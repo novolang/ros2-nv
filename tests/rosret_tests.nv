@@ -1,0 +1,97 @@
+// rosret_tests.nv — the four codes that are not failures, and the
+// grouping rcl's numbering carries.
+//
+// RED ON PURPOSE.  Every body in this package is a `todo()`, so the
+// first call each test makes ends it with `not implemented`.  What the
+// suite checks today is that every signature can be SPELLED by a
+// consumer with the types a consumer holds, and the assertions are the
+// ones the implementation will have to satisfy.
+
+use std.test
+use rosret
+
+@test
+fn test_a_take_that_found_nothing_is_not_an_error() [io]
+    // A wait set reports that a subscription has data, the take finds
+    // none, and the code comes back.  Almost every rclc example logs a
+    // failure for it, so a working node prints errors under load and an
+    // operator learns to ignore the log.
+    test.case("the three take codes")
+    test.assert(not rosret.ros_ret_is_error(rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED))
+    test.assert(not rosret.ros_ret_is_error(rosret.ROS_RET_CLIENT_TAKE_FAILED))
+    test.assert(not rosret.ros_ret_is_error(rosret.ROS_RET_SERVICE_TAKE_FAILED))
+
+    test.case("and a spin with nothing ready")
+    test.assert(not rosret.ros_ret_is_error(rosret.ROS_RET_TIMEOUT))
+
+    test.case("but none of the four means the call did anything")
+    test.assert(not rosret.ros_ret_is_ok(rosret.ROS_RET_TIMEOUT))
+    test.assert(not rosret.ros_ret_is_ok(rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED))
+
+    test.case("the two questions agree only on success")
+    test.assert(rosret.ros_ret_is_ok(rosret.ROS_RET_OK))
+    test.assert(not rosret.ros_ret_is_error(rosret.ROS_RET_OK))
+
+@test
+fn test_a_real_failure_reads_as_one() [io]
+    test.case("a bad name, a full wait set and an invalid handle")
+    test.assert(rosret.ros_ret_is_error(rosret.ROS_RET_NODE_INVALID_NAME))
+    test.assert(rosret.ros_ret_is_error(rosret.ROS_RET_WAIT_SET_FULL))
+    test.assert(rosret.ros_ret_is_error(rosret.ROS_RET_PUBLISHER_INVALID))
+    test.assert(rosret.ros_ret_is_error(rosret.ROS_RET_BAD_ALLOC))
+
+    test.case("the take codes as their own question")
+    test.assert(rosret.ros_ret_is_take_failed(rosret.ROS_RET_CLIENT_TAKE_FAILED))
+    test.assert(not rosret.ros_ret_is_take_failed(rosret.ROS_RET_TIMEOUT))
+
+    test.case("an invalid handle is a program that is wrong")
+    test.assert(rosret.ros_ret_is_invalid_handle(rosret.ROS_RET_NODE_INVALID))
+    test.assert(rosret.ros_ret_is_invalid_handle(rosret.ROS_RET_TIMER_INVALID))
+    test.assert(not rosret.ros_ret_is_invalid_handle(rosret.ROS_RET_TIMEOUT))
+
+@test
+fn test_the_numbering_groups_by_subsystem() [io]
+    // rcl's own scheme: 1xx for the context, 2xx for the node, 3xx for
+    // a publisher, and a diagnostic that names the subsystem tells a
+    // reader which of the twelve things they wrote is at fault.
+    test.case("the hundreds digit")
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_NOT_INIT), 1)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_NODE_INVALID_NAMESPACE), 2)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_PUBLISHER_INVALID), 3)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED), 4)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_CLIENT_INVALID), 5)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_SERVICE_INVALID), 6)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_TIMER_CANCELED), 8)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_WAIT_SET_EMPTY), 9)
+
+    test.case("the general codes belong to none of them")
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_ERROR), 0)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_UNSUPPORTED), 0)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_INVALID_ARGUMENT), 0)
+
+    test.case("and both have names")
+    test.assert(str.len(rosret.ros_ret_subsystem_name(2)) > 0)
+    test.assert(str.len(rosret.ros_ret_name(rosret.ROS_RET_ALREADY_SHUTDOWN)) > 0)
+    test.assert(str.len(rosret.ros_ret_name(rosret.ROS_RET_ALREADY_INIT)) > 0)
+    test.assert(str.len(rosret.ros_ret_name(rosret.ROS_RET_TOPIC_NAME_INVALID)) > 0)
+    test.assert(str.len(rosret.ros_ret_name(rosret.ROS_RET_SERVICE_NAME_INVALID)) > 0)
+    test.assert(str.len(rosret.ros_ret_name(rosret.ROS_RET_UNKNOWN_SUBSTITUTION)) > 0)
+
+@test
+fn test_the_two_codes_this_package_invented_say_so() [io]
+    // rcl has no code for either, because in rcl neither is a failure:
+    // two endpoints with incompatible settings are created
+    // successfully and never connect, and rcl on a workstation has no
+    // agent to be unreachable.
+    test.case("both are above the range rcl uses")
+    test.assert(rosret.ros_ret_is_extension(rosret.ROS_RET_QOS_INCOMPATIBLE))
+    test.assert(rosret.ros_ret_is_extension(rosret.ROS_RET_AGENT_UNREACHABLE))
+
+    test.case("and nothing rcl defines is")
+    test.assert(not rosret.ros_ret_is_extension(rosret.ROS_RET_OK))
+    test.assert(not rosret.ros_ret_is_extension(rosret.ROS_RET_WAIT_SET_INVALID))
+    test.assert(not rosret.ros_ret_is_extension(rosret.ROS_RET_SUBSCRIPTION_INVALID))
+
+    test.case("both are errors")
+    test.assert(rosret.ros_ret_is_error(rosret.ROS_RET_QOS_INCOMPATIBLE))
+    test.assert(rosret.ros_ret_is_error(rosret.ROS_RET_AGENT_UNREACHABLE))

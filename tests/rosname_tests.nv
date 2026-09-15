@@ -1,0 +1,278 @@
+// rosname_tests.nv — the name rules, the DDS names nobody writes, the
+// message envelope, and the three parameter types a microcontroller
+// has.
+//
+// RED ON PURPOSE: the first `todo()` each test reaches ends it.
+
+use std.bytes
+use std.test
+use rosmsg
+use rosname
+use rosparam
+use rosret
+
+@test
+fn test_a_node_has_a_name_and_a_namespace_and_they_are_not_one_thing() [io]
+    test.case("a node name is one token")
+    test.assert_eq(rosname.check_node_name("temperature_sensor"),
+                   rosname.ROS_NAME_OK)
+
+    test.case("with no slash in it")
+    test.assert_eq(rosname.check_node_name("/sensors/temp"),
+                   rosname.ROS_NAME_NODE_HAS_SLASH)
+
+    test.case("and not starting with a digit")
+    test.assert_eq(rosname.check_node_name("2fast"),
+                   rosname.ROS_NAME_TOKEN_STARTS_WITH_DIGIT)
+
+    test.case("an empty name is refused before anything else")
+    test.assert_eq(rosname.check_node_name(""), rosname.ROS_NAME_EMPTY)
+
+    test.case("a namespace is absolute, and the root is a namespace")
+    test.assert_eq(rosname.check_namespace("/"), rosname.ROS_NAME_OK)
+    test.assert_eq(rosname.check_namespace("/sensors"), rosname.ROS_NAME_OK)
+    test.assert_eq(rosname.check_namespace("sensors"),
+                   rosname.ROS_NAME_NAMESPACE_NOT_ABSOLUTE)
+
+@test
+fn test_the_topic_rules_are_checked_in_order() [io]
+    test.case("an ordinary name")
+    test.assert_eq(rosname.check_topic_name("/cmd_vel"), rosname.ROS_NAME_OK)
+
+    test.case("a trailing slash is not decoration")
+    test.assert_eq(rosname.check_topic_name("/cmd_vel/"),
+                   rosname.ROS_NAME_ENDS_WITH_SLASH)
+
+    test.case("two slashes in a row")
+    test.assert_eq(rosname.check_topic_name("/cmd//vel"),
+                   rosname.ROS_NAME_REPEATED_SLASH)
+
+    test.case("a character the middleware will not carry")
+    test.assert_eq(rosname.check_topic_name("/cmd vel"),
+                   rosname.ROS_NAME_BAD_CHARACTER)
+
+    test.case("a tilde anywhere but the start")
+    test.assert_eq(rosname.check_topic_name("/cmd/~vel"),
+                   rosname.ROS_NAME_TILDE_NOT_AT_START)
+
+    test.case("an unbalanced substitution")
+    test.assert_eq(rosname.check_topic_name("/{node/state"),
+                   rosname.ROS_NAME_UNBALANCED_BRACES)
+
+    test.case("a substitution nothing defines")
+    test.assert_eq(rosname.check_topic_name("/{robot}/state"),
+                   rosname.ROS_NAME_UNKNOWN_SUBSTITUTION)
+
+    test.case("and every code has a name and an rcl equivalent")
+    test.assert(str.len(rosname.name_error_name(rosname.ROS_NAME_TOO_LONG)) > 0)
+    test.assert_eq(rosname.name_error_ret(rosname.ROS_NAME_TOO_LONG, 2),
+                   rosret.ROS_RET_TOPIC_NAME_INVALID)
+    test.assert_eq(rosname.check_service_name("/add_two_ints"),
+                   rosname.ROS_NAME_OK)
+
+@test
+fn test_a_leading_underscore_hides_a_topic() [io]
+    // A program whose topic silently fails to appear in a listing has
+    // very often named it with a leading underscore by accident.
+    test.case("hidden")
+    test.assert(rosname.is_hidden("/_internal/state"))
+
+    test.case("not hidden")
+    test.assert(not rosname.is_hidden("/internal/state"))
+
+    test.case("absolute, relative and private are three shapes")
+    test.assert(rosname.is_absolute("/cmd_vel"))
+    test.assert(not rosname.is_absolute("cmd_vel"))
+    test.assert(rosname.is_private("~/state"))
+    test.assert(not rosname.is_private("/state"))
+
+@test
+fn test_a_relative_name_means_nothing_until_it_is_expanded() [io]
+    test.case("a relative name joins the namespace")
+    test.assert_eq(rosname.expand("temperature", "/sensors", "probe"),
+                   "/sensors/temperature")
+
+    test.case("a private name joins the node's own name")
+    test.assert_eq(rosname.expand("~/state", "/sensors", "probe"),
+                   "/sensors/probe/state")
+
+    test.case("an absolute name is left alone")
+    test.assert_eq(rosname.expand("/tf", "/sensors", "probe"), "/tf")
+
+    test.case("and the node's own fully qualified name")
+    test.assert_eq(rosname.fully_qualified("/sensors", "probe"),
+                   "/sensors/probe")
+    test.assert_eq(rosname.fully_qualified("/", "probe"), "/probe")
+
+@test
+fn test_the_name_on_the_wire_is_not_the_name_in_the_program() [io]
+    // A DDS monitoring tool shows these and not the ROS names, and the
+    // length limit applies to these.
+    test.case("a topic gets rt")
+    test.assert_eq(rosname.dds_topic_name("/chatter"), "rt/chatter")
+
+    test.case("a service gets two topics, rq and rr")
+    test.assert_eq(rosname.dds_request_name("/add_two_ints"),
+                   "rq/add_two_ints")
+    test.assert_eq(rosname.dds_reply_name("/add_two_ints"),
+                   "rr/add_two_ints")
+
+    test.case("and the prefix comes out of the length budget")
+    test.assert_eq(rosname.effective_length("/chatter"), 10)
+    test.assert_eq(rosname.ROS_NAME_MAX, 255)
+    test.assert_eq(rosname.ROS_DDS_TOPIC_PREFIX, "rt/")
+    test.assert_eq(rosname.ROS_DDS_REQUEST_PREFIX, "rq/")
+    test.assert_eq(rosname.ROS_DDS_REPLY_PREFIX, "rr/")
+
+@test
+fn test_a_two_part_type_name_is_the_ros_1_spelling() [io]
+    // Which still appears in tutorials, and which ROS 2 refuses.
+    test.case("three parts, with the middle saying which kind")
+    test.assert(rosname.type_name_is_valid("std_msgs/msg/String"))
+    test.assert(rosname.type_name_is_valid("example_interfaces/srv/AddTwoInts"))
+    test.assert(not rosname.type_name_is_valid("std_msgs/String"))
+
+    test.case("the kind is answered from the middle part")
+    test.assert_eq(rosname.type_kind("std_msgs/msg/String"), 0)
+    test.assert_eq(rosname.type_kind("example_interfaces/srv/AddTwoInts"), 1)
+    test.assert_eq(rosname.type_kind("std_msgs/String"), -1)
+
+    test.case("two different types get two different numbers")
+    test.assert(rosname.type_id("std_msgs/msg/String")
+                != rosname.type_id("std_msgs/msg/Int32"))
+
+    test.case("and the same type gets the same one")
+    test.assert_eq(rosname.type_id("std_msgs/msg/String"),
+                   rosname.type_id("std_msgs/msg/String"))
+
+@test
+fn test_the_four_bytes_in_front_are_not_part_of_the_message() [io]
+    // A reader that skips them reads a little-endian message as a
+    // big-endian one and gets numbers wrong by a factor of sixteen
+    // million.
+    let payload = bytes.from_str("hello")
+    let m = rosmsg.message(payload, 1234)
+
+    test.case("a message is little endian by default, which is what ROS 2 sends")
+    test.assert(rosmsg.is_little_endian(m))
+    test.assert_eq(m.encapsulation, rosmsg.ROS_CDR_LE)
+    test.assert(not rosmsg.is_parameter_list(m))
+
+    test.case("the header is four bytes and the payload is not")
+    test.assert_eq(rosmsg.payload_length(m), 5)
+    test.assert_eq(rosmsg.wire_length(m), 9)
+    test.assert_eq(rosmsg.ROS_ENCAPSULATION_BYTES, 4)
+
+    test.case("what goes out comes back")
+    let back = rosmsg.decode_envelope(rosmsg.encode_envelope(m), 1234)
+    test.assert_eq(rosmsg.payload_length(back), 5)
+    test.assert(rosmsg.same_type(m, back))
+    test.assert_eq(bytes.len(rosmsg.payload(back)), 5)
+
+    test.case("a big-endian message says so")
+    let be = rosmsg.message_with(payload, 1234, rosmsg.ROS_CDR_BE)
+    test.assert(not rosmsg.is_little_endian(be))
+
+    test.case("a parameter list is a different layout")
+    let pl = rosmsg.message_with(payload, 1234, rosmsg.ROS_PL_CDR_LE)
+    test.assert(rosmsg.is_parameter_list(pl))
+    test.assert(rosmsg.envelope_is_known(rosmsg.ROS_PL_CDR_BE))
+    test.assert(not rosmsg.envelope_is_known(99))
+    test.assert(str.len(rosmsg.encapsulation_name(rosmsg.ROS_CDR_LE)) > 0)
+
+@test
+fn test_a_message_that_does_not_fit_is_dropped_below_the_error() [io]
+    // The publish call succeeds, nothing arrives, and no error appears
+    // anywhere.
+    test.case("a stock build carries 512 bytes")
+    test.assert_eq(rosmsg.ROS_DEFAULT_MTU, 512)
+
+    test.case("six hundred bytes do not fit")
+    let big = rosmsg.message(bytes.zeros(600), 1234)
+    test.assert(not rosmsg.fits_mtu(big, rosmsg.ROS_DEFAULT_MTU))
+
+    test.case("and a hundred do")
+    test.assert(rosmsg.fits_mtu(rosmsg.message(bytes.zeros(100), 1234),
+                                rosmsg.ROS_DEFAULT_MTU))
+
+    test.case("the header and the framing both come out of the budget")
+    test.assert(rosmsg.max_payload(512, 12) < 512 - 12)
+
+@test
+fn test_rclc_carries_three_parameter_types_of_the_ten() [io]
+    // A node written on a workstation and moved to a microcontroller
+    // loses every string parameter it had, which is usually the frame
+    // identifier, the device path and the mode name.
+    test.case("the three it carries")
+    test.assert(rosparam.kind_is_supported(rosparam.ROS_PARAM_BOOL))
+    test.assert(rosparam.kind_is_supported(rosparam.ROS_PARAM_INTEGER))
+    test.assert(rosparam.kind_is_supported(rosparam.ROS_PARAM_DOUBLE))
+
+    test.case("and four of the seven it does not")
+    test.assert(not rosparam.kind_is_supported(rosparam.ROS_PARAM_STRING))
+    test.assert(not rosparam.kind_is_supported(rosparam.ROS_PARAM_BYTE_ARRAY))
+    test.assert(not rosparam.kind_is_supported(rosparam.ROS_PARAM_INTEGER_ARRAY))
+    test.assert(not rosparam.kind_is_supported(rosparam.ROS_PARAM_STRING_ARRAY))
+    test.assert(not rosparam.kind_is_supported(rosparam.ROS_PARAM_BOOL_ARRAY))
+    test.assert(not rosparam.kind_is_supported(rosparam.ROS_PARAM_DOUBLE_ARRAY))
+    test.assert_eq(rosparam.ROS_PARAM_TYPES, 10)
+    test.assert_eq(rosparam.ROS_PARAM_NOT_SET, 0)
+
+@test
+fn test_a_parameter_keeps_the_type_it_was_declared_with() [io]
+    // An integer parameter set from a launch file that wrote `1.0` is
+    // refused, and the node starts with its default and no message
+    // about it.
+    test.case("the same type is allowed")
+    test.assert(rosparam.set_is_allowed(rosparam.ROS_PARAM_INTEGER,
+                                        rosparam.ROS_PARAM_INTEGER))
+
+    test.case("a double into an integer is not, and is not coerced")
+    test.assert(not rosparam.set_is_allowed(rosparam.ROS_PARAM_INTEGER,
+                                            rosparam.ROS_PARAM_DOUBLE))
+    test.assert_eq(rosparam.set_ret(rosparam.ROS_PARAM_INTEGER,
+                                    rosparam.ROS_PARAM_DOUBLE),
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+    test.assert_eq(rosparam.set_ret(rosparam.ROS_PARAM_BOOL,
+                                    rosparam.ROS_PARAM_BOOL),
+                   rosret.ROS_RET_OK)
+
+@test
+fn test_a_value_reads_back_as_what_it_is_and_falls_back_otherwise() [io]
+    test.case("each of the three")
+    test.assert_eq(rosparam.int_param(42).kind, rosparam.ROS_PARAM_INTEGER)
+    test.assert_eq(rosparam.as_int(rosparam.int_param(42), 0), 42)
+    test.assert(rosparam.as_bool(rosparam.bool_param(true), false))
+    test.assert(rosparam.as_double(rosparam.double_param(1.5), 0.0) > 1.0)
+
+    test.case("reading one as another falls back")
+    test.assert_eq(rosparam.as_int(rosparam.bool_param(true), -1), -1)
+
+    test.case("an unset parameter has no value")
+    test.assert(not rosparam.is_set(rosparam.unset()))
+    test.assert(rosparam.is_set(rosparam.int_param(0)))
+
+    test.case("and two values compare by type as well as by number")
+    test.assert(rosparam.same_value(rosparam.int_param(1),
+                                    rosparam.int_param(1)))
+    test.assert(not rosparam.same_value(rosparam.int_param(1),
+                                        rosparam.double_param(1.0)))
+
+@test
+fn test_the_limits_a_micro_ros_parameter_server_has() [io]
+    test.case("four parameters, and names of fifty characters")
+    test.assert_eq(rosparam.ROS_PARAM_MAX, 4)
+    test.assert_eq(rosparam.ROS_PARAM_NAME_MAX, 50)
+    test.assert(rosparam.can_declare(3))
+    test.assert(not rosparam.can_declare(4))
+
+    test.case("a name that fits and one that does not")
+    test.assert(rosparam.name_fits("wheel_radius"))
+    test.assert(not rosparam.name_fits(
+        "wheel_separation_multiplier_left_front_and_then_some_more"))
+
+    test.case("a range is the node's to enforce, so it is a function here")
+    test.assert(rosparam.int_in_range(rosparam.int_param(5), 0, 10))
+    test.assert(not rosparam.int_in_range(rosparam.int_param(50), 0, 10))
+    test.assert(rosparam.double_in_range(rosparam.double_param(0.5), 0.0, 1.0))
+    test.assert(str.len(rosparam.kind_name(rosparam.ROS_PARAM_DOUBLE)) > 0)

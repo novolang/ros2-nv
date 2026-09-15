@@ -1,0 +1,162 @@
+// rosmsg.nv — a message as bytes this package does not read, and the
+// four-byte header that says which way round they are.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  Nothing here performs anything.
+//
+// THIS PACKAGE DOES NOT SERIALISE.  A ROS 2 message on the wire is
+// Common Data Representation: a header saying which byte order follows,
+// then fields laid out with alignment rules of their own.  That is a
+// subject with a specification, and the ROS 2 plan gives it its own
+// package.  A second implementation of it here would be a second
+// original, and the day the two disagreed about a padding byte a bag
+// file written by one would be unreadable by the other.
+//
+// So a message here is a payload, a type and an encapsulation, and the
+// payload is opaque.  What this module does own is the FOUR BYTES IN
+// FRONT of it, because those are not part of the message: they say
+// which byte order the rest is in, they travel with the payload rather
+// than with the type, and a reader that skips them reads a
+// little-endian message as a big-endian one and gets numbers that are
+// wrong by a factor of sixteen million.
+//
+// AND THE MTU IS A LIMIT WITH NO ERROR BEHIND IT.  A micro-ROS build
+// has a transport buffer fixed at compile time — 512 bytes is the
+// default on a serial link — and a message that does not fit is dropped
+// by the transport, below the layer that could report it.  A node
+// publishing a laser scan over a serial link publishes nothing, and
+// says nothing.  `fits_mtu` is the check, and it is the reason the
+// message carries its own length.
+
+// ── Encapsulation (the four bytes in front) ──────────────────────────
+
+// How many bytes the encapsulation header takes: 4.
+//
+// Two for the representation identifier and two of options, which are
+// zero in everything ROS 2 sends.
+pub const ROS_ENCAPSULATION_BYTES = 4
+
+// Plain CDR, most significant byte first: 0x0000.
+pub const ROS_CDR_BE = 0x0000
+// Plain CDR, least significant byte first: 0x0001.  What every ROS 2
+// node on every ordinary processor sends.
+pub const ROS_CDR_LE = 0x0001
+// Parameter-list CDR, most significant byte first: 0x0002.
+pub const ROS_PL_CDR_BE = 0x0002
+// Parameter-list CDR, least significant byte first: 0x0003.
+pub const ROS_PL_CDR_LE = 0x0003
+
+// ── A message ────────────────────────────────────────────────────────
+
+// A serialised message, its type, and which way round its bytes are.
+//
+// A PLAIN STRUCT AND NOT A `@value`, because it holds a `Bytes`.  That
+// is also why this module is not claimed for a device: a firmware holds
+// its payload in a buffer it owns, and hands this package the length
+// and the encapsulation rather than a heap value.
+pub struct RosMessage
+    // The payload, WITHOUT the encapsulation header.
+    payload: Bytes
+    // The message type, as `rosname.type_id` computes it.
+    type_id: Int
+    // One of the four `ROS_CDR_*` or `ROS_PL_CDR_*` identifiers.
+    encapsulation: Int
+
+// A message from a payload that has no header on it yet.
+//
+// Little-endian, which is what every ROS 2 node this will talk to
+// sends.
+pub fn message(payload: Bytes, type_id: Int) -> RosMessage []
+    todo("ros2-nv.rosmsg.message")
+
+// A message from a payload in a stated byte order.
+pub fn message_with(payload: Bytes, type_id: Int, encapsulation: Int) -> RosMessage []
+    todo("ros2-nv.rosmsg.message_with")
+
+// The message a received buffer holds, header and all.
+//
+// Reads the four-byte header, keeps the rest as the payload, and
+// answers a message whose encapsulation is what the header said.  A
+// buffer shorter than four bytes answers a message with an
+// encapsulation of -1.
+pub fn decode_envelope(buffer: Bytes, type_id: Int) -> RosMessage []
+    todo("ros2-nv.rosmsg.decode_envelope")
+
+// The bytes to send: the four-byte header, then the payload.
+pub fn encode_envelope(m: RosMessage) -> Bytes []
+    todo("ros2-nv.rosmsg.encode_envelope")
+
+// Whether the envelope is one of the four this package knows.
+pub fn envelope_is_known(encapsulation: Int) -> Bool []
+    todo("ros2-nv.rosmsg.envelope_is_known")
+
+// Whether the payload's numbers are least significant byte first.
+//
+// The one question about a message this package can answer without
+// reading the payload, and the one a serialiser has to be told.
+pub fn is_little_endian(m: RosMessage) -> Bool []
+    todo("ros2-nv.rosmsg.is_little_endian")
+
+// Whether the message carries a parameter list rather than a plain
+// structure.
+//
+// A different layout, used for the discovery messages the middleware
+// exchanges rather than for anything a node publishes.
+pub fn is_parameter_list(m: RosMessage) -> Bool []
+    todo("ros2-nv.rosmsg.is_parameter_list")
+
+// The payload, with no header on it.
+pub fn payload(m: RosMessage) -> Bytes []
+    todo("ros2-nv.rosmsg.payload")
+
+// How many bytes the payload holds.
+pub fn payload_length(m: RosMessage) -> Int []
+    todo("ros2-nv.rosmsg.payload_length")
+
+// How many bytes go on the wire: the payload and the four-byte header.
+pub fn wire_length(m: RosMessage) -> Int []
+    todo("ros2-nv.rosmsg.wire_length")
+
+// The encapsulation in words.
+pub fn encapsulation_name(encapsulation: Int) -> Str []
+    todo("ros2-nv.rosmsg.encapsulation_name")
+
+// ── The transport's ceiling ──────────────────────────────────────────
+
+// The transport buffer a stock micro-ROS build has: 512 bytes.
+//
+// Set at compile time in the firmware, shared by every message, and
+// the reason a node that publishes a small message every cycle works
+// and the same node publishing an image does not.
+pub const ROS_DEFAULT_MTU = 512
+
+// Whether the whole message fits in a transport of this size.
+//
+// Counts the encapsulation header, because the transport does.  A
+// message that does not fit is dropped BELOW the layer that could
+// report it: the publish call succeeds, nothing arrives, and no error
+// appears anywhere.
+//
+// ```novo
+// use rosmsg
+// use std.bytes
+//
+// fn main() [io]
+//     let m = rosmsg.message(bytes.zeros(600), 1234)
+//     println("${rosmsg.fits_mtu(m, rosmsg.ROS_DEFAULT_MTU)}")   // false
+// ```
+pub fn fits_mtu(m: RosMessage, mtu: Int) -> Bool []
+    todo("ros2-nv.rosmsg.fits_mtu")
+
+// The largest payload a transport of this size can carry.
+//
+// The size less the four header bytes, and less whatever the session
+// framing takes — `rostransport.framing_overhead` is that number, and
+// this takes it as an argument rather than assuming a transport.
+pub fn max_payload(mtu: Int, framing_overhead: Int) -> Int []
+    todo("ros2-nv.rosmsg.max_payload")
+
+// Whether two messages carry the same type.
+pub fn same_type(a: RosMessage, b: RosMessage) -> Bool []
+    todo("ros2-nv.rosmsg.same_type")

@@ -1,0 +1,201 @@
+// rosqos_tests.nv — the pair that never connects, and the five
+// policies that decide it.
+//
+// RED ON PURPOSE: the first `todo()` each test reaches ends it.
+//
+// THE ASSERTIONS ARE THE RxO RULES.  A publisher offers and a
+// subscription requests, and a match needs the offer to be at least as
+// strong as the request.  Every case below is one a real ROS 2 system
+// produces, and the first is the single most common reason a
+// subscription receives nothing.
+
+use std.test
+use rosqos
+
+@test
+fn test_the_camera_and_the_default_subscription_never_connect() [io]
+    // Every camera, laser scanner and inertial unit in ROS 2 publishes
+    // best effort.  A program that subscribes without saying otherwise
+    // requests reliable.  Both endpoints are created, both report
+    // healthy, and the callback is never called.
+    let c = rosqos.compatible(rosqos.sensor_data_profile(),
+                              rosqos.default_profile())
+
+    test.case("they do not match")
+    test.assert(not c.compatible)
+
+    test.case("and reliability is what refused")
+    test.assert_eq(c.policy, rosqos.ROS_QOS_POLICY_RELIABILITY)
+    test.assert_eq(c.offered, rosqos.ROS_RELIABILITY_BEST_EFFORT)
+    test.assert_eq(c.requested, rosqos.ROS_RELIABILITY_RELIABLE)
+
+    test.case("the advice names both edits")
+    test.assert(str.len(rosqos.compat_advice(c)) > 0)
+    test.assert(str.len(rosqos.policy_name(c.policy)) > 0)
+
+@test
+fn test_the_relation_is_not_symmetric() [io]
+    // A reliable publisher satisfies a best-effort subscription.  The
+    // same two profiles the other way round do not, which is why the
+    // arguments are named rather than interchangeable.
+    test.case("reliable offered, best effort requested")
+    test.assert(rosqos.compatible(rosqos.default_profile(),
+                                  rosqos.sensor_data_profile()).compatible)
+
+    test.case("best effort offered, reliable requested")
+    test.assert(not rosqos.compatible(rosqos.sensor_data_profile(),
+                                      rosqos.default_profile()).compatible)
+
+    test.case("the rule on its own")
+    test.assert(rosqos.reliability_satisfies(rosqos.ROS_RELIABILITY_RELIABLE,
+                                             rosqos.ROS_RELIABILITY_BEST_EFFORT))
+    test.assert(not rosqos.reliability_satisfies(rosqos.ROS_RELIABILITY_BEST_EFFORT,
+                                                 rosqos.ROS_RELIABILITY_RELIABLE))
+
+@test
+fn test_a_late_joiner_needs_the_publisher_to_have_kept_something() [io]
+    // What `/tf_static` and `/robot_description` rely on: a
+    // subscription that joins a minute after the publisher still gets
+    // the last message.
+    test.case("volatile offered, transient local requested")
+    test.assert(not rosqos.durability_satisfies(rosqos.ROS_DURABILITY_VOLATILE,
+                                                rosqos.ROS_DURABILITY_TRANSIENT_LOCAL))
+
+    test.case("transient local offered satisfies both")
+    test.assert(rosqos.durability_satisfies(rosqos.ROS_DURABILITY_TRANSIENT_LOCAL,
+                                            rosqos.ROS_DURABILITY_VOLATILE))
+    test.assert(rosqos.durability_satisfies(rosqos.ROS_DURABILITY_TRANSIENT_LOCAL,
+                                            rosqos.ROS_DURABILITY_TRANSIENT_LOCAL))
+
+    test.case("and durability is named when it is what refused")
+    let c = rosqos.compatible(rosqos.default_profile(),
+                              rosqos.transient_local_profile())
+    test.assert(not c.compatible)
+    test.assert_eq(c.policy, rosqos.ROS_QOS_POLICY_DURABILITY)
+
+@test
+fn test_a_deadline_is_a_promise_and_it_goes_the_other_way() [io]
+    // A publisher promising a message every hundred milliseconds
+    // satisfies a subscriber that will tolerate two hundred.  The
+    // reverse is a publisher that cannot keep up with what was asked.
+    test.case("a shorter offer satisfies a longer request")
+    test.assert(rosqos.deadline_satisfies(100, 200))
+    test.assert(not rosqos.deadline_satisfies(200, 100))
+
+    test.case("equal is enough")
+    test.assert(rosqos.deadline_satisfies(100, 100))
+
+    test.case("and infinity is spelled zero, which a comparison gets wrong")
+    test.assert(rosqos.deadline_satisfies(100, rosqos.ROS_DURATION_INFINITE))
+    test.assert(not rosqos.deadline_satisfies(rosqos.ROS_DURATION_INFINITE, 100))
+    test.assert(rosqos.deadline_satisfies(rosqos.ROS_DURATION_INFINITE,
+                                          rosqos.ROS_DURATION_INFINITE))
+
+    test.case("a lease works the same way")
+    test.assert(rosqos.lease_satisfies(500, 1000))
+    test.assert(not rosqos.lease_satisfies(1000, 500))
+
+@test
+fn test_a_node_that_stopped_working_is_still_alive_automatically() [io]
+    // Manual-by-topic is what distinguishes a process that is running
+    // from a control loop that is running.
+    test.case("automatic offered does not satisfy a manual request")
+    test.assert(not rosqos.liveliness_satisfies(rosqos.ROS_LIVELINESS_AUTOMATIC,
+                                                rosqos.ROS_LIVELINESS_MANUAL_BY_TOPIC))
+
+    test.case("manual offered satisfies both")
+    test.assert(rosqos.liveliness_satisfies(rosqos.ROS_LIVELINESS_MANUAL_BY_TOPIC,
+                                            rosqos.ROS_LIVELINESS_AUTOMATIC))
+
+@test
+fn test_three_settings_cannot_stop_a_connection_at_all() [io]
+    // The assumption that a depth mismatch prevents a connection is
+    // common and sends people looking in the wrong place: two endpoints
+    // with depths of 1 and 100 connect perfectly and drop messages,
+    // which is a different problem with a different fix.
+    test.case("history, depth and lifespan do not participate")
+    test.assert(not rosqos.policy_affects_matching(rosqos.ROS_QOS_POLICY_NONE))
+
+    test.case("the five that do")
+    test.assert(rosqos.policy_affects_matching(rosqos.ROS_QOS_POLICY_RELIABILITY))
+    test.assert(rosqos.policy_affects_matching(rosqos.ROS_QOS_POLICY_DURABILITY))
+    test.assert(rosqos.policy_affects_matching(rosqos.ROS_QOS_POLICY_DEADLINE))
+    test.assert(rosqos.policy_affects_matching(rosqos.ROS_QOS_POLICY_LIVELINESS))
+    test.assert(rosqos.policy_affects_matching(rosqos.ROS_QOS_POLICY_LEASE))
+
+    test.case("two depths that differ still match")
+    let shallow = rosqos.with_depth(rosqos.default_profile(), 1)
+    let deep = rosqos.with_depth(rosqos.default_profile(), 100)
+    test.assert(rosqos.compatible(shallow, deep).compatible)
+
+@test
+fn test_the_named_profiles_are_the_ones_ros2_ships() [io]
+    test.case("the default keeps ten, reliably, and forgets late joiners")
+    let d = rosqos.default_profile()
+    test.assert_eq(d.depth, 10)
+    test.assert_eq(d.reliability, rosqos.ROS_RELIABILITY_RELIABLE)
+    test.assert_eq(d.durability, rosqos.ROS_DURABILITY_VOLATILE)
+    test.assert_eq(d.history, rosqos.ROS_HISTORY_KEEP_LAST)
+
+    test.case("sensor data keeps five, best effort")
+    test.assert_eq(rosqos.sensor_data_profile().depth, 5)
+
+    test.case("services are the default's twin")
+    test.assert_eq(rosqos.services_profile().reliability,
+                   rosqos.ROS_RELIABILITY_RELIABLE)
+
+    test.case("parameters keep a thousand, which is not a typo")
+    test.assert_eq(rosqos.parameters_profile().depth, 1000)
+
+    test.case("and a latched topic keeps one, for ever")
+    let t = rosqos.transient_local_profile()
+    test.assert_eq(t.durability, rosqos.ROS_DURABILITY_TRANSIENT_LOCAL)
+    test.assert_eq(t.depth, 1)
+
+@test
+fn test_a_profile_can_be_built_and_changed() [io]
+    let q = rosqos.qos(rosqos.ROS_HISTORY_KEEP_LAST, 7,
+                       rosqos.ROS_RELIABILITY_BEST_EFFORT,
+                       rosqos.ROS_DURABILITY_VOLATILE,
+                       200, 1000, rosqos.ROS_LIVELINESS_AUTOMATIC, 3000)
+
+    test.case("the fields are what went in")
+    test.assert_eq(q.depth, 7)
+    test.assert_eq(q.lifespan_ms, 1000)
+    test.assert_eq(q.lease_ms, 3000)
+
+    test.case("and each change answers a new profile")
+    test.assert_eq(rosqos.with_reliability(q, rosqos.ROS_RELIABILITY_RELIABLE).reliability,
+                   rosqos.ROS_RELIABILITY_RELIABLE)
+    test.assert_eq(rosqos.with_durability(q, rosqos.ROS_DURABILITY_TRANSIENT_LOCAL).durability,
+                   rosqos.ROS_DURABILITY_TRANSIENT_LOCAL)
+    test.assert_eq(rosqos.with_deadline(q, 50).deadline_ms, 50)
+
+    test.case("it is valid and it leaves nothing to the middleware")
+    test.assert(rosqos.qos_is_valid(q))
+    test.assert(not rosqos.qos_has_system_default(q))
+
+    test.case("unlike the system default profile, which leaves everything")
+    test.assert(rosqos.qos_has_system_default(rosqos.system_default_profile()))
+
+    test.case("a reliability of 7 is not a value the middleware knows")
+    test.assert(not rosqos.qos_is_valid(rosqos.with_reliability(q, 7)))
+
+@test
+fn test_the_queue_is_what_an_endpoint_costs_on_a_device() [io]
+    test.case("keep-last answers its depth")
+    test.assert_eq(rosqos.queue_slots(rosqos.sensor_data_profile()), 5)
+
+    test.case("keep-all has no answer")
+    let all = rosqos.qos(rosqos.ROS_HISTORY_KEEP_ALL, 0,
+                         rosqos.ROS_RELIABILITY_RELIABLE,
+                         rosqos.ROS_DURABILITY_VOLATILE,
+                         rosqos.ROS_DURATION_INFINITE,
+                         rosqos.ROS_DURATION_INFINITE,
+                         rosqos.ROS_LIVELINESS_AUTOMATIC,
+                         rosqos.ROS_DURATION_INFINITE)
+    test.assert_eq(rosqos.queue_slots(all), -1)
+    test.assert_eq(rosqos.ROS_HISTORY_SYSTEM_DEFAULT, 0)
+    test.assert_eq(rosqos.ROS_RELIABILITY_SYSTEM_DEFAULT, 0)
+    test.assert_eq(rosqos.ROS_DURABILITY_SYSTEM_DEFAULT, 0)
+    test.assert_eq(rosqos.ROS_LIVELINESS_SYSTEM_DEFAULT, 0)

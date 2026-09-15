@@ -1,0 +1,289 @@
+// rostransport.nv — the session with the agent, and the byte pipe
+// underneath it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A MICRO-ROS NODE IS NOT A ROS 2 PARTICIPANT.  A node on a workstation
+// speaks DDS to every other node directly.  A node on a
+// microcontroller speaks Micro XRCE-DDS to an AGENT — a process on
+// another machine — and the agent is the DDS participant on its behalf.
+// Everything follows from that: the node's topics do not exist until
+// the agent has created them, an agent restart loses every entity the
+// node made, and a node whose agent is not running publishes into
+// nothing and is not told.
+//
+// `RosTransport[e]` IS THE TRAIT THAT CROSSES THE LAYER, and this
+// module implements it nowhere.  `e` is the effect the byte pipe
+// supplies: `[hw]` for a UART on a device, `[net]` for a socket on a
+// host, and nothing for a recorded exchange in a test.  Every function
+// written over it costs what its argument costs (SPEC § 5.6).
+//
+// THE STREAM KIND IS WHERE QUALITY OF SERVICE ACTUALLY HAPPENS HERE.
+// A publisher's reliability setting is a DDS concept, and between a
+// microcontroller and its agent there is no DDS: there is an XRCE
+// stream, and a stream is either best-effort — send and forget — or
+// reliable, with sequence numbers, acknowledgements and a
+// retransmission buffer.  `stream_for` is the mapping, and the
+// retransmission buffer is memory the firmware set aside at compile
+// time, which is why a node with more reliable streams than its build
+// allows fails at the last one.
+//
+// AND THE SESSION IS THE PART THAT GOES WRONG IN THE FIELD.  An agent
+// that restarts leaves the client believing it has a participant, a
+// topic and a publisher that no longer exist; every write after that
+// succeeds locally and arrives nowhere.  The only thing that notices is
+// the heartbeat, which is why `RosSession` carries one and why
+// `session_is_stale` exists.
+
+use rosmsg
+
+// ── Stream kinds ─────────────────────────────────────────────────────
+
+// No stream at all: the message travels in the session's own
+// out-of-band channel.  For the session handshake and nothing else.
+pub const ROS_STREAM_NONE = 0
+// Best effort: sent once, not numbered, not acknowledged.  What a
+// sensor topic uses, and what costs no buffer.
+pub const ROS_STREAM_BEST_EFFORT = 1
+// Reliable: numbered, acknowledged, retransmitted.  What a command
+// topic and every service call uses, and what costs a retransmission
+// buffer sized at compile time.
+pub const ROS_STREAM_RELIABLE = 2
+
+// Which XRCE stream a quality-of-service reliability setting becomes.
+//
+// `ROS_RELIABILITY_RELIABLE` becomes a reliable stream and
+// `ROS_RELIABILITY_BEST_EFFORT` a best-effort one.  The middleware's
+// own default is reliable here, which is the safe direction: a
+// best-effort topic on a reliable stream works and costs a buffer, and
+// the other way round loses messages.
+//
+// ```novo
+// use rostransport
+// use rosqos
+//
+// fn main() [io]
+//     println("${rostransport.stream_for(rosqos.ROS_RELIABILITY_BEST_EFFORT)}")
+//     // 1, a best-effort stream
+// ```
+pub fn stream_for(reliability: Int) -> Int []
+    todo("ros2-nv.rostransport.stream_for")
+
+// The stream kind in words.
+pub fn stream_name(kind: Int) -> Str []
+    todo("ros2-nv.rostransport.stream_name")
+
+// How many messages a reliable stream holds for retransmission in a
+// stock micro-ROS build: 4.
+//
+// Fixed at compile time, and shared per stream.  A publisher on a
+// reliable stream that gets four messages ahead of the agent's
+// acknowledgements blocks or drops, depending on the build.
+pub const ROS_STREAM_HISTORY = 4
+
+// ── The session ──────────────────────────────────────────────────────
+
+// The session has not been opened.
+pub const ROS_SESSION_CLOSED = 0
+// A create request has gone out and no status has come back.
+pub const ROS_SESSION_OPENING = 1
+// The agent has acknowledged the session.
+pub const ROS_SESSION_ESTABLISHED = 2
+// The agent stopped answering heartbeats.
+pub const ROS_SESSION_LOST = 3
+
+// One client's conversation with one agent.
+//
+// A `@value` of integers, so a driver holds it beside its transport
+// handle with nothing on a heap.
+pub @value
+struct RosSession
+    // One of `ROS_SESSION_*`.
+    state: Int
+    // The four bytes that identify this client to the agent.  Two
+    // clients with the same key on one agent take each other's
+    // entities, which is a failure that looks like a flapping node.
+    client_key: Int
+    // The session identifier the agent assigned.
+    session_id: Int
+    // The next request identifier to send.  Every create, write and
+    // read carries one and the agent's status quotes it back.
+    next_request: Int
+    // The last sequence number written on the reliable stream.
+    output_seq: Int
+    // The last sequence number accepted from the agent.
+    input_seq: Int
+    // The transport's buffer size, in bytes.
+    mtu: Int
+    // How long since the agent last answered, in milliseconds.  The
+    // caller measures it; this package has no clock.
+    silent_ms: Int
+
+// A session that has not been opened, for a client key and a transport
+// size.
+//
+// ```novo
+// use rostransport
+//
+// fn main() [io]
+//     println("${rostransport.session(0xaabbccdd, 512).state}")   // 0
+// ```
+pub fn session(client_key: Int, mtu: Int) -> RosSession []
+    todo("ros2-nv.rostransport.session")
+
+// Whether the session may carry messages.
+pub fn session_is_ready(s: RosSession) -> Bool []
+    todo("ros2-nv.rostransport.session_is_ready")
+
+// The session with `delta_ms` more milliseconds of silence.
+pub fn session_silent(s: RosSession, delta_ms: Int) -> RosSession []
+    todo("ros2-nv.rostransport.session_silent")
+
+// The session with the silence cleared, because the agent answered.
+pub fn session_heard(s: RosSession) -> RosSession []
+    todo("ros2-nv.rostransport.session_heard")
+
+// Whether the agent has been silent longer than it should be.
+//
+// The one thing that notices an agent restart.  Until this answers
+// true, every write succeeds locally and arrives nowhere, because the
+// client still believes in entities the new agent has never heard of.
+pub fn session_is_stale(s: RosSession, timeout_ms: Int) -> Bool []
+    todo("ros2-nv.rostransport.session_is_stale")
+
+// How long a client should wait between heartbeats, in milliseconds:
+// 100.
+pub const ROS_HEARTBEAT_MS = 100
+
+// How long a client should let an agent be silent before declaring the
+// session lost, in milliseconds: 1000.
+pub const ROS_SESSION_TIMEOUT_MS = 1000
+
+// The session after the agent acknowledged it.
+pub fn session_established(s: RosSession, session_id: Int) -> RosSession []
+    todo("ros2-nv.rostransport.session_established")
+
+// The session with its next request identifier taken.
+pub fn session_next_request(s: RosSession) -> RosSession []
+    todo("ros2-nv.rostransport.session_next_request")
+
+// The session after one message went out on the reliable stream.
+pub fn session_wrote(s: RosSession) -> RosSession []
+    todo("ros2-nv.rostransport.session_wrote")
+
+// Whether a sequence number from the agent is the next one expected.
+//
+// A number that is not is either a retransmission, which is dropped, or
+// a gap, which the client acknowledges negatively.  Getting this
+// backwards makes a link that works until the first lost byte.
+pub fn sequence_is_next(s: RosSession, seq: Int) -> Bool []
+    todo("ros2-nv.rostransport.sequence_is_next")
+
+// Whether a sequence number is one already seen.
+//
+// XRCE sequence numbers are sixteen bits and WRAP, so "already seen" is
+// a comparison in modular arithmetic and not a `<`.  A client that used
+// a plain comparison rejects every message for half the sequence space
+// once the counter has gone round, about an hour into a run at a
+// hundred messages a second.
+pub fn sequence_is_old(s: RosSession, seq: Int) -> Bool []
+    todo("ros2-nv.rostransport.sequence_is_old")
+
+// The session state in words.
+pub fn session_state_name(state: Int) -> Str []
+    todo("ros2-nv.rostransport.session_state_name")
+
+// ── Framing ───────────────────────────────────────────────────────────
+
+// How many bytes the session puts around a message.
+//
+// The XRCE message header and the submessage header, which come out of
+// the transport's buffer before the payload does.  `kind` is one of
+// `ROS_STREAM_*`: a reliable stream costs two more bytes than a
+// best-effort one, for its sequence number.
+pub fn framing_overhead(kind: Int) -> Int []
+    todo("ros2-nv.rostransport.framing_overhead")
+
+// Whether a message fits this session's transport.
+//
+// The payload, the encapsulation header and the framing, against the
+// session's own buffer size.  A message that does not fit is DROPPED BY
+// THE TRANSPORT, below the layer that could report it.
+pub fn message_fits(s: RosSession, m: RosMessage, kind: Int) -> Bool []
+    todo("ros2-nv.rostransport.message_fits")
+
+// ── The byte pipe ────────────────────────────────────────────────────
+
+// A pipe that carries whole XRCE messages between a client and its
+// agent.
+//
+// WHOLE MESSAGES, NOT BYTES.  A serial link frames with a begin flag
+// and an escape byte and a checksum; a TCP link puts a two-byte length
+// in front; a UDP link needs neither because a datagram is already a
+// frame.  All three are the transport's business and none of them is
+// this package's, so the trait's unit is a message and an implementation
+// does whatever its medium needs underneath.
+pub trait RosTransport[e]
+    // Send one whole message.  Answers whether every byte went out.
+    fn ros_send(self, frame: Bytes) -> Bool [e]
+    // Take the next whole message, or nothing when none has arrived.
+    //
+    // NOT A BLOCKING READ.  A node on a device polls this from its own
+    // loop and a node on a host from a task, and a blocking read would
+    // make the first impossible.  `timeout_ms` is passed to whatever
+    // waiting the medium does; zero means take what is already there.
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes [e]
+    // Whether the pipe is open.
+    fn ros_is_open(self) -> Bool [e]
+    // Close it.
+    fn ros_close(self) [e]
+    // The largest message this pipe carries, in bytes.  Answered
+    // without performing anything, because a driver asks it once.
+    fn ros_mtu(self) -> Int
+
+// Open a session with the agent.
+//
+// `[e]`, so the cost is the pipe's.  Sends the create request and takes
+// the agent's status; answers the session with its state set to
+// established, or to closed when no status came back within
+// `timeout_ms`.
+//
+// ONE EXCHANGE, NOT A RETRY LOOP.  A node that cannot reach its agent
+// has to decide what to do about it — wait, blink a light, carry on
+// measuring into a buffer — and a library that hid the retry would
+// decide for it.
+pub fn open_session<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> RosSession [e]
+    todo("ros2-nv.rostransport.open_session")
+
+// Tell the agent the session is over.
+pub fn close_session<T: RosTransport[e]>(t: T, s: RosSession) -> RosSession [e]
+    todo("ros2-nv.rostransport.close_session")
+
+// Send one message on a stream.
+//
+// Answers the return code: `ROS_RET_OK`, `ROS_RET_NOT_INIT` for a
+// session that is not established, `ROS_RET_INVALID_ARGUMENT` for a
+// message larger than the transport, and `ROS_RET_AGENT_UNREACHABLE`
+// when the pipe refused it.
+pub fn send_message<T: RosTransport[e]>(t: T, s: RosSession, m: RosMessage, kind: Int) -> Int [e]
+    todo("ros2-nv.rostransport.send_message")
+
+// Take one message from the agent, or nothing.
+//
+// Answers the raw bytes; `rosmsg.decode_envelope` is what turns them
+// into a message, and which type they are is the caller's, because only
+// the caller knows which subscription the object identifier belongs to.
+pub fn take_message<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> ?Bytes [e]
+    todo("ros2-nv.rostransport.take_message")
+
+// Send a heartbeat if one is due, and answer the session.
+//
+// `elapsed_ms` is how long since this was last called.  The one
+// periodic obligation a micro-ROS client has, and the only thing that
+// notices an agent that went away.
+pub fn heartbeat<T: RosTransport[e]>(t: T, s: RosSession, elapsed_ms: Int) -> RosSession [e]
+    todo("ros2-nv.rostransport.heartbeat")
+
+// Whether the pipe reports itself open and the session established.
+pub fn is_connected<T: RosTransport[e]>(t: T, s: RosSession) -> Bool [e]
+    todo("ros2-nv.rostransport.is_connected")

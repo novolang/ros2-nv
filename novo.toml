@@ -1,0 +1,66 @@
+[package]
+name        = "ros2-nv"
+version     = "0.0.1"
+description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, with one host module named below, and the plan's row for this
+# package says `host`.
+#
+# The subject is rclc, which is the ROS 2 client library for a
+# microcontroller, so the microcontroller is the half that decides the
+# layer.  The return codes, the name rules, the QoS arithmetic, the
+# handle table and the executor's step machine are integer arithmetic
+# over values a caller already holds, and they run on a part with
+# sixty-four kilobytes of RAM.  The session is written over
+# `RosTransport[e]` and declares `[e]`, the effect the implementation
+# behind the byte pipe supplies (SPEC § 5.6) — `[hw]` for a UART on a
+# device, `[net]` for a socket on a host, nothing for a recorded
+# exchange in a test.
+#
+# `tests/embedded_probe.nv` is what makes the claim a thing the audit
+# BUILDS: `rosret`, `rosqos`, `rosgraph` and `rosexec` link for
+# `--target=nrf52-qemu`.
+layer       = "core"
+
+# `rosagent` is the one module that performs: a Micro XRCE-DDS session
+# over a TCP stream to a micro-ROS agent, through `std.net`'s byte pair.
+# `[net]`, and nothing else — no clock, because every timeout in this
+# package is a number the caller measures.
+host_modules = ["rosagent"]
+
+category    = "embedded"
+
+tags        = ["ros2", "ros", "rclc", "micro-ros", "robotics", "xrce-dds",
+               "dds", "qos", "embedded", "no-alloc"]
+repository  = "https://github.com/novolang/ros2-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Two endpoints that never connect, and the function that says so first"
+
+[dependencies]
+# NONE, and the absence that matters is a serialiser.
+#
+# A ROS 2 message on the wire is Common Data Representation, and this
+# package carries a payload as bytes it does not read.  CDR is its own
+# subject — the alignment rules, the encapsulation header, the byte
+# order flag, the sequence and string encodings — and the ROS 2 plan
+# already names `cdr-nv` as the package that owns it.  A copy of it here
+# would be a second original, and a bag reader and a node would then
+# disagree about a padding byte.
+#
+# `rosmsg` is the seam: it holds the bytes, the encapsulation header
+# that says which byte order they are in, and the type identity, and it
+# reads none of the payload.

@@ -1,0 +1,281 @@
+// rostransport_tests.nv — the session, the stream kinds, and the whole
+// package driven over a byte pipe that touches nothing.
+//
+// RED ON PURPOSE: the first `todo()` each test reaches ends it.
+//
+// `RosTapeLink` SATISFIES `RosTransport[]` — the empty supply, which is
+// how an implementation asserts it is pure (SPEC § 5.6) — so every
+// session function is called here at NO EFFECT AT ALL.  That is the
+// claim the layer rests on: a `core` package whose session functions
+// declare `[e]` costs a caller whatever the caller's pipe costs, and a
+// caller whose pipe is a recording pays nothing.  The same functions
+// over `rosagent`'s TCP link are `[net]`, and nothing in the package
+// changes.
+//
+// THE AGENT MODULE IS NAMED THROUGH A FUNCTION THAT IS NEVER REACHED.
+// `over_a_real_agent` names `connect`, `disconnect` and the rest with
+// their `[net]` row; it is guarded by a host nothing listens on, and
+// the first `todo()` ends the test before it.
+
+use std.bytes
+use std.test
+use rosagent
+use rosmsg
+use rosret
+use rostransport
+
+// A pipe that answers recorded bytes and sends into nothing.
+struct RosTapeLink
+    canned: Bytes
+    open: Bool
+
+impl RosTransport[] for RosTapeLink
+    fn ros_send(self, frame: Bytes) -> Bool
+        self.open
+
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes
+        if self.open
+            Some(self.canned)
+        else
+            None
+
+    fn ros_is_open(self) -> Bool
+        self.open
+
+    fn ros_close(self)
+        ()
+
+    fn ros_mtu(self) -> Int
+        512
+
+fn a_tape() -> RosTapeLink
+    RosTapeLink { canned: bytes.zeros(16), open: true }
+
+fn a_dead_pipe() -> RosTapeLink
+    RosTapeLink { canned: bytes.zeros(0), open: false }
+
+// Names the whole `[net]` surface, and the reassembly that needs a
+// socket to have been opened.
+//
+// NEVER CALLED.  A `RosAgentLink` holds a socket, so a link cannot be
+// built without `[net]`; the reassembly assertions a caller would want
+// belong in a suite with an agent to talk to, and what this function
+// does here is prove that every signature can be spelled from outside
+// the package with the types a consumer holds.
+fn over_a_real_agent() -> Int [net]
+    match rosagent.connect("127.0.0.1", rosagent.ROS_AGENT_DEFAULT_PORT)
+        Some(l) =>
+            // An empty link holds no whole message; two prefix bytes
+            // are still not a message; the eight that follow make one,
+            // and taking it shortens the link.
+            let half = rosagent.feed(l, rosagent.length_prefix(8))
+            let whole = rosagent.feed(half, bytes.zeros(8))
+            let (rest, frame) = rosagent.take_frame(whole)
+            let n = bytes.len(frame) + rosagent.pending_bytes(rest)
+            let over = rosagent.link_over(rest.sock, rosagent.ROS_AGENT_MTU)
+            var more = 0
+            if rosagent.has_whole_frame(over)
+                more = 1
+            rosagent.disconnect(rest)
+            n + more
+        None    =>
+            match rosagent.connect_with_mtu("127.0.0.1", 8888, 1024)
+                Some(l2) =>
+                    rosagent.disconnect(l2)
+                    2
+                None     => 0
+
+@test
+fn test_a_pure_pipe_costs_a_caller_nothing() [io]
+    // This test declares `[io]` for its own assertions and nothing
+    // else.  Every session call below is charged the implementation's
+    // supply, which is empty.
+    let t = a_tape()
+
+    test.case("the pipe answers its size without performing")
+    test.assert_eq(t.ros_mtu(), 512)
+
+    test.case("and it is open")
+    test.assert(t.ros_is_open())
+    test.assert(not a_dead_pipe().ros_is_open())
+
+@test
+fn test_a_session_carries_nothing_until_the_agent_says_so() [io]
+    // A node on a microcontroller is not a ROS 2 participant: its
+    // topics do not exist until the agent has created them.
+    let s = rostransport.session(0xaabbccdd, 512)
+
+    test.case("a fresh session is closed")
+    test.assert_eq(s.state, rostransport.ROS_SESSION_CLOSED)
+    test.assert(not rostransport.session_is_ready(s))
+    test.assert_eq(s.mtu, 512)
+
+    test.case("and one the agent acknowledged is ready")
+    let up = rostransport.session_established(s, 0x81)
+    test.assert_eq(up.state, rostransport.ROS_SESSION_ESTABLISHED)
+    test.assert(rostransport.session_is_ready(up))
+    test.assert(str.len(rostransport.session_state_name(up.state)) > 0)
+
+    test.case("opening one is one exchange and not a retry loop")
+    let opened = rostransport.open_session(a_dead_pipe(), s, 100)
+    test.assert(not rostransport.session_is_ready(opened))
+
+    test.case("and closing one says so to the agent")
+    test.assert_eq(rostransport.close_session(a_tape(), up).state,
+                   rostransport.ROS_SESSION_CLOSED)
+
+@test
+fn test_the_heartbeat_is_the_only_thing_that_notices_an_agent_restart() [io]
+    // Until it does, every write succeeds locally and arrives nowhere,
+    // because the client still believes in entities the new agent has
+    // never heard of.
+    let s = rostransport.session_established(rostransport.session(1, 512), 1)
+
+    test.case("silence accumulates")
+    let quiet = rostransport.session_silent(s, 1500)
+    test.assert(rostransport.session_is_stale(quiet,
+                                              rostransport.ROS_SESSION_TIMEOUT_MS))
+
+    test.case("and hearing from the agent clears it")
+    test.assert(not rostransport.session_is_stale(
+        rostransport.session_heard(quiet), rostransport.ROS_SESSION_TIMEOUT_MS))
+
+    test.case("a short silence is not staleness")
+    test.assert(not rostransport.session_is_stale(
+        rostransport.session_silent(s, 50), rostransport.ROS_SESSION_TIMEOUT_MS))
+
+    test.case("the two intervals")
+    test.assert_eq(rostransport.ROS_HEARTBEAT_MS, 100)
+    test.assert_eq(rostransport.ROS_SESSION_TIMEOUT_MS, 1000)
+
+    test.case("and the heartbeat is sent over the pipe")
+    test.assert(rostransport.session_is_ready(
+        rostransport.heartbeat(a_tape(), s, 200)))
+    test.assert(rostransport.is_connected(a_tape(), s))
+
+@test
+fn test_reliability_becomes_a_stream_kind_here() [io]
+    // Between a microcontroller and its agent there is no DDS: there
+    // is an XRCE stream, and a stream is either best-effort or
+    // reliable with a retransmission buffer.
+    test.case("the two mappings")
+    test.assert_eq(rostransport.stream_for(1), rostransport.ROS_STREAM_RELIABLE)
+    test.assert_eq(rostransport.stream_for(2), rostransport.ROS_STREAM_BEST_EFFORT)
+
+    test.case("and the middleware default maps to the safe direction")
+    test.assert_eq(rostransport.stream_for(0), rostransport.ROS_STREAM_RELIABLE)
+
+    test.case("a reliable stream costs a buffer sized at compile time")
+    test.assert_eq(rostransport.ROS_STREAM_HISTORY, 4)
+    test.assert(str.len(rostransport.stream_name(
+        rostransport.ROS_STREAM_BEST_EFFORT)) > 0)
+    test.assert_eq(rostransport.ROS_STREAM_NONE, 0)
+
+    test.case("and it costs two more framing bytes for its sequence number")
+    test.assert(rostransport.framing_overhead(rostransport.ROS_STREAM_RELIABLE)
+                > rostransport.framing_overhead(rostransport.ROS_STREAM_BEST_EFFORT))
+
+@test
+fn test_a_sequence_number_wraps_and_a_plain_comparison_does_not() [io]
+    // XRCE sequence numbers are sixteen bits.  A client that compared
+    // them with `<` rejects every message for half the sequence space
+    // once the counter has gone round, about an hour into a run at a
+    // hundred messages a second.
+    let s = rostransport.session_established(rostransport.session(1, 512), 1)
+
+    test.case("the next one is the next one")
+    test.assert(rostransport.sequence_is_next(s, 1))
+
+    test.case("one already seen is old")
+    test.assert(rostransport.sequence_is_old(s, 0))
+
+    test.case("a write advances the outgoing counter")
+    test.assert(rostransport.session_wrote(s).output_seq > s.output_seq)
+
+    test.case("and a number half the space away is not old")
+    // The wrap is what a plain comparison gets wrong: 0 arriving after
+    // 65535 is the next message, not one from an hour ago.
+    test.assert(not rostransport.sequence_is_old(s, 40000))
+
+@test
+fn test_a_message_larger_than_the_transport_is_refused_here() [io]
+    // Because the transport will drop it below the layer that could
+    // report it.
+    let s = rostransport.session_established(rostransport.session(1, 512), 1)
+    let small = rosmsg.message(bytes.zeros(64), 1234)
+    let big = rosmsg.message(bytes.zeros(600), 1234)
+
+    test.case("a small message fits")
+    test.assert(rostransport.message_fits(s, small,
+                                          rostransport.ROS_STREAM_BEST_EFFORT))
+
+    test.case("a large one does not")
+    test.assert(not rostransport.message_fits(s, big,
+                                              rostransport.ROS_STREAM_BEST_EFFORT))
+
+    test.case("and sending it answers a code rather than succeeding")
+    test.assert_eq(rostransport.send_message(a_tape(), s, big,
+                                             rostransport.ROS_STREAM_BEST_EFFORT),
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+
+    test.case("a session that is not established refuses everything")
+    test.assert_eq(rostransport.send_message(a_tape(),
+                                             rostransport.session(1, 512),
+                                             small,
+                                             rostransport.ROS_STREAM_BEST_EFFORT),
+                   rosret.ROS_RET_NOT_INIT)
+
+    test.case("and a closed pipe answers that the agent is unreachable")
+    test.assert_eq(rostransport.send_message(a_dead_pipe(), s, small,
+                                             rostransport.ROS_STREAM_RELIABLE),
+                   rosret.ROS_RET_AGENT_UNREACHABLE)
+
+@test
+fn test_taking_a_message_answers_bytes_and_not_a_type() [io]
+    // Which subscription an object identifier belongs to is the
+    // caller's knowledge, not this package's.
+    let s = rostransport.session_established(rostransport.session(1, 512), 1)
+
+    test.case("something arrived")
+    match rostransport.take_message(a_tape(), s, 0)
+        Some(b) => test.assert(bytes.len(b) > 0)
+        None    => test.assert(false)
+
+    test.case("and nothing did")
+    match rostransport.take_message(a_dead_pipe(), s, 0)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("the next request identifier is taken one at a time")
+    test.assert(rostransport.session_next_request(s).next_request
+                > s.next_request)
+
+@test
+fn test_a_tcp_message_carries_its_own_length() [io]
+    // TCP has no frames of its own, and a reader that took whatever
+    // `recv` returned would get half a message as often as it got two.
+    test.case("two bytes, least significant first")
+    test.assert_eq(bytes.len(rosagent.length_prefix(300)),
+                   rosagent.ROS_TCP_LENGTH_BYTES)
+    test.assert_eq(rosagent.length_of_prefix(rosagent.length_prefix(300)), 300)
+
+    test.case("a prefix that is not two bytes describes nothing")
+    test.assert_eq(rosagent.length_of_prefix(bytes.zeros(1)), -1)
+
+    test.case("the agent's port and this transport's size")
+    test.assert_eq(rosagent.ROS_AGENT_DEFAULT_PORT, 8888)
+    test.assert_eq(rosagent.ROS_AGENT_MTU, 2048)
+
+@test
+fn test_the_length_prefix_round_trips_without_a_socket() [io]
+    // The reassembly itself needs a link, a link holds a socket, and a
+    // socket needs `[net]` — so the loop that turns a byte stream back
+    // into messages is named in `over_a_real_agent` and asserted in a
+    // suite that has an agent.  What can be checked with no socket is
+    // the framing arithmetic, which is the part a caller writing its
+    // own transport has to match.
+    test.case("a hundred and thirty bytes, and back")
+    test.assert_eq(rosagent.length_of_prefix(rosagent.length_prefix(130)), 130)
+
+    test.case("and zero, which is a legal message length in XRCE")
+    test.assert_eq(rosagent.length_of_prefix(rosagent.length_prefix(0)), 0)

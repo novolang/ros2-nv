@@ -1,0 +1,218 @@
+// rosret.nv — rcl's return codes, and the four of them that are not
+// failures.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A return code is
+// an integer; nothing here allocates and nothing here performs.
+//
+// AN INTEGER AND NOT AN ENUM, because that is what the reference does
+// and because the reference is right about it here.  `rcl_ret_t` is an
+// `int` with a numbering that groups by subsystem — 0 for success, 1xx
+// for the context, 2xx for the node, 3xx for a publisher, 4xx for a
+// subscription — and that shape survives a `switch` in an interrupt
+// handler, a log line on a device with no heap, and a value returned
+// through four layers.  An enum whose variants carried the offending
+// name would be a heap value at every one of those points.
+//
+// `ros_ret_is_error` IS THE LOAD-BEARING FUNCTION AND IT IS WHY THIS
+// MODULE EXISTS.  `RCL_RET_SUBSCRIPTION_TAKE_FAILED` is not an error.
+// A wait set reports that a subscription has data, the take that
+// follows finds none, and the code comes back — which happens
+// routinely, because the two questions are asked of the middleware at
+// two different moments and a message can be taken by another reader in
+// between.  Almost every example written against rclc tests
+// `ret != RCL_RET_OK` and logs a failure, so a working node prints
+// errors under load and an operator learns to ignore its log.  The same
+// is true of the client and service take codes and of
+// `RCL_RET_TIMEOUT`, which is what a spin with nothing to do answers.
+//
+// So there are two questions, not one: `ros_ret_is_ok` asks whether
+// something happened, and `ros_ret_is_error` asks whether something is
+// wrong.  They are different questions and the four codes between them
+// are the reason.
+
+// ── Success, and the three general failures ──────────────────────────
+
+// The call did what it was asked: 0.
+pub const ROS_RET_OK = 0
+// An unspecified failure: 1.
+pub const ROS_RET_ERROR = 1
+// The call ran out of time.  NOT an error: a spin with nothing ready
+// answers this once per cycle: 2.
+pub const ROS_RET_TIMEOUT = 2
+// The operation is not implemented by this middleware: 3.
+pub const ROS_RET_UNSUPPORTED = 3
+// An allocation failed: 10.  On a device with a fixed handle table this
+// means the table is full rather than that a heap is exhausted.
+pub const ROS_RET_BAD_ALLOC = 10
+// An argument was not valid: 11.
+pub const ROS_RET_INVALID_ARGUMENT = 11
+
+// ── The context (1xx) ────────────────────────────────────────────────
+
+// Init was called on a context that is already initialised: 100.
+pub const ROS_RET_ALREADY_INIT = 100
+// The context has not been initialised: 101.
+pub const ROS_RET_NOT_INIT = 101
+// A name that is not a valid topic name: 103.
+pub const ROS_RET_TOPIC_NAME_INVALID = 103
+// A name that is not a valid service name: 104.
+pub const ROS_RET_SERVICE_NAME_INVALID = 104
+// A name containing a substitution nothing defines: 105.
+pub const ROS_RET_UNKNOWN_SUBSTITUTION = 105
+// Shutdown was called on a context that is already shut down: 106.
+pub const ROS_RET_ALREADY_SHUTDOWN = 106
+
+// ── The node (2xx) ───────────────────────────────────────────────────
+
+// The node handle is not valid: 200.
+pub const ROS_RET_NODE_INVALID = 200
+// The node's name is not valid: 201.
+pub const ROS_RET_NODE_INVALID_NAME = 201
+// The node's namespace is not valid: 202.
+pub const ROS_RET_NODE_INVALID_NAMESPACE = 202
+
+// ── The endpoints (3xx to 6xx) ───────────────────────────────────────
+
+// The publisher handle is not valid: 300.
+pub const ROS_RET_PUBLISHER_INVALID = 300
+// The subscription handle is not valid: 400.
+pub const ROS_RET_SUBSCRIPTION_INVALID = 400
+// A take found no message after the wait set said there was one: 401.
+// NOT an error — see the module comment.
+pub const ROS_RET_SUBSCRIPTION_TAKE_FAILED = 401
+// The client handle is not valid: 500.
+pub const ROS_RET_CLIENT_INVALID = 500
+// A client take found no response: 501.  NOT an error.
+pub const ROS_RET_CLIENT_TAKE_FAILED = 501
+// The service handle is not valid: 600.
+pub const ROS_RET_SERVICE_INVALID = 600
+// A service take found no request: 601.  NOT an error.
+pub const ROS_RET_SERVICE_TAKE_FAILED = 601
+
+// ── The timer and the wait set (8xx, 9xx) ────────────────────────────
+
+// The timer handle is not valid: 800.
+pub const ROS_RET_TIMER_INVALID = 800
+// The timer has been cancelled: 801.
+pub const ROS_RET_TIMER_CANCELED = 801
+// The wait set handle is not valid: 900.
+pub const ROS_RET_WAIT_SET_INVALID = 900
+// There is nothing in the wait set to wait on: 901.
+pub const ROS_RET_WAIT_SET_EMPTY = 901
+// The wait set has no room for another handle: 902.  On a device this
+// is the one that says the handle table declared at init is too small.
+pub const ROS_RET_WAIT_SET_FULL = 902
+
+// ── Beyond rcl ───────────────────────────────────────────────────────
+//
+// Two codes this package adds, in a range rcl leaves free, because the
+// two conditions have no rcl code and answering `ROS_RET_ERROR` for
+// them would lose the only two diagnoses a caller can act on.
+
+// A publisher and a subscription have offered and requested quality of
+// service settings that cannot match: 10001.
+//
+// There is no rcl code for this because in rcl it is not a failure at
+// all: the two endpoints are created successfully and then never
+// connect.  `rosqos.compatible` is what answers it before either is
+// created.
+pub const ROS_RET_QOS_INCOMPATIBLE = 10001
+
+// The agent did not answer, or answered something this session cannot
+// read: 10002.
+//
+// A micro-ROS node's whole existence depends on an agent process
+// elsewhere, which rcl on a workstation has no equivalent of.
+pub const ROS_RET_AGENT_UNREACHABLE = 10002
+
+// Whether the call did what it was asked.
+//
+// ```novo
+// use rosret
+//
+// fn main() [io]
+//     println("${rosret.ros_ret_is_ok(rosret.ROS_RET_OK)}")   // true
+// ```
+pub @tier(embedded)
+fn ros_ret_is_ok(ret: Int) -> Bool []
+    todo("ros2-nv.rosret.ros_ret_is_ok")
+
+// Whether something is WRONG, which is a different question.
+//
+// False for `ROS_RET_OK`, for `ROS_RET_TIMEOUT`, and for the three
+// `*_TAKE_FAILED` codes: those five all mean "nothing happened", and
+// nothing happening is the ordinary state of a node that is waiting.  A
+// node that logged all five reports failures under load, and the
+// operator learns to ignore the log.
+//
+// ```novo
+// use rosret
+//
+// fn main() [io]
+//     println("${rosret.ros_ret_is_error(rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)}")
+//     // false — the wait set said there was a message and there was not
+//     println("${rosret.ros_ret_is_error(rosret.ROS_RET_NODE_INVALID_NAME)}")
+//     // true
+// ```
+pub @tier(embedded)
+fn ros_ret_is_error(ret: Int) -> Bool []
+    todo("ros2-nv.rosret.ros_ret_is_error")
+
+// Whether the code means a take found nothing.
+//
+// The three `*_TAKE_FAILED` codes as one question, for an executor loop
+// that wants to move on to the next handle.
+pub @tier(embedded)
+fn ros_ret_is_take_failed(ret: Int) -> Bool []
+    todo("ros2-nv.rosret.ros_ret_is_take_failed")
+
+// Whether the code means a handle is not usable at all.
+//
+// The `*_INVALID` codes.  The distinction a retry loop needs: an
+// invalid handle is a program that is wrong, and no amount of spinning
+// makes it right.
+pub @tier(embedded)
+fn ros_ret_is_invalid_handle(ret: Int) -> Bool []
+    todo("ros2-nv.rosret.ros_ret_is_invalid_handle")
+
+// Which subsystem a code belongs to: its hundreds digit, or -1 for a
+// code with no subsystem.
+//
+// 0 for the general codes, 1 for the context, 2 for the node, 3 for a
+// publisher, 4 for a subscription, 5 for a client, 6 for a service, 8
+// for a timer and 9 for a wait set.  The grouping is rcl's own
+// numbering, and a diagnostic that names the subsystem tells a reader
+// which of the twelve things they wrote is at fault.
+pub @tier(embedded)
+fn ros_ret_subsystem(ret: Int) -> Int []
+    todo("ros2-nv.rosret.ros_ret_subsystem")
+
+// The subsystem in words.
+pub @tier(embedded)
+fn ros_ret_subsystem_name(subsystem: Int) -> Str []
+    todo("ros2-nv.rosret.ros_ret_subsystem_name")
+
+// The code in words, for a log line.
+//
+// A `Str` literal allocates nothing, so a device can write this.
+//
+// ```novo
+// use rosret
+//
+// fn main() [io]
+//     println(rosret.ros_ret_name(rosret.ROS_RET_WAIT_SET_FULL))
+// ```
+pub @tier(embedded)
+fn ros_ret_name(ret: Int) -> Str []
+    todo("ros2-nv.rosret.ros_ret_name")
+
+// Whether this package invented the code rather than taking it from
+// rcl.
+//
+// True for the two above 10000.  Worth asking before a code is reported
+// to something that expects rcl's own numbering.
+pub @tier(embedded)
+fn ros_ret_is_extension(ret: Int) -> Bool []
+    todo("ros2-nv.rosret.ros_ret_is_extension")

@@ -1,0 +1,358 @@
+// rosqos.nv — the settings that decide whether two endpoints ever
+// speak to each other, and the function that answers before either is
+// created.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+//
+// THIS IS THE LOAD-BEARING INTERFACE OF THE PACKAGE, and the argument
+// is that AN INCOMPATIBLE PAIR IS SILENT.  A publisher that offers
+// best-effort delivery and a subscription that requests reliable
+// delivery are both created successfully, both report healthy, and
+// never connect.  Nothing is logged.  `ros2 topic list` shows the
+// topic, `ros2 topic info` shows one publisher and one subscription,
+// and the callback is never called.  The same is true of a volatile
+// publisher against a transient-local subscription, and of an automatic
+// liveliness publisher against a subscription that asks for manual
+// liveliness.
+//
+// The failure is worse on a microcontroller than on a workstation,
+// because the workstation at least has `ros2 topic echo` and a
+// publisher whose settings can be read back from the graph.  A node on
+// a Cortex-M has a UART and whatever it was compiled to print.
+//
+// So `compatible` is a pure function over two settings values, it
+// answers WHICH policy is the offender, and it is meant to be called at
+// startup — before the endpoint exists, on the device, with the answer
+// printed once.
+//
+// THE RULE IS "REQUESTED VERSUS OFFERED" AND IT IS NOT SYMMETRIC.  The
+// publisher OFFERS and the subscription REQUESTS, and a match needs the
+// offer to be at least as strong as the request.  Reliable satisfies a
+// request for best-effort; best-effort does not satisfy a request for
+// reliable.  Swapping the two arguments of `compatible` therefore gives
+// a different answer, which is why they are named rather than
+// positional in the doc comments.
+//
+// AND TWO POLICIES DO NOT PARTICIPATE AT ALL.  History and its depth
+// are local to each endpoint, and lifespan is the publisher's own
+// business; none of them can prevent a match.  A depth of 1 against a
+// depth of 100 is a perfectly good pair that will drop messages, which
+// is a different problem with a different fix.
+
+// ── History ──────────────────────────────────────────────────────────
+
+// Keep the last `depth` messages.  Every profile below uses this.
+pub const ROS_HISTORY_KEEP_LAST = 1
+// Keep every message, up to the middleware's resource limits.
+pub const ROS_HISTORY_KEEP_ALL = 2
+// Whatever the middleware's own default is.
+pub const ROS_HISTORY_SYSTEM_DEFAULT = 0
+
+// ── Reliability ──────────────────────────────────────────────────────
+
+// Retransmit until every subscription has the message.
+pub const ROS_RELIABILITY_RELIABLE = 1
+// Send once and do not look back.  What a sensor stream wants: a
+// retransmitted reading from three cycles ago is worse than no reading.
+pub const ROS_RELIABILITY_BEST_EFFORT = 2
+// Whatever the middleware's own default is.
+pub const ROS_RELIABILITY_SYSTEM_DEFAULT = 0
+
+// ── Durability ───────────────────────────────────────────────────────
+
+// Keep the last messages for subscriptions that join later.  What
+// `/tf_static` and every "latched" topic uses, and the reason a node
+// that starts second can still learn the robot's shape.
+pub const ROS_DURABILITY_TRANSIENT_LOCAL = 1
+// Keep nothing for a late joiner.
+pub const ROS_DURABILITY_VOLATILE = 2
+// Whatever the middleware's own default is.
+pub const ROS_DURABILITY_SYSTEM_DEFAULT = 0
+
+// ── Liveliness ───────────────────────────────────────────────────────
+
+// The middleware asserts that the publisher is alive, by itself.
+pub const ROS_LIVELINESS_AUTOMATIC = 1
+// The publisher asserts it, per topic, by publishing or by saying so.
+// A node whose process is running and whose control loop has stopped is
+// alive under the automatic policy and dead under this one, which is
+// the whole reason it exists.
+pub const ROS_LIVELINESS_MANUAL_BY_TOPIC = 3
+// Whatever the middleware's own default is.
+pub const ROS_LIVELINESS_SYSTEM_DEFAULT = 0
+
+// ── Which policy refused ─────────────────────────────────────────────
+
+// Nothing refused.
+pub const ROS_QOS_POLICY_NONE = 0
+// Reliability.
+pub const ROS_QOS_POLICY_RELIABILITY = 1
+// Durability.
+pub const ROS_QOS_POLICY_DURABILITY = 2
+// Deadline.
+pub const ROS_QOS_POLICY_DEADLINE = 3
+// Liveliness.
+pub const ROS_QOS_POLICY_LIVELINESS = 4
+// The liveliness lease duration.
+pub const ROS_QOS_POLICY_LEASE = 5
+
+// The number that means "no duration at all", which is how ROS 2
+// spells an infinite deadline, lifespan or lease: 0.
+//
+// Zero rather than a large number, because a deadline of zero is not a
+// meaningful request and an infinity has to be spelled somehow.  A
+// caller comparing durations must therefore test for it rather than
+// comparing, which is what `deadline_satisfies` does.
+pub const ROS_DURATION_INFINITE = 0
+
+// ── The settings ─────────────────────────────────────────────────────
+
+// One endpoint's quality of service settings.
+//
+// Durations are in MILLISECONDS rather than nanoseconds.  ROS 2's own
+// structure carries seconds and nanoseconds in two fields; a deadline
+// or a lease that anybody sets by hand is a number of milliseconds, and
+// a nanosecond field on a thirty-two bit part invites the overflow that
+// makes a ten-second lease into a four-second one.
+pub @value
+struct RosQos
+    // One of `ROS_HISTORY_*`.
+    history: Int
+    // How many messages to keep, when the history is keep-last.
+    depth: Int
+    // One of `ROS_RELIABILITY_*`.
+    reliability: Int
+    // One of `ROS_DURABILITY_*`.
+    durability: Int
+    // The longest gap between messages the endpoint promises or
+    // tolerates, in milliseconds, or `ROS_DURATION_INFINITE`.
+    deadline_ms: Int
+    // How long a message stays valid after it is published, in
+    // milliseconds, or `ROS_DURATION_INFINITE`.  Local to the
+    // publisher: it does not participate in matching.
+    lifespan_ms: Int
+    // One of `ROS_LIVELINESS_*`.
+    liveliness: Int
+    // How long the publisher may be silent before it is declared not
+    // alive, in milliseconds, or `ROS_DURATION_INFINITE`.
+    lease_ms: Int
+
+// ROS 2's default profile: keep the last 10, reliable, volatile.
+//
+// What a topic gets when nothing asks for anything else, and the right
+// answer for commands, states and anything a receiver must not miss.
+//
+// ```novo
+// use rosqos
+//
+// fn main() [io]
+//     println("${rosqos.default_profile().depth}")   // 10
+// ```
+pub @tier(embedded)
+fn default_profile() -> RosQos []
+    todo("ros2-nv.rosqos.default_profile")
+
+// The sensor-data profile: keep the last 5, best effort, volatile.
+//
+// The profile every camera, laser scanner and inertial unit in ROS 2
+// publishes with, and the one whose mismatch with the default is the
+// single most common reason a ROS 2 subscription receives nothing.
+pub @tier(embedded)
+fn sensor_data_profile() -> RosQos []
+    todo("ros2-nv.rosqos.sensor_data_profile")
+
+// The services profile: keep the last 10, reliable, volatile.
+pub @tier(embedded)
+fn services_profile() -> RosQos []
+    todo("ros2-nv.rosqos.services_profile")
+
+// The parameters profile: keep the last 1000, reliable, volatile.
+//
+// The depth is not a typo: parameter events are bursty and a node that
+// sets fifty parameters at startup sends fifty messages in a
+// millisecond.
+pub @tier(embedded)
+fn parameters_profile() -> RosQos []
+    todo("ros2-nv.rosqos.parameters_profile")
+
+// The profile a latched topic wants: keep the last 1, reliable,
+// transient local.
+//
+// What `/tf_static`, `/robot_description` and `/map` use.  A
+// subscription that joins a minute after the publisher still gets the
+// last message, which is the only way a topic that is published once at
+// startup is useful at all.
+pub @tier(embedded)
+fn transient_local_profile() -> RosQos []
+    todo("ros2-nv.rosqos.transient_local_profile")
+
+// Every field set to the middleware's own default.
+//
+// The profile to avoid on a robot with more than one middleware in it:
+// what it resolves to is the vendor's choice, so two nodes that both
+// asked for it can still fail to match.
+pub @tier(embedded)
+fn system_default_profile() -> RosQos []
+    todo("ros2-nv.rosqos.system_default_profile")
+
+// A profile from its eight fields.
+pub @tier(embedded)
+fn qos(history: Int, depth: Int, reliability: Int, durability: Int, deadline_ms: Int,
+       lifespan_ms: Int, liveliness: Int, lease_ms: Int) -> RosQos []
+    todo("ros2-nv.rosqos.qos")
+
+// The same profile with a different reliability.
+pub @tier(embedded)
+fn with_reliability(q: RosQos, reliability: Int) -> RosQos []
+    todo("ros2-nv.rosqos.with_reliability")
+
+// The same profile with a different durability.
+pub @tier(embedded)
+fn with_durability(q: RosQos, durability: Int) -> RosQos []
+    todo("ros2-nv.rosqos.with_durability")
+
+// The same profile with a different keep-last depth.
+pub @tier(embedded)
+fn with_depth(q: RosQos, depth: Int) -> RosQos []
+    todo("ros2-nv.rosqos.with_depth")
+
+// The same profile with a different deadline, in milliseconds.
+pub @tier(embedded)
+fn with_deadline(q: RosQos, deadline_ms: Int) -> RosQos []
+    todo("ros2-nv.rosqos.with_deadline")
+
+// ── Compatibility ────────────────────────────────────────────────────
+
+// Whether two endpoints can match, and which policy stopped them.
+pub @value
+struct RosQosCompat
+    // Whether the pair will connect.
+    compatible: Bool
+    // Which policy refused, one of `ROS_QOS_POLICY_*`, or
+    // `ROS_QOS_POLICY_NONE`.  The FIRST one found, in the order
+    // reliability, durability, deadline, liveliness, lease — a pair can
+    // disagree about several and a caller can only fix one at a time.
+    policy: Int
+    // What the publisher offered for that policy.
+    offered: Int
+    // What the subscription requested.
+    requested: Int
+
+// Whether a publisher's offer satisfies a subscription's request.
+//
+// The whole check, in the order the policies are listed above.
+// `offered` is the PUBLISHER's profile and `requested` is the
+// SUBSCRIPTION's; the relation is not symmetric and swapping them gives
+// a different answer.
+//
+// ```novo
+// use rosqos
+//
+// fn main() [io]
+//     // The most common mismatch in ROS 2: a camera publishes best
+//     // effort and a program subscribes with the default profile.
+//     let c = rosqos.compatible(rosqos.sensor_data_profile(),
+//                               rosqos.default_profile())
+//     println("${c.compatible}")   // false
+//     println(rosqos.policy_name(c.policy))   // reliability
+// ```
+pub @tier(embedded)
+fn compatible(offered: RosQos, requested: RosQos) -> RosQosCompat []
+    todo("ros2-nv.rosqos.compatible")
+
+// Whether a reliability offer satisfies a reliability request.
+//
+// Reliable satisfies both requests; best effort satisfies only a
+// best-effort request.
+pub @tier(embedded)
+fn reliability_satisfies(offered: Int, requested: Int) -> Bool []
+    todo("ros2-nv.rosqos.reliability_satisfies")
+
+// Whether a durability offer satisfies a durability request.
+//
+// Transient local satisfies both; volatile satisfies only a volatile
+// request.
+pub @tier(embedded)
+fn durability_satisfies(offered: Int, requested: Int) -> Bool []
+    todo("ros2-nv.rosqos.durability_satisfies")
+
+// Whether an offered deadline satisfies a requested one.
+//
+// The publisher's deadline must be no LONGER than the subscription's: a
+// publisher promising a message every hundred milliseconds satisfies a
+// subscriber that will tolerate two hundred, and not the other way
+// round.  An infinite offered deadline satisfies only an infinite
+// request, which is the case a comparison on the numbers gets backwards
+// because the infinity is spelled zero.
+pub @tier(embedded)
+fn deadline_satisfies(offered_ms: Int, requested_ms: Int) -> Bool []
+    todo("ros2-nv.rosqos.deadline_satisfies")
+
+// Whether a liveliness offer satisfies a liveliness request.
+//
+// Manual-by-topic satisfies both; automatic satisfies only an automatic
+// request.
+pub @tier(embedded)
+fn liveliness_satisfies(offered: Int, requested: Int) -> Bool []
+    todo("ros2-nv.rosqos.liveliness_satisfies")
+
+// Whether an offered lease satisfies a requested one.
+//
+// The same direction as the deadline: the publisher's lease must be no
+// longer than the subscription's tolerance.
+pub @tier(embedded)
+fn lease_satisfies(offered_ms: Int, requested_ms: Int) -> Bool []
+    todo("ros2-nv.rosqos.lease_satisfies")
+
+// Whether this policy takes part in matching at all.
+//
+// False for history, depth and lifespan.  Published because the
+// assumption that a depth mismatch prevents a connection is common, and
+// it sends people looking in the wrong place: two endpoints with
+// depths of 1 and 100 connect perfectly and drop messages, which is a
+// different problem with a different fix.
+pub @tier(embedded)
+fn policy_affects_matching(policy: Int) -> Bool []
+    todo("ros2-nv.rosqos.policy_affects_matching")
+
+// The policy in words.
+pub @tier(embedded)
+fn policy_name(policy: Int) -> Str []
+    todo("ros2-nv.rosqos.policy_name")
+
+// A one-line description of what a caller should change.
+//
+// The difference between a diagnostic and a fix: "reliability" names
+// the policy and "the subscription asks for reliable delivery and the
+// publisher offers best effort; either relax the subscription or make
+// the publisher reliable" names the two edits.
+pub @tier(embedded)
+fn compat_advice(c: RosQosCompat) -> Str []
+    todo("ros2-nv.rosqos.compat_advice")
+
+// Whether every field of a profile holds a value this package knows.
+//
+// A profile built by hand with a reliability of 7 is accepted by the
+// middleware on some vendors and refused on others.
+pub @tier(embedded)
+fn qos_is_valid(q: RosQos) -> Bool []
+    todo("ros2-nv.rosqos.qos_is_valid")
+
+// Whether the profile leaves anything to the middleware.
+//
+// True when any field is a `*_SYSTEM_DEFAULT`.  Worth asking before two
+// nodes on different vendors are expected to match.
+pub @tier(embedded)
+fn qos_has_system_default(q: RosQos) -> Bool []
+    todo("ros2-nv.rosqos.qos_has_system_default")
+
+// How many message slots this profile asks the middleware to hold.
+//
+// The depth for keep-last, and -1 for keep-all, which has no answer.
+// The number that decides how much memory an endpoint costs on a
+// device, and the reason `sensor_data_profile` keeps five and not ten.
+pub @tier(embedded)
+fn queue_slots(q: RosQos) -> Int []
+    todo("ros2-nv.rosqos.queue_slots")

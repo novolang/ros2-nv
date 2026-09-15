@@ -1,0 +1,418 @@
+// rosexec.nv — the executor, as a step a caller drives rather than a
+// loop that calls back.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The executor
+// here decides WHAT to run; the caller runs it.
+//
+// THE INVERSION IS THE LOAD-BEARING DECISION.  rclc's executor takes a
+// function pointer per handle and calls it from inside `spin_some`.
+// Written that way in novo-lang, every registered callback would have
+// to share ONE effect row, because they are all stored in one table of
+// the same function type — so a node with a subscription callback that
+// writes a GPIO and another that only updates a counter would charge
+// both, and every caller of `spin_some`, with hardware access.  A
+// `@value` struct cannot appear in a function value's signature either
+// (E2015), so the message could not be one.
+//
+// So `spin_step` answers WHICH handle is ready and the caller
+// dispatches it with a `match`.  Three things come out of that beyond
+// the effect rows: the dispatch is ordinary code a reader can follow,
+// a test can drive the whole executor with no middleware under it, and
+// a callback can borrow whatever it likes from the enclosing scope
+// because it is not a closure stored in a table.
+//
+// THE ORDER HANDLES WERE ADDED IS THE SCHEDULE.  rclc dispatches ready
+// handles in registration order and nothing in its API says so, so a
+// node whose control callback runs before its sensor callback has a
+// one-cycle delay in its loop that moving two lines of setup code
+// removes.  `add_handle` answers the index it assigned, and
+// `handle_order` is that fact made readable.
+//
+// PUBLISHERS ARE NOT HANDLES.  An executor waits on things that become
+// READY — subscriptions, timers, services, clients and guard conditions
+// — and a publisher never does.  Counting publishers when sizing the
+// executor wastes slots; forgetting timers exhausts it.
+// `handles_required` is the arithmetic, because getting it wrong is a
+// runtime failure on a device.
+
+// ── How many handles ─────────────────────────────────────────────────
+
+// The most handles one executor here can hold: 64.
+//
+// The ready set is a bit per handle in one integer, which is what lets
+// a spin be a value rather than a list.  Sixty-four handles is far more
+// than a microcontroller node has; a node that wants more wants two
+// executors, which is also how rclc gets priorities.
+pub const ROS_EXEC_MAX_HANDLES = 64
+
+// How many executor handles a node needs.
+//
+// Subscriptions, timers, services, clients and guard conditions, added
+// up.  PUBLISHERS ARE NOT COUNTED: nothing waits on one.
+//
+// ```novo
+// use rosexec
+//
+// fn main() [io]
+//     // Two subscriptions, one timer, no services, no clients, no
+//     // guard conditions — and three publishers, which cost nothing.
+//     println("${rosexec.handles_required(2, 1, 0, 0, 0)}")   // 3
+// ```
+pub @tier(embedded)
+fn handles_required(subscriptions: Int, timers: Int, services: Int, clients: Int,
+                    guards: Int) -> Int []
+    todo("ros2-nv.rosexec.handles_required")
+
+// ── When a spin dispatches ───────────────────────────────────────────
+
+// Dispatch as soon as any handle is ready.  rclc's default, and what a
+// node that just wants to react uses.
+pub const ROS_TRIGGER_ANY = 0
+// Dispatch only when EVERY handle is ready.
+//
+// What makes a fusion node deterministic: a filter that needs a reading
+// from three sensors runs once per complete set rather than three times
+// per set with two thirds of its input stale.  The cost is that one
+// silent sensor stops the node.
+pub const ROS_TRIGGER_ALL = 1
+// Dispatch when one named handle is ready, whatever the others are
+// doing.  A timer-driven node whose subscriptions only fill buffers.
+pub const ROS_TRIGGER_ONE = 2
+
+// ── What the two semantics mean ──────────────────────────────────────
+
+// Each callback sees whatever has arrived by the time it runs.
+//
+// rclcpp's behaviour, and rclc's default.  A message published by one
+// callback can be taken by a later callback in the SAME spin, so a
+// three-stage chain propagates in one cycle — and how long that cycle
+// takes depends on which callbacks happened to be ready.
+pub const ROS_SEMANTICS_ROS2 = 0
+
+// Every input is taken at the START of the spin and every output is
+// published at the END.
+//
+// Logical execution time.  A three-stage chain now takes three spins,
+// which is slower and is the point: the delay through the node is the
+// same on every cycle whatever the timing was, so a controller tuned on
+// a bench behaves the same under load.  A callback cannot see data a
+// callback earlier in the same spin produced, which is the property
+// that makes the timing independent of the order.
+pub const ROS_SEMANTICS_LET = 1
+
+// ── When a callback runs ─────────────────────────────────────────────
+
+// Run the callback only when a new message arrived.
+pub const ROS_INVOKE_ON_NEW_DATA = 0
+
+// Run the callback every spin, with or without a message.
+//
+// How a control loop keeps its period when its input is late.  THE
+// CALLBACK GETS NO MESSAGE on the spins where nothing arrived, and a
+// callback written for the other setting reads a buffer holding either
+// nothing or the previous message — which is why `RosExecStep` carries
+// `has_message` as a field rather than leaving it to be inferred.
+pub const ROS_INVOKE_ALWAYS = 1
+
+// ── The executor ─────────────────────────────────────────────────────
+
+// A wait set and a dispatch policy, with no handles' contents in it.
+//
+// What a handle IS — which subscription, which callback — lives with
+// the program.  What lives here is the index, the kind and the two
+// policies, which is everything the dispatch decision needs.
+pub @value
+struct RosExecutor
+    // How many handles this executor was built for.
+    capacity: Int
+    // How many have been added.
+    count: Int
+    // One of `ROS_TRIGGER_*`.
+    trigger: Int
+    // The handle `ROS_TRIGGER_ONE` waits for, or -1.
+    trigger_index: Int
+    // One of `ROS_SEMANTICS_*`.
+    semantics: Int
+    // How long a spin should wait for something to become ready, in
+    // milliseconds.  A number this package never sleeps for: the wait
+    // is the transport's, and this is what the caller passes it.
+    timeout_ms: Int
+    // Which handle the next `spin_step` will consider first.  A spin
+    // walks the handles in registration order and this is where it is.
+    cursor: Int
+
+// An executor with room for `capacity` handles.
+//
+// Trigger any, ROS 2 semantics, a hundred millisecond spin timeout —
+// rclc's own defaults.
+//
+// ```novo
+// use rosexec
+//
+// fn main() [io]
+//     println("${rosexec.executor(3).capacity}")   // 3
+// ```
+pub @tier(embedded)
+fn executor(capacity: Int) -> RosExecutor []
+    todo("ros2-nv.rosexec.executor")
+
+// How many more handles will fit.
+pub @tier(embedded)
+fn remaining_handles(e: RosExecutor) -> Int []
+    todo("ros2-nv.rosexec.remaining_handles")
+
+// Whether one more handle fits.
+pub @tier(embedded)
+fn can_add_handle(e: RosExecutor) -> Bool []
+    todo("ros2-nv.rosexec.can_add_handle")
+
+// The executor with one more handle.
+//
+// UNCHANGED when it is full: `add_handle_ret` is the refusal, and a
+// caller that ignored it would have an executor whose count disagrees
+// with what it thinks it registered.
+pub @tier(embedded)
+fn add_handle(e: RosExecutor) -> RosExecutor []
+    todo("ros2-nv.rosexec.add_handle")
+
+// The return code adding a handle would produce.
+//
+// `ROS_RET_OK`, or `ROS_RET_WAIT_SET_FULL` — which is the code that
+// says the number passed to `executor` was smaller than the number
+// `handles_required` answers.
+pub @tier(embedded)
+fn add_handle_ret(e: RosExecutor) -> Int []
+    todo("ros2-nv.rosexec.add_handle_ret")
+
+// Which position the next handle added will take.
+//
+// THE POSITION IS THE SCHEDULE.  Ready handles are dispatched in this
+// order on every spin, so a node whose control callback was registered
+// before the subscription it consumes runs one cycle behind for the
+// life of the program — and neither the code nor the middleware says
+// so anywhere.
+pub @tier(embedded)
+fn handle_order(e: RosExecutor) -> Int []
+    todo("ros2-nv.rosexec.handle_order")
+
+// The executor with a different trigger policy.
+//
+// `index` is the handle `ROS_TRIGGER_ONE` waits on, and is ignored by
+// the other two.
+pub @tier(embedded)
+fn set_trigger(e: RosExecutor, trigger: Int, index: Int) -> RosExecutor []
+    todo("ros2-nv.rosexec.set_trigger")
+
+// The executor with different semantics.
+pub @tier(embedded)
+fn set_semantics(e: RosExecutor, semantics: Int) -> RosExecutor []
+    todo("ros2-nv.rosexec.set_semantics")
+
+// The executor with a different spin timeout, in milliseconds.
+pub @tier(embedded)
+fn set_timeout(e: RosExecutor, timeout_ms: Int) -> RosExecutor []
+    todo("ros2-nv.rosexec.set_timeout")
+
+// The semantics in words.
+pub @tier(embedded)
+fn semantics_name(semantics: Int) -> Str []
+    todo("ros2-nv.rosexec.semantics_name")
+
+// The trigger policy in words.
+pub @tier(embedded)
+fn trigger_name(trigger: Int) -> Str []
+    todo("ros2-nv.rosexec.trigger_name")
+
+// ── A spin ───────────────────────────────────────────────────────────
+
+// Whether a ready set satisfies the executor's trigger policy.
+//
+// `ready` is a bit per handle, bit `n` for the handle registered `n`th.
+// A bit set means the middleware says that handle has something.
+//
+// ```novo
+// use rosexec
+//
+// fn main() [io]
+//     let e = rosexec.set_trigger(rosexec.executor(3), rosexec.ROS_TRIGGER_ALL, -1)
+//     println("${rosexec.should_dispatch(e, 0x3)}")   // false, two of three
+//     println("${rosexec.should_dispatch(e, 0x7)}")   // true
+// ```
+pub @tier(embedded)
+fn should_dispatch(e: RosExecutor, ready: Int) -> Bool []
+    todo("ros2-nv.rosexec.should_dispatch")
+
+// The bit in a ready set that belongs to handle `index`.
+pub @tier(embedded)
+fn ready_bit(index: Int) -> Int []
+    todo("ros2-nv.rosexec.ready_bit")
+
+// Whether handle `index` is ready in this set.
+pub @tier(embedded)
+fn is_ready(ready: Int, index: Int) -> Bool []
+    todo("ros2-nv.rosexec.is_ready")
+
+// How many handles are ready.
+pub @tier(embedded)
+fn ready_count(ready: Int) -> Int []
+    todo("ros2-nv.rosexec.ready_count")
+
+// What one step of a spin says to do.
+pub @value
+struct RosExecStep
+    // Whether there is anything to dispatch.  False ends the spin.
+    dispatch: Bool
+    // Which handle, in registration order.
+    index: Int
+    // One of `rosgraph`'s `ROS_ENTITY_*` values, as the caller
+    // registered it.
+    kind: Int
+    // Whether a message came with it.  FALSE under
+    // `ROS_INVOKE_ALWAYS` on a spin where nothing arrived, and a
+    // callback that reads a buffer without checking this reads either
+    // nothing or the previous message.
+    has_message: Bool
+    // `ROS_RET_OK`, or the code the take produced.  Very often
+    // `ROS_RET_SUBSCRIPTION_TAKE_FAILED`, which is NOT an error — see
+    // `rosret`.
+    ret: Int
+
+// What to do next, given what the middleware says is ready.
+//
+// Answers a step with `dispatch` false when the trigger policy is not
+// satisfied and when the walk has passed the last handle.  A spin is
+// this called in a loop until it answers false, with the executor it
+// returns from `spin_advance` each time.
+//
+// THE CALLER DISPATCHES.  That is the whole shape of this module: the
+// step names a handle and the caller's own `match` decides what running
+// it means, so the effects a callback has are the caller's and not
+// every caller's.
+pub @tier(embedded)
+fn spin_step(e: RosExecutor, ready: Int) -> RosExecStep []
+    todo("ros2-nv.rosexec.spin_step")
+
+// The executor after a step has been dispatched.
+pub @tier(embedded)
+fn spin_advance(e: RosExecutor) -> RosExecutor []
+    todo("ros2-nv.rosexec.spin_advance")
+
+// The executor at the start of a new spin.
+//
+// Puts the cursor back to the first handle.  Called once per spin, and
+// the reason the cursor is a field rather than a loop variable: a node
+// that has to give the scheduler its turn can stop a spin halfway and
+// resume it.
+pub @tier(embedded)
+fn spin_begin(e: RosExecutor) -> RosExecutor []
+    todo("ros2-nv.rosexec.spin_begin")
+
+// Whether a spin has walked every handle.
+pub @tier(embedded)
+fn spin_done(e: RosExecutor) -> Bool []
+    todo("ros2-nv.rosexec.spin_done")
+
+// Which handles a spin under these semantics may take from.
+//
+// Under ROS 2 semantics, everything in the ready set.  Under logical
+// execution time, the ready set AS IT WAS when the spin began, which is
+// why this takes both: a handle that became ready during the spin is
+// dispatched on the next one, and that is the property that makes the
+// delay through the node constant.
+pub @tier(embedded)
+fn takeable(e: RosExecutor, ready_at_begin: Int, ready_now: Int) -> Int []
+    todo("ros2-nv.rosexec.takeable")
+
+// ── Timers ───────────────────────────────────────────────────────────
+
+// A late timer fires as many times as it missed, catching up.
+//
+// rcl's own behaviour.  The consequence is worth stating: a control
+// loop whose spin was blocked for a second runs its integrator ten
+// times in a row with the same interval, and a PID controller does
+// something dramatic.
+pub const ROS_TIMER_CATCH_UP = 0
+
+// A late timer fires once and the missed periods are dropped.
+//
+// What a control loop wants, and what a counter of events does not.
+pub const ROS_TIMER_SKIP_MISSED = 1
+
+// A periodic callback, counted in the caller's own milliseconds.
+//
+// NO CLOCK.  This package reads no time: `advance` takes how many
+// milliseconds passed, from whatever the program uses to measure them.
+// That also makes a node's timing replayable from a log, and it is what
+// lets the same timer run against simulated time without a second
+// implementation.
+pub @value
+struct RosTimer
+    // How often it should fire, in milliseconds.
+    period_ms: Int
+    // How long since it last fired.
+    elapsed_ms: Int
+    // One of `ROS_TIMER_*`.
+    on_late: Int
+    // How many firings are owed, under `ROS_TIMER_CATCH_UP`.
+    owed: Int
+    // Whether the timer runs at all.
+    active: Bool
+
+// A timer of this period.
+pub @tier(embedded)
+fn timer(period_ms: Int, on_late: Int) -> RosTimer []
+    todo("ros2-nv.rosexec.timer")
+
+// The timer after `delta_ms` more milliseconds.
+pub @tier(embedded)
+fn timer_advance(t: RosTimer, delta_ms: Int) -> RosTimer []
+    todo("ros2-nv.rosexec.timer_advance")
+
+// Whether the timer owes a firing.
+pub @tier(embedded)
+fn timer_is_ready(t: RosTimer) -> Bool []
+    todo("ros2-nv.rosexec.timer_is_ready")
+
+// The timer with one owed firing taken.
+pub @tier(embedded)
+fn timer_fired(t: RosTimer) -> RosTimer []
+    todo("ros2-nv.rosexec.timer_fired")
+
+// How many firings the timer owes.
+//
+// More than one means the spin was late.  A number rather than a
+// boolean, because a program that wants to know it was late can only
+// find out here.
+pub @tier(embedded)
+fn timer_owed(t: RosTimer) -> Int []
+    todo("ros2-nv.rosexec.timer_owed")
+
+// How long until the timer next fires, in milliseconds, or 0.
+//
+// The number a spin passes to the transport as its wait: waiting longer
+// than this makes the timer late for no reason.
+pub @tier(embedded)
+fn timer_next_ms(t: RosTimer) -> Int []
+    todo("ros2-nv.rosexec.timer_next_ms")
+
+// The timer, stopped.
+pub @tier(embedded)
+fn timer_cancel(t: RosTimer) -> RosTimer []
+    todo("ros2-nv.rosexec.timer_cancel")
+
+// The timer, started again from zero.
+pub @tier(embedded)
+fn timer_reset(t: RosTimer) -> RosTimer []
+    todo("ros2-nv.rosexec.timer_reset")
+
+// The shortest wait an executor should take, given its own timeout and
+// a timer's, in milliseconds.
+//
+// A spin that waits its full timeout when a timer is due in five
+// milliseconds makes that timer ninety-five milliseconds late, every
+// cycle, and nothing reports it.
+pub @tier(embedded)
+fn spin_wait_ms(e: RosExecutor, t: RosTimer) -> Int []
+    todo("ros2-nv.rosexec.spin_wait_ms")

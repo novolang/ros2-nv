@@ -1,0 +1,161 @@
+// rosagent.nv — the byte pipe to a micro-ROS agent, over TCP.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ONE MODULE IN THIS PACKAGE THAT PERFORMS ANYTHING, and its row is
+// `[net]` and nothing else.  No clock: every timeout here is handed to
+// the socket, which is what measures it.
+//
+// TCP, AND NOT THE TWO TRANSPORTS A REAL DEPLOYMENT WOULD RATHER USE.
+// A micro-ROS agent listens on four: UDP, TCP, a serial line and CAN
+// FD.  A board on a bench is almost always on the serial line and a
+// board on a robot is almost always on UDP.  Neither can be written
+// against the standard library today, and each is a row worth opening:
+//
+//   - a UDP datagram comes back from `net.udp_recv_from` as a
+//     NUL-terminated string, so it is truncated at its first zero byte
+//     — and an XRCE message's header has a zero in its second byte.
+//     TCP has `net.send_bytes` and `net.recv_bytes`, which is why this
+//     module exists at all.
+//   - there is no serial port in the standard library.  No baud rate,
+//     no parity, no inter-character timeout.
+//
+// So this is the transport a development machine and a continuous
+// integration run use, and the one a test against a real agent can be
+// written with.  A device brings its own `RosTransport` over its UART.
+//
+// A TCP MESSAGE IS LENGTH-PREFIXED, and the prefix is not part of the
+// message.  Micro XRCE-DDS puts two bytes of little-endian length in
+// front of every message on a stream transport, because TCP has no
+// frames of its own and a reader that took whatever `recv` returned
+// would get half a message as often as it got two.  `recv_frame` is
+// what reassembles them, and it is the reason the link holds a buffer.
+
+// The port a micro-ROS agent listens on by default: 8888.
+pub const ROS_AGENT_DEFAULT_PORT = 8888
+
+// How many bytes of length go in front of a message on a stream
+// transport: 2.
+pub const ROS_TCP_LENGTH_BYTES = 2
+
+// The largest message this transport carries, in bytes: 2048.
+//
+// Larger than the 512 a serial link gets, because TCP has no such
+// constraint and a development machine has memory — and small enough
+// that a node written against this one still fits a serial link later
+// if its messages fit here with room over.
+pub const ROS_AGENT_MTU = 2048
+
+// An open connection to an agent, and the bytes not yet reassembled
+// into a message.
+//
+// A PLAIN STRUCT, because it holds a socket and a buffer.  The buffer
+// is what a stream transport needs and a datagram one does not: a
+// `recv` on TCP answers whatever bytes have arrived, which is very
+// often part of a message and sometimes two.
+pub struct RosAgentLink
+    // The socket.
+    sock: Sock
+    // Bytes received and not yet part of a whole message.
+    pending: Bytes
+    // The largest message this link will carry.
+    mtu: Int
+    // Whether the socket is open.
+    open: Bool
+
+impl RosTransport[net] for RosAgentLink
+    // Send one message, with its two-byte length in front.
+    fn ros_send(self, frame: Bytes) -> Bool [net]
+        todo("ros2-nv.rosagent.ros_send")
+
+    // Take one whole message, or nothing.
+    //
+    // Reads into the link's buffer and answers a message only when a
+    // whole one is there, which is what a length prefix is for.
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes [net]
+        todo("ros2-nv.rosagent.ros_recv")
+
+    fn ros_is_open(self) -> Bool [net]
+        todo("ros2-nv.rosagent.ros_is_open")
+
+    fn ros_close(self) [net]
+        todo("ros2-nv.rosagent.ros_close")
+
+    fn ros_mtu(self) -> Int
+        todo("ros2-nv.rosagent.ros_mtu")
+
+// Open a connection to an agent.
+//
+// `[net]`: one TCP connection and nothing else.  Answers nothing when
+// the agent is not listening — which is the ordinary case on a machine
+// where nobody started one, and the reason a node should say so rather
+// than retrying silently.
+//
+// ```novo
+// use rosagent
+//
+// fn main() [net, io]
+//     match rosagent.connect("127.0.0.1", rosagent.ROS_AGENT_DEFAULT_PORT)
+//         Some(_) => println("agent found")
+//         None    => println("no agent on this machine")
+// ```
+pub fn connect(host: Str, port: Int) -> ?RosAgentLink [net]
+    todo("ros2-nv.rosagent.connect")
+
+// Open a connection with a stated message size.
+pub fn connect_with_mtu(host: Str, port: Int, mtu: Int) -> ?RosAgentLink [net]
+    todo("ros2-nv.rosagent.connect_with_mtu")
+
+// Close the connection.
+pub fn disconnect(l: RosAgentLink) [net]
+    todo("ros2-nv.rosagent.disconnect")
+
+// A link over a socket somebody else opened.
+//
+// For a program that got its socket from elsewhere — a test harness, a
+// connection accepted rather than made — and the reason `connect` is
+// not the only way in.
+pub fn link_over(sock: Sock, mtu: Int) -> RosAgentLink []
+    todo("ros2-nv.rosagent.link_over")
+
+// The two bytes that go in front of a message of this length.
+//
+// Little-endian, which is what Micro XRCE-DDS's stream framing uses
+// whatever the payload's own byte order is.  Published because it is
+// the one piece of framing a caller writing its own transport has to
+// match.
+pub fn length_prefix(n: Int) -> Bytes []
+    todo("ros2-nv.rosagent.length_prefix")
+
+// The message length two prefix bytes describe, or -1.
+pub fn length_of_prefix(b: Bytes) -> Int []
+    todo("ros2-nv.rosagent.length_of_prefix")
+
+// Whether the link's buffer holds a whole message.
+//
+// The question `ros_recv` asks before it answers anything, and the one
+// a caller draining a link by hand has to ask too.
+pub fn has_whole_frame(l: RosAgentLink) -> Bool []
+    todo("ros2-nv.rosagent.has_whole_frame")
+
+// The whole message at the front of the link's buffer, and the link
+// without it.
+//
+// Answers an empty `Bytes` and the link unchanged when there is no
+// whole message.  Two answers from one call, because taking a message
+// and shortening the buffer are one operation and doing them
+// separately is how a reader loses a message.
+pub fn take_frame(l: RosAgentLink) -> (RosAgentLink, Bytes) []
+    todo("ros2-nv.rosagent.take_frame")
+
+// The link with more bytes appended to its buffer.
+pub fn feed(l: RosAgentLink, chunk: Bytes) -> RosAgentLink []
+    todo("ros2-nv.rosagent.feed")
+
+// How many bytes are waiting to become a message.
+//
+// Worth logging when a link stops producing messages: a number that
+// grows without a message coming out means the length prefix and the
+// stream have lost their alignment, which nothing else reports.
+pub fn pending_bytes(l: RosAgentLink) -> Int []
+    todo("ros2-nv.rosagent.pending_bytes")

@@ -1,0 +1,311 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS THE NODE THIS PACKAGE EXISTS FOR: a Cortex-M with a
+// serial line to an agent, two subscriptions, a timer and no heap.
+// Everything that node decides before it touches the wire — whether its
+// firmware was built to hold the entities it wants, whether its
+// publisher and its peer's subscription can match, which handle to
+// dispatch next, whether a return code means anything is wrong — is
+// integer arithmetic, and this program is that arithmetic compiled for
+// the hardware rather than a sentence claiming it would compile.
+//
+// WHAT IS NOT HERE, AND WHY.  `rosname` is not, because expanding a
+// relative name against a namespace concatenates and concatenation
+// allocates.  `rosmsg` is not, because a payload is a `Bytes`.
+// `rostransport` is not, because a session holds one too.  `rosagent`
+// is not, because it is the host module and one host-only function
+// anywhere in a compilation unit is an undefined symbol at embedded
+// link time whether or not the firmware calls it.
+//
+// What that leaves is the four modules a node consults with nothing in
+// its hands but numbers, which is also the four this package would be
+// worth having for if the wire never worked at all.
+
+use std.str
+use rosexec
+use rosgraph
+use rosqos
+use rosret
+
+// The pair a real ROS 2 system produces most often: a camera that
+// offers best-effort delivery and a program that requests the default.
+@tier(embedded)
+fn a_mismatched_pair() -> RosQosCompat
+    rosqos.compatible(rosqos.sensor_data_profile(), rosqos.default_profile())
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+//
+// A firmware image has one line of output; making it depend on all of
+// them is what stops a passing run from meaning "the first check held".
+@tier(embedded)
+fn score() -> Int
+    var n = 0
+
+    // The return codes, and the four that are not failures.  A node
+    // that logged all four prints errors under load.
+    if rosret.ros_ret_is_ok(rosret.ROS_RET_OK)
+        n = n + 1
+    if not rosret.ros_ret_is_error(rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+        n = n + 1
+    if not rosret.ros_ret_is_error(rosret.ROS_RET_CLIENT_TAKE_FAILED)
+        n = n + 1
+    if not rosret.ros_ret_is_error(rosret.ROS_RET_SERVICE_TAKE_FAILED)
+        n = n + 1
+    if not rosret.ros_ret_is_error(rosret.ROS_RET_TIMEOUT)
+        n = n + 1
+    if rosret.ros_ret_is_error(rosret.ROS_RET_WAIT_SET_FULL)
+        n = n + 1
+    if rosret.ros_ret_is_take_failed(rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+        n = n + 1
+    if rosret.ros_ret_is_invalid_handle(rosret.ROS_RET_NODE_INVALID)
+        n = n + 1
+    if rosret.ros_ret_subsystem(rosret.ROS_RET_PUBLISHER_INVALID) == 3
+        n = n + 1
+    if rosret.ros_ret_is_extension(rosret.ROS_RET_QOS_INCOMPATIBLE)
+        n = n + 1
+    if not rosret.ros_ret_is_extension(rosret.ROS_RET_ERROR)
+        n = n + 1
+    if str.len(rosret.ros_ret_name(rosret.ROS_RET_NOT_INIT)) > 0
+        n = n + 1
+    if str.len(rosret.ros_ret_subsystem_name(2)) > 0
+        n = n + 1
+
+    // The quality-of-service arithmetic, which is the one thing a node
+    // on a device cannot discover any other way: an incompatible pair
+    // is created successfully and never connects.
+    let bad = a_mismatched_pair()
+    if not bad.compatible
+        n = n + 1
+    if bad.policy == rosqos.ROS_QOS_POLICY_RELIABILITY
+        n = n + 1
+    if str.len(rosqos.compat_advice(bad)) > 0
+        n = n + 1
+    if str.len(rosqos.policy_name(bad.policy)) > 0
+        n = n + 1
+    if rosqos.compatible(rosqos.default_profile(),
+                         rosqos.sensor_data_profile()).compatible
+        n = n + 1
+    if rosqos.reliability_satisfies(rosqos.ROS_RELIABILITY_RELIABLE,
+                                    rosqos.ROS_RELIABILITY_BEST_EFFORT)
+        n = n + 1
+    if not rosqos.durability_satisfies(rosqos.ROS_DURABILITY_VOLATILE,
+                                       rosqos.ROS_DURABILITY_TRANSIENT_LOCAL)
+        n = n + 1
+    if rosqos.deadline_satisfies(100, 200)
+        n = n + 1
+    if not rosqos.deadline_satisfies(rosqos.ROS_DURATION_INFINITE, 100)
+        n = n + 1
+    if rosqos.lease_satisfies(500, 1000)
+        n = n + 1
+    if not rosqos.liveliness_satisfies(rosqos.ROS_LIVELINESS_AUTOMATIC,
+                                       rosqos.ROS_LIVELINESS_MANUAL_BY_TOPIC)
+        n = n + 1
+    if rosqos.policy_affects_matching(rosqos.ROS_QOS_POLICY_DEADLINE)
+        n = n + 1
+    if not rosqos.policy_affects_matching(rosqos.ROS_QOS_POLICY_NONE)
+        n = n + 1
+    if rosqos.default_profile().depth == 10
+        n = n + 1
+    if rosqos.sensor_data_profile().depth == 5
+        n = n + 1
+    if rosqos.services_profile().reliability == rosqos.ROS_RELIABILITY_RELIABLE
+        n = n + 1
+    if rosqos.parameters_profile().depth == 1000
+        n = n + 1
+    let latched = rosqos.transient_local_profile().durability
+    if latched == rosqos.ROS_DURABILITY_TRANSIENT_LOCAL
+        n = n + 1
+    if rosqos.qos_has_system_default(rosqos.system_default_profile())
+        n = n + 1
+    let hand = rosqos.qos(rosqos.ROS_HISTORY_KEEP_LAST, 7,
+                          rosqos.ROS_RELIABILITY_BEST_EFFORT,
+                          rosqos.ROS_DURABILITY_VOLATILE, 200, 1000,
+                          rosqos.ROS_LIVELINESS_AUTOMATIC, 3000)
+    if rosqos.qos_is_valid(hand)
+        n = n + 1
+    if not rosqos.qos_has_system_default(hand)
+        n = n + 1
+    let rel = rosqos.with_reliability(hand, rosqos.ROS_RELIABILITY_RELIABLE)
+    if rel.reliability == rosqos.ROS_RELIABILITY_RELIABLE
+        n = n + 1
+    let dur = rosqos.with_durability(hand, rosqos.ROS_DURABILITY_TRANSIENT_LOCAL)
+    if dur.durability == rosqos.ROS_DURABILITY_TRANSIENT_LOCAL
+        n = n + 1
+    if rosqos.with_depth(hand, 3).depth == 3
+        n = n + 1
+    if rosqos.with_deadline(hand, 50).deadline_ms == 50
+        n = n + 1
+    if rosqos.queue_slots(rosqos.sensor_data_profile()) == 5
+        n = n + 1
+
+    // The entity pool, which on this part is an array sized before the
+    // program started.  A stock build allows one of everything.
+    let pool = rosgraph.default_pool()
+    if pool.max_publishers == 1
+        n = n + 1
+    if pool.max_history == 4
+        n = n + 1
+    if rosgraph.can_add(pool, rosgraph.ROS_ENTITY_PUBLISHER)
+        n = n + 1
+    let one = rosgraph.add(pool, rosgraph.ROS_ENTITY_PUBLISHER)
+    if rosgraph.used_of(one, rosgraph.ROS_ENTITY_PUBLISHER) == 1
+        n = n + 1
+    if not rosgraph.can_add(one, rosgraph.ROS_ENTITY_PUBLISHER)
+        n = n + 1
+    if rosgraph.add_ret(one, rosgraph.ROS_ENTITY_PUBLISHER) == rosret.ROS_RET_BAD_ALLOC
+        n = n + 1
+    if rosgraph.remaining(one, rosgraph.ROS_ENTITY_PUBLISHER) == 0
+        n = n + 1
+    if rosgraph.can_add(rosgraph.remove(one, rosgraph.ROS_ENTITY_PUBLISHER),
+                        rosgraph.ROS_ENTITY_PUBLISHER)
+        n = n + 1
+    if rosgraph.capacity_of(pool, rosgraph.ROS_ENTITY_TIMER) == -1
+        n = n + 1
+    if rosgraph.pool_admits(pool, 1, 1, 1, 1)
+        n = n + 1
+    if not rosgraph.pool_admits(pool, 2, 1, 0, 0)
+        n = n + 1
+    if rosgraph.first_shortfall(pool, 2, 1, 0, 0) == rosgraph.ROS_ENTITY_PUBLISHER
+        n = n + 1
+    if str.len(rosgraph.entity_name(rosgraph.ROS_ENTITY_SUBSCRIPTION)) > 0
+        n = n + 1
+    let big = rosgraph.pool(1, 8, 8, 2, 2, 16)
+    if rosgraph.capacity_of(big, rosgraph.ROS_ENTITY_SUBSCRIPTION) == 8
+        n = n + 1
+
+    // Two endpoints, and the two mismatches that connect nothing and
+    // say nothing.
+    let p = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 0, 1111,
+                              rosqos.sensor_data_profile())
+    let s = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 1111,
+                              rosqos.default_profile())
+    let s_ok = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 1111,
+                                 rosqos.sensor_data_profile())
+    let s_other = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 2222,
+                                    rosqos.sensor_data_profile())
+    if rosgraph.can_connect(p, s) == rosret.ROS_RET_QOS_INCOMPATIBLE
+        n = n + 1
+    if rosgraph.can_connect(p, s_ok) == rosret.ROS_RET_OK
+        n = n + 1
+    if rosgraph.can_connect(p, s_other) == rosret.ROS_RET_ERROR
+        n = n + 1
+    let absent = rosgraph.no_endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION)
+    if rosgraph.can_connect(p, absent) == rosret.ROS_RET_INVALID_ARGUMENT
+        n = n + 1
+    if not rosgraph.connect_qos(p, s).compatible
+        n = n + 1
+    if rosgraph.same_type(p, s)
+        n = n + 1
+    if not rosgraph.same_type(p, s_other)
+        n = n + 1
+    if rosgraph.effective_depth(pool, s) == 4
+        n = n + 1
+    if not rosgraph.depth_is_honoured(pool, s)
+        n = n + 1
+
+    // The executor, driven from outside.  A publisher is not a handle,
+    // and the order handles were added is the schedule.
+    if rosexec.handles_required(2, 1, 0, 0, 0) == 3
+        n = n + 1
+    if rosexec.ROS_EXEC_MAX_HANDLES == 64
+        n = n + 1
+    var e = rosexec.executor(3)
+    if rosexec.handle_order(e) == 0
+        n = n + 1
+    e = rosexec.add_handle(e)
+    e = rosexec.add_handle(e)
+    e = rosexec.add_handle(e)
+    if e.count == 3
+        n = n + 1
+    if not rosexec.can_add_handle(e)
+        n = n + 1
+    if rosexec.add_handle_ret(e) == rosret.ROS_RET_WAIT_SET_FULL
+        n = n + 1
+    if rosexec.remaining_handles(e) == 0
+        n = n + 1
+    if rosexec.ready_bit(2) == 4
+        n = n + 1
+    if rosexec.is_ready(0x5, 2)
+        n = n + 1
+    if rosexec.ready_count(0x7) == 3
+        n = n + 1
+    let all = rosexec.set_trigger(e, rosexec.ROS_TRIGGER_ALL, -1)
+    if not rosexec.should_dispatch(all, 0x3)
+        n = n + 1
+    if rosexec.should_dispatch(all, 0x7)
+        n = n + 1
+    let one_h = rosexec.set_trigger(e, rosexec.ROS_TRIGGER_ONE, 2)
+    if rosexec.should_dispatch(one_h, 0x4)
+        n = n + 1
+    if str.len(rosexec.trigger_name(rosexec.ROS_TRIGGER_ANY)) > 0
+        n = n + 1
+    let let_sem = rosexec.set_semantics(e, rosexec.ROS_SEMANTICS_LET)
+    if rosexec.takeable(let_sem, 0x1, 0x7) == 0x1
+        n = n + 1
+    if str.len(rosexec.semantics_name(rosexec.ROS_SEMANTICS_LET)) > 0
+        n = n + 1
+    let begun = rosexec.spin_begin(e)
+    if not rosexec.spin_done(begun)
+        n = n + 1
+    let step = rosexec.spin_step(begun, 0x1)
+    if step.dispatch
+        n = n + 1
+    if step.index == 0
+        n = n + 1
+    if step.has_message
+        n = n + 1
+    if step.ret == rosret.ROS_RET_OK
+        n = n + 1
+    if step.kind >= 0
+        n = n + 1
+    if rosexec.spin_advance(begun).cursor > begun.cursor
+        n = n + 1
+    if rosexec.set_timeout(e, 50).timeout_ms == 50
+        n = n + 1
+
+    // The timer, counted in the caller's own milliseconds, with no
+    // clock anywhere in the package.
+    let late = rosexec.timer_advance(rosexec.timer(100, rosexec.ROS_TIMER_CATCH_UP),
+                                     1000)
+    if rosexec.timer_is_ready(late)
+        n = n + 1
+    if rosexec.timer_owed(late) == 10
+        n = n + 1
+    if rosexec.timer_owed(rosexec.timer_fired(late)) == 9
+        n = n + 1
+    let skipped = rosexec.timer_advance(
+        rosexec.timer(100, rosexec.ROS_TIMER_SKIP_MISSED), 1000)
+    if rosexec.timer_owed(skipped) == 1
+        n = n + 1
+    let early = rosexec.timer_advance(
+        rosexec.timer(100, rosexec.ROS_TIMER_SKIP_MISSED), 40)
+    if not rosexec.timer_is_ready(early)
+        n = n + 1
+    if rosexec.timer_next_ms(early) == 60
+        n = n + 1
+    if not rosexec.timer_is_ready(rosexec.timer_cancel(late))
+        n = n + 1
+    if rosexec.timer_next_ms(rosexec.timer_reset(early)) == 100
+        n = n + 1
+    if rosexec.spin_wait_ms(rosexec.set_timeout(e, 100), early) == 60
+        n = n + 1
+
+    n
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 81 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says HOW MANY it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 81
+        hal.uart.write("PASS: ros2-embedded\n")
+    else
+        hal.uart.write("FAIL: ros2-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        hal.timer.delay_ms(1000)

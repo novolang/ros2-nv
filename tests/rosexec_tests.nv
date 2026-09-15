@@ -1,0 +1,237 @@
+// rosexec_tests.nv — the executor driven from outside, the two
+// semantics, and a timer that was late.
+//
+// RED ON PURPOSE: the first `todo()` each test reaches ends it.
+//
+// THE DISPATCH LOOP IS WRITTEN HERE, in `drive`, and that is the point
+// of the design: an executor a caller steps is an executor a test can
+// run with no middleware under it and no callbacks registered anywhere.
+
+use std.test
+use rosexec
+use rosgraph
+use rosret
+
+// One whole spin, counting what it dispatched.
+//
+// The loop a node writes, in nine lines, with the caller's own `match`
+// where a callback table would be.
+fn drive(e: RosExecutor, ready: Int) -> Int
+    var ex = rosexec.spin_begin(e)
+    var n = 0
+    var going = true
+    while going
+        let step = rosexec.spin_step(ex, ready)
+        if step.dispatch
+            n = n + 1
+            ex = rosexec.spin_advance(ex)
+        else
+            going = false
+    n
+
+@test
+fn test_a_publisher_is_not_a_handle() [io]
+    // An executor waits on things that become ready, and a publisher
+    // never does.  Counting publishers wastes slots; forgetting timers
+    // exhausts the table.
+    test.case("two subscriptions and one timer need three")
+    test.assert_eq(rosexec.handles_required(2, 1, 0, 0, 0), 3)
+
+    test.case("services, clients and guard conditions count too")
+    test.assert_eq(rosexec.handles_required(1, 1, 1, 1, 1), 5)
+
+    test.case("a node that only publishes needs none")
+    test.assert_eq(rosexec.handles_required(0, 0, 0, 0, 0), 0)
+
+@test
+fn test_the_table_is_fixed_and_the_refusal_names_the_wait_set() [io]
+    var e = rosexec.executor(2)
+
+    test.case("two fit")
+    test.assert(rosexec.can_add_handle(e))
+    e = rosexec.add_handle(e)
+    e = rosexec.add_handle(e)
+    test.assert_eq(e.count, 2)
+
+    test.case("the third does not")
+    test.assert(not rosexec.can_add_handle(e))
+    test.assert_eq(rosexec.add_handle_ret(e), rosret.ROS_RET_WAIT_SET_FULL)
+    test.assert_eq(rosexec.remaining_handles(e), 0)
+
+    test.case("and adding it anyway changes nothing")
+    test.assert_eq(rosexec.add_handle(e).count, 2)
+
+    test.case("the ceiling is sixty-four, because a ready set is one integer")
+    test.assert_eq(rosexec.ROS_EXEC_MAX_HANDLES, 64)
+
+@test
+fn test_the_order_handles_were_added_is_the_schedule() [io]
+    // A node whose control callback was registered before the
+    // subscription it consumes runs one cycle behind for the life of
+    // the program, and neither the code nor the middleware says so.
+    var e = rosexec.executor(3)
+
+    test.case("the first handle takes position zero")
+    test.assert_eq(rosexec.handle_order(e), 0)
+    e = rosexec.add_handle(e)
+
+    test.case("and the next takes the one after it")
+    test.assert_eq(rosexec.handle_order(e), 1)
+
+@test
+fn test_a_ready_set_is_a_bit_per_handle() [io]
+    test.case("the bit for handle two")
+    test.assert_eq(rosexec.ready_bit(2), 4)
+
+    test.case("asking about one of them")
+    test.assert(rosexec.is_ready(0x5, 0))
+    test.assert(not rosexec.is_ready(0x5, 1))
+    test.assert(rosexec.is_ready(0x5, 2))
+
+    test.case("and counting them")
+    test.assert_eq(rosexec.ready_count(0x7), 3)
+    test.assert_eq(rosexec.ready_count(0), 0)
+
+@test
+fn test_trigger_all_is_what_makes_a_fusion_node_deterministic() [io]
+    // A filter that needs a reading from three sensors runs once per
+    // complete set rather than three times per set with two thirds of
+    // its input stale.  The cost is that one silent sensor stops it.
+    var e = rosexec.executor(3)
+    e = rosexec.add_handle(rosexec.add_handle(rosexec.add_handle(e)))
+
+    test.case("trigger any dispatches on one")
+    let any = rosexec.set_trigger(e, rosexec.ROS_TRIGGER_ANY, -1)
+    test.assert(rosexec.should_dispatch(any, 0x1))
+
+    test.case("trigger all waits for every one")
+    let all = rosexec.set_trigger(e, rosexec.ROS_TRIGGER_ALL, -1)
+    test.assert(not rosexec.should_dispatch(all, 0x3))
+    test.assert(rosexec.should_dispatch(all, 0x7))
+
+    test.case("trigger one waits for the handle it names")
+    let one = rosexec.set_trigger(e, rosexec.ROS_TRIGGER_ONE, 2)
+    test.assert(not rosexec.should_dispatch(one, 0x3))
+    test.assert(rosexec.should_dispatch(one, 0x4))
+
+    test.case("nothing ready dispatches nothing under any policy")
+    test.assert(not rosexec.should_dispatch(any, 0))
+    test.assert(str.len(rosexec.trigger_name(rosexec.ROS_TRIGGER_ALL)) > 0)
+
+@test
+fn test_the_caller_dispatches_and_the_executor_only_says_which() [io]
+    var e = rosexec.executor(3)
+    e = rosexec.add_handle(rosexec.add_handle(rosexec.add_handle(e)))
+
+    test.case("three ready handles are three steps")
+    test.assert_eq(drive(e, 0x7), 3)
+
+    test.case("two ready handles are two")
+    test.assert_eq(drive(e, 0x5), 2)
+
+    test.case("and a spin with nothing ready dispatches nothing")
+    test.assert_eq(drive(e, 0), 0)
+
+    test.case("a step names the handle and whether a message came")
+    let step = rosexec.spin_step(rosexec.spin_begin(e), 0x1)
+    test.assert(step.dispatch)
+    test.assert_eq(step.index, 0)
+    test.assert_eq(step.ret, rosret.ROS_RET_OK)
+    test.assert(step.has_message)
+
+    test.case("and a spin that has walked every handle says so")
+    test.assert(not rosexec.spin_done(rosexec.spin_begin(e)))
+
+@test
+fn test_logical_execution_time_makes_a_chain_take_three_spins() [io]
+    // A callback cannot see data a callback earlier in the same spin
+    // produced, which is the property that makes the delay through the
+    // node independent of the order.
+    var e = rosexec.executor(3)
+    e = rosexec.add_handle(rosexec.add_handle(rosexec.add_handle(e)))
+
+    test.case("ros 2 semantics take whatever has arrived by now")
+    let ros2 = rosexec.set_semantics(e, rosexec.ROS_SEMANTICS_ROS2)
+    test.assert_eq(rosexec.takeable(ros2, 0x1, 0x7), 0x7)
+
+    test.case("logical execution time takes the set the spin began with")
+    let let_sem = rosexec.set_semantics(e, rosexec.ROS_SEMANTICS_LET)
+    test.assert_eq(rosexec.takeable(let_sem, 0x1, 0x7), 0x1)
+
+    test.case("both have names")
+    test.assert(str.len(rosexec.semantics_name(rosexec.ROS_SEMANTICS_LET)) > 0)
+    test.assert_eq(rosexec.executor(1).semantics, rosexec.ROS_SEMANTICS_ROS2)
+
+@test
+fn test_a_callback_that_always_runs_gets_no_message() [io]
+    // How a control loop keeps its period when its input is late, and
+    // the reason a callback written for the other setting reads a
+    // buffer holding either nothing or the previous message.
+    test.case("the two invocation settings are named")
+    test.assert_eq(rosexec.ROS_INVOKE_ON_NEW_DATA, 0)
+    test.assert_eq(rosexec.ROS_INVOKE_ALWAYS, 1)
+
+    test.case("a step with no message says so in a field")
+    var e = rosexec.executor(1)
+    e = rosexec.add_handle(e)
+    let step = rosexec.spin_step(rosexec.spin_begin(e), 0)
+    test.assert(not step.has_message)
+
+@test
+fn test_a_late_timer_either_catches_up_or_does_not() [io]
+    // A control loop whose spin was blocked for a second runs its
+    // integrator ten times in a row with the same interval under one
+    // policy, and once under the other.
+    test.case("a hundred millisecond timer, nine hundred late")
+    let catching = rosexec.timer_advance(
+        rosexec.timer(100, rosexec.ROS_TIMER_CATCH_UP), 1000)
+    test.assert(rosexec.timer_is_ready(catching))
+    test.assert_eq(rosexec.timer_owed(catching), 10)
+
+    test.case("the same lateness, skipping")
+    let skipping = rosexec.timer_advance(
+        rosexec.timer(100, rosexec.ROS_TIMER_SKIP_MISSED), 1000)
+    test.assert_eq(rosexec.timer_owed(skipping), 1)
+
+    test.case("a firing is taken one at a time")
+    test.assert_eq(rosexec.timer_owed(rosexec.timer_fired(catching)), 9)
+
+    test.case("and a timer that has not come due owes nothing")
+    let early = rosexec.timer_advance(
+        rosexec.timer(100, rosexec.ROS_TIMER_SKIP_MISSED), 40)
+    test.assert(not rosexec.timer_is_ready(early))
+    test.assert_eq(rosexec.timer_next_ms(early), 60)
+
+@test
+fn test_a_spin_must_not_wait_past_a_timer() [io]
+    // A spin that waits its full timeout when a timer is due in five
+    // milliseconds makes that timer ninety-five milliseconds late,
+    // every cycle, and nothing reports it.
+    let e = rosexec.set_timeout(rosexec.executor(1), 100)
+    let t = rosexec.timer_advance(rosexec.timer(100, rosexec.ROS_TIMER_SKIP_MISSED), 95)
+
+    test.case("the shorter of the two")
+    test.assert_eq(rosexec.spin_wait_ms(e, t), 5)
+
+    test.case("a cancelled timer does not shorten anything")
+    let off = rosexec.timer_cancel(t)
+    test.assert(not rosexec.timer_is_ready(off))
+    test.assert_eq(rosexec.spin_wait_ms(e, off), 100)
+
+    test.case("and a reset timer starts again from its whole period")
+    test.assert_eq(rosexec.timer_next_ms(rosexec.timer_reset(t)), 100)
+
+@test
+fn test_a_handle_carries_the_kind_the_caller_registered() [io]
+    // The kinds are `rosgraph`'s, so a program has one vocabulary for
+    // what a thing is rather than two.
+    var e = rosexec.executor(2)
+    e = rosexec.add_handle(e)
+    let step = rosexec.spin_step(rosexec.spin_begin(e), 0x1)
+
+    test.case("a subscription and a timer are the same two constants")
+    test.assert(step.kind == rosgraph.ROS_ENTITY_SUBSCRIPTION
+                or step.kind == rosgraph.ROS_ENTITY_TIMER
+                or step.kind == rosgraph.ROS_ENTITY_SERVICE
+                or step.kind == rosgraph.ROS_ENTITY_CLIENT
+                or step.kind == rosgraph.ROS_ENTITY_GUARD)

@@ -1,0 +1,155 @@
+// rosgraph_tests.nv — the pool that was fixed before the program
+// started, and the two mismatches that connect nothing and say nothing.
+//
+// RED ON PURPOSE: the first `todo()` each test reaches ends it.
+
+use std.test
+use rosgraph
+use rosqos
+use rosret
+
+@test
+fn test_a_stock_micro_ros_build_allows_one_of_everything() [io]
+    // The first thing anybody writing a second publisher discovers is
+    // that the second one does not exist.
+    let g = rosgraph.default_pool()
+
+    test.case("one node, one publisher, one subscription")
+    test.assert_eq(g.max_nodes, 1)
+    test.assert_eq(g.max_publishers, 1)
+    test.assert_eq(g.max_subscriptions, 1)
+    test.assert_eq(g.max_services, 1)
+    test.assert_eq(g.max_clients, 1)
+
+    test.case("and four messages of history")
+    test.assert_eq(g.max_history, 4)
+
+    test.case("nothing has been taken yet")
+    test.assert_eq(rosgraph.used_of(g, rosgraph.ROS_ENTITY_PUBLISHER), 0)
+    test.assert_eq(rosgraph.remaining(g, rosgraph.ROS_ENTITY_PUBLISHER), 1)
+
+@test
+fn test_the_second_publisher_is_refused_and_says_bad_alloc() [io]
+    // Which reads as "out of memory" when it means "this firmware was
+    // built for one".
+    let g = rosgraph.add(rosgraph.default_pool(), rosgraph.ROS_ENTITY_PUBLISHER)
+
+    test.case("the first one fitted")
+    test.assert_eq(rosgraph.used_of(g, rosgraph.ROS_ENTITY_PUBLISHER), 1)
+
+    test.case("the second does not")
+    test.assert(not rosgraph.can_add(g, rosgraph.ROS_ENTITY_PUBLISHER))
+    test.assert_eq(rosgraph.add_ret(g, rosgraph.ROS_ENTITY_PUBLISHER),
+                   rosret.ROS_RET_BAD_ALLOC)
+
+    test.case("and adding it anyway changes nothing")
+    let same = rosgraph.add(g, rosgraph.ROS_ENTITY_PUBLISHER)
+    test.assert_eq(rosgraph.used_of(same, rosgraph.ROS_ENTITY_PUBLISHER), 1)
+
+    test.case("giving one back makes room")
+    let back = rosgraph.remove(g, rosgraph.ROS_ENTITY_PUBLISHER)
+    test.assert(rosgraph.can_add(back, rosgraph.ROS_ENTITY_PUBLISHER))
+
+@test
+fn test_a_program_can_ask_before_it_creates_anything() [io]
+    // One call at startup is what turns a mysterious runtime failure
+    // into a line naming which maximum is too small.
+    let g = rosgraph.default_pool()
+
+    test.case("one of each fits")
+    test.assert(rosgraph.pool_admits(g, 1, 1, 1, 1))
+
+    test.case("two publishers do not")
+    test.assert(not rosgraph.pool_admits(g, 2, 1, 0, 0))
+
+    test.case("and the shortfall is named")
+    test.assert_eq(rosgraph.first_shortfall(g, 2, 1, 0, 0),
+                   rosgraph.ROS_ENTITY_PUBLISHER)
+    test.assert_eq(rosgraph.first_shortfall(g, 1, 1, 0, 0), -1)
+
+    test.case("a bigger pool admits more")
+    let big = rosgraph.pool(1, 8, 8, 2, 2, 16)
+    test.assert(rosgraph.pool_admits(big, 8, 8, 2, 2))
+    test.assert_eq(rosgraph.capacity_of(big, rosgraph.ROS_ENTITY_SUBSCRIPTION), 8)
+
+    test.case("a timer is not a middleware entity")
+    test.assert_eq(rosgraph.capacity_of(big, rosgraph.ROS_ENTITY_TIMER), -1)
+    test.assert_eq(rosgraph.capacity_of(big, rosgraph.ROS_ENTITY_GUARD), -1)
+    test.assert_eq(rosgraph.capacity_of(big, rosgraph.ROS_ENTITY_NODE), 1)
+    test.assert_eq(rosgraph.capacity_of(big, rosgraph.ROS_ENTITY_CLIENT), 2)
+    test.assert_eq(rosgraph.capacity_of(big, rosgraph.ROS_ENTITY_SERVICE), 2)
+    test.assert_eq(rosgraph.ROS_ENTITY_KINDS, 7)
+    test.assert(str.len(rosgraph.entity_name(rosgraph.ROS_ENTITY_CLIENT)) > 0)
+
+@test
+fn test_two_endpoints_that_disagree_about_the_type_are_silent() [io]
+    // Both are created, both healthy, and `ros2 topic info --verbose`
+    // is the only thing that shows it — and there is no `ros2` on a
+    // microcontroller.
+    let q = rosqos.default_profile()
+    let p = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 0, 1111, q)
+    let s = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 2222, q)
+
+    test.case("the types differ")
+    test.assert(not rosgraph.same_type(p, s))
+
+    test.case("so they will not connect")
+    test.assert_eq(rosgraph.can_connect(p, s), rosret.ROS_RET_ERROR)
+
+    test.case("with the same type they will")
+    let s2 = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 1111, q)
+    test.assert(rosgraph.same_type(p, s2))
+    test.assert_eq(rosgraph.can_connect(p, s2), rosret.ROS_RET_OK)
+
+@test
+fn test_two_endpoints_that_disagree_about_the_settings_are_also_silent() [io]
+    let p = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 0, 1111,
+                              rosqos.sensor_data_profile())
+    let s = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 1111,
+                              rosqos.default_profile())
+
+    test.case("the code says which of the two failures it was")
+    test.assert_eq(rosgraph.can_connect(p, s), rosret.ROS_RET_QOS_INCOMPATIBLE)
+
+    test.case("and the detail behind it names the policy")
+    let c = rosgraph.connect_qos(p, s)
+    test.assert(not c.compatible)
+    test.assert_eq(c.policy, rosqos.ROS_QOS_POLICY_RELIABILITY)
+
+@test
+fn test_an_endpoint_that_was_never_created_refuses_first() [io]
+    let good = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 0, 1111,
+                                 rosqos.default_profile())
+    let bad = rosgraph.no_endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION)
+
+    test.case("it is not valid")
+    test.assert(not bad.valid)
+
+    test.case("and the answer is about the argument, not the settings")
+    test.assert_eq(rosgraph.can_connect(good, bad), rosret.ROS_RET_INVALID_ARGUMENT)
+
+    test.case("two publishers are not a pair either")
+    let other = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 1, 1111,
+                                  rosqos.default_profile())
+    test.assert_eq(rosgraph.can_connect(good, other),
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+
+@test
+fn test_a_depth_the_firmware_cannot_hold_is_quietly_reduced() [io]
+    // A subscription asking to keep ten against a firmware built to
+    // hold four keeps four, silently — so a burst of six arrives as
+    // four, and the program that sized its buffer from its own profile
+    // is wrong by two.
+    let g = rosgraph.default_pool()
+    let e = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 1111,
+                              rosqos.default_profile())
+
+    test.case("the profile asks for ten and the pool holds four")
+    test.assert_eq(rosgraph.effective_depth(g, e), 4)
+    test.assert(not rosgraph.depth_is_honoured(g, e))
+
+    test.case("a profile inside the pool is honoured")
+    let small = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 1111,
+                                  rosqos.with_depth(rosqos.default_profile(), 2))
+    test.assert_eq(rosgraph.effective_depth(g, small), 2)
+    test.assert(rosgraph.depth_is_honoured(g, small))

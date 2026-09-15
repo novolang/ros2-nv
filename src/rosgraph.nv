@@ -1,0 +1,261 @@
+// rosgraph.nv — how many of each thing a node may have, counted
+// against a table that was fixed before the program started.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  Everything here
+// is a count.
+//
+// THERE IS NO ALLOCATOR BEHIND A MICRO-ROS NODE.  On a workstation
+// `rcl_publisher_init` allocates, and a program that creates a
+// forty-first publisher gets a forty-first publisher.  Under
+// rmw_microxrcedds the entity pools are arrays sized at COMPILE TIME —
+// the maxima are set in the firmware's build configuration — and
+// creating one past the end fails at run time, on a part whose only
+// output is a serial line, with a return code that says an allocation
+// failed.
+//
+// AND THE DEFAULTS ARE ONE OF EACH.  A stock micro-ROS build allows one
+// node, one publisher, one subscription, one service and one client,
+// and the first thing anybody writing a second publisher discovers is
+// that the second one does not exist.  `default_pool` is those numbers,
+// published rather than described, so a program can compare what it
+// intends to create against what its firmware was built to hold — at
+// startup, in one call, before the failure.
+//
+// A POOL IS A VALUE AND ADDING TO IT ANSWERS A NEW ONE.  Nothing here
+// holds a name or a handle: those live wherever the program keeps them.
+// What this module owns is the arithmetic that says whether the next
+// entity fits.
+
+// ── The kinds of entity ──────────────────────────────────────────────
+
+// A node.
+pub const ROS_ENTITY_NODE = 0
+// A publisher.
+pub const ROS_ENTITY_PUBLISHER = 1
+// A subscription.
+pub const ROS_ENTITY_SUBSCRIPTION = 2
+// A service server.
+pub const ROS_ENTITY_SERVICE = 3
+// A service client.
+pub const ROS_ENTITY_CLIENT = 4
+// A timer.  Not an entity the middleware holds — a timer is the
+// client library's own — but it occupies an executor handle, which is
+// the other table that runs out.
+pub const ROS_ENTITY_TIMER = 5
+// A guard condition, which is how something outside the wait set wakes
+// it.
+pub const ROS_ENTITY_GUARD = 6
+
+// How many kinds there are: 7.
+pub const ROS_ENTITY_KINDS = 7
+
+// ── The pool ─────────────────────────────────────────────────────────
+
+// What the firmware was built to hold, and what has been taken.
+pub @value
+struct RosGraph
+    // The compile-time maxima.
+    max_nodes: Int
+    max_publishers: Int
+    max_subscriptions: Int
+    max_services: Int
+    max_clients: Int
+    // How many messages the middleware keeps per endpoint.  Not an
+    // entity count: it is the other compile-time number, and a profile
+    // asking to keep ten messages against a firmware built to hold four
+    // keeps four.
+    max_history: Int
+    // What has been created so far.
+    nodes: Int
+    publishers: Int
+    subscriptions: Int
+    services: Int
+    clients: Int
+
+// The pool a stock micro-ROS build gives: one of everything, and four
+// messages of history.
+//
+// The numbers a program most needs to see before it hits them.
+//
+// ```novo
+// use rosgraph
+//
+// fn main() [io]
+//     println("${rosgraph.default_pool().max_publishers}")   // 1
+// ```
+pub @tier(embedded)
+fn default_pool() -> RosGraph []
+    todo("ros2-nv.rosgraph.default_pool")
+
+// A pool from the maxima a firmware was built with.
+pub @tier(embedded)
+fn pool(max_nodes: Int, max_publishers: Int, max_subscriptions: Int, max_services: Int,
+        max_clients: Int, max_history: Int) -> RosGraph []
+    todo("ros2-nv.rosgraph.pool")
+
+// The maximum for one kind of entity, or -1 for a kind the middleware
+// does not pool.
+//
+// Timers and guard conditions answer -1: they cost an executor handle
+// and not a middleware entity, and `rosexec` is where they are counted.
+pub @tier(embedded)
+fn capacity_of(g: RosGraph, kind: Int) -> Int []
+    todo("ros2-nv.rosgraph.capacity_of")
+
+// How many of one kind have been created.
+pub @tier(embedded)
+fn used_of(g: RosGraph, kind: Int) -> Int []
+    todo("ros2-nv.rosgraph.used_of")
+
+// How many more of one kind will fit.
+pub @tier(embedded)
+fn remaining(g: RosGraph, kind: Int) -> Int []
+    todo("ros2-nv.rosgraph.remaining")
+
+// Whether one more of this kind fits.
+//
+// The question to ask before creating anything, because the answer
+// afterwards is a return code on a device with no console.
+pub @tier(embedded)
+fn can_add(g: RosGraph, kind: Int) -> Bool []
+    todo("ros2-nv.rosgraph.can_add")
+
+// The pool with one more of this kind taken.
+//
+// UNCHANGED when there is no room, which is why `add_ret` exists beside
+// it: a caller that ignored the refusal would otherwise count entities
+// the middleware does not have.
+pub @tier(embedded)
+fn add(g: RosGraph, kind: Int) -> RosGraph []
+    todo("ros2-nv.rosgraph.add")
+
+// The return code adding one of this kind would produce.
+//
+// `ROS_RET_OK`, or `ROS_RET_BAD_ALLOC` — which is what rmw_microxrcedds
+// answers when a pool is exhausted, and which reads as "out of memory"
+// when it means "this firmware was built for one".
+pub @tier(embedded)
+fn add_ret(g: RosGraph, kind: Int) -> Int []
+    todo("ros2-nv.rosgraph.add_ret")
+
+// The pool with one of this kind given back.
+pub @tier(embedded)
+fn remove(g: RosGraph, kind: Int) -> RosGraph []
+    todo("ros2-nv.rosgraph.remove")
+
+// Whether a pool can hold everything a program intends to create.
+//
+// The four counts are what the program will ask for.  One call at
+// startup against `default_pool` is the check that turns a mysterious
+// runtime failure into a line naming which maximum is too small.
+pub @tier(embedded)
+fn pool_admits(g: RosGraph, publishers: Int, subscriptions: Int, services: Int,
+               clients: Int) -> Bool []
+    todo("ros2-nv.rosgraph.pool_admits")
+
+// The first kind of entity a program would run out of, or -1.
+pub @tier(embedded)
+fn first_shortfall(g: RosGraph, publishers: Int, subscriptions: Int, services: Int,
+                   clients: Int) -> Int []
+    todo("ros2-nv.rosgraph.first_shortfall")
+
+// The kind in words.
+pub @tier(embedded)
+fn entity_name(kind: Int) -> Str []
+    todo("ros2-nv.rosgraph.entity_name")
+
+// ── An endpoint ──────────────────────────────────────────────────────
+
+// One publisher or one subscription, as the three things that decide
+// whether it connects to anything.
+//
+// NO TOPIC NAME.  A name is a string, a string is a heap value, and a
+// firmware holds its names as literals wherever it holds them.  What
+// travels with the endpoint is the INDEX the program filed it under,
+// which is the same thing an rcl handle is.
+pub @value
+struct RosEndpoint
+    // One of `ROS_ENTITY_PUBLISHER` or `ROS_ENTITY_SUBSCRIPTION`.
+    kind: Int
+    // Where the program keeps this endpoint.
+    index: Int
+    // The message type, as `rosname.type_id` computes it.
+    type_id: Int
+    // The settings this endpoint offers or requests.
+    qos: RosQos
+    // Whether the endpoint was created.
+    valid: Bool
+
+// An endpoint.
+pub @tier(embedded)
+fn endpoint(kind: Int, index: Int, type_id: Int, q: RosQos) -> RosEndpoint []
+    todo("ros2-nv.rosgraph.endpoint")
+
+// An endpoint that was not created.
+pub @tier(embedded)
+fn no_endpoint(kind: Int) -> RosEndpoint []
+    todo("ros2-nv.rosgraph.no_endpoint")
+
+// Whether two endpoints will connect, as a return code.
+//
+// `ROS_RET_OK` when they will.  `ROS_RET_INVALID_ARGUMENT` when either
+// was not created or when they are not a publisher and a subscription.
+// `ROS_RET_ERROR` when their message types differ.
+// `ROS_RET_QOS_INCOMPATIBLE` when their settings cannot match.
+//
+// BOTH OF THE LAST TWO ARE SILENT IN ROS 2.  Two endpoints on one topic
+// with different message types are both created, both healthy, and
+// never connected; `ros2 topic info --verbose` is the only thing that
+// shows it, and there is no `ros2` on a microcontroller.  The settings
+// mismatch is the same story.  This function is the whole reason the
+// endpoint carries its type and its settings rather than leaving them
+// with the middleware.
+//
+// ```novo
+// use rosgraph
+// use rosqos
+// use rosret
+//
+// fn main() [io]
+//     let p = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 0, 1234,
+//                               rosqos.sensor_data_profile())
+//     let s = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, 1234,
+//                               rosqos.default_profile())
+//     println(rosret.ros_ret_name(rosgraph.can_connect(p, s)))
+//     // ROS_RET_QOS_INCOMPATIBLE
+// ```
+pub @tier(embedded)
+fn can_connect(publisher: RosEndpoint, subscription: RosEndpoint) -> Int []
+    todo("ros2-nv.rosgraph.can_connect")
+
+// Which quality-of-service policy stopped two endpoints, in full.
+//
+// `can_connect` answers a code and this answers the detail behind it.
+// Compatible when the endpoints differ for some other reason, which is
+// why `can_connect` is the question and this is the follow-up.
+pub @tier(embedded)
+fn connect_qos(publisher: RosEndpoint, subscription: RosEndpoint) -> RosQosCompat []
+    todo("ros2-nv.rosgraph.connect_qos")
+
+// Whether two endpoints carry the same message type.
+pub @tier(embedded)
+fn same_type(a: RosEndpoint, b: RosEndpoint) -> Bool []
+    todo("ros2-nv.rosgraph.same_type")
+
+// How many messages an endpoint's settings will actually be given.
+//
+// The smaller of the profile's depth and the pool's history maximum.  A
+// subscription asking to keep ten against a firmware built to hold four
+// keeps four, silently — so a burst of six arrives as four, and the
+// program that sized its buffer from its own profile is wrong by two.
+pub @tier(embedded)
+fn effective_depth(g: RosGraph, e: RosEndpoint) -> Int []
+    todo("ros2-nv.rosgraph.effective_depth")
+
+// Whether the pool will give this endpoint the depth its settings asked
+// for.
+pub @tier(embedded)
+fn depth_is_honoured(g: RosGraph, e: RosEndpoint) -> Bool []
+    todo("ros2-nv.rosgraph.depth_is_honoured")

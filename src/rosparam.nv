@@ -1,0 +1,197 @@
+// rosparam.nv — the three parameter types a node on a microcontroller
+// can have, and the seven it cannot.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  Nothing here performs anything.
+//
+// ROS 2 HAS TEN PARAMETER TYPES AND rclc CARRIES THREE.  A parameter
+// may be a boolean, an integer, a double, a string, a byte array, or an
+// array of each of the first four; rclc's parameter server supports the
+// boolean, the integer and the double, and nothing else.  A node
+// written on a workstation and moved to a microcontroller loses every
+// string parameter it had, which is usually the frame identifier, the
+// device path and the mode name.  `kind_is_supported` says so before
+// the port starts rather than after.
+//
+// AND A PARAMETER'S TYPE IS FIXED WHEN IT IS DECLARED.  Setting a
+// parameter to a value of a different type is refused, not coerced — so
+// an integer parameter set from a launch file that wrote `1.0` is
+// refused, and the node starts with its default and no message about
+// it.  `set_is_allowed` is that rule as a function.
+//
+// A VALUE HOLDS NO STRING, which is what lets it be a `@value` and live
+// in a fixed array beside a node's other state.  The three types it
+// carries are the three rclc carries, which is not a coincidence: a
+// string parameter would need storage this package cannot size.
+
+// ── The ten types ────────────────────────────────────────────────────
+
+// The parameter has no value.
+pub const ROS_PARAM_NOT_SET = 0
+// A boolean.  Carried by rclc.
+pub const ROS_PARAM_BOOL = 1
+// A sixty-four bit integer.  Carried by rclc.
+pub const ROS_PARAM_INTEGER = 2
+// A double.  Carried by rclc.
+pub const ROS_PARAM_DOUBLE = 3
+// A string.  NOT carried by rclc.
+pub const ROS_PARAM_STRING = 4
+// An array of bytes.  NOT carried by rclc.
+pub const ROS_PARAM_BYTE_ARRAY = 5
+// An array of booleans.  NOT carried by rclc.
+pub const ROS_PARAM_BOOL_ARRAY = 6
+// An array of integers.  NOT carried by rclc.
+pub const ROS_PARAM_INTEGER_ARRAY = 7
+// An array of doubles.  NOT carried by rclc.
+pub const ROS_PARAM_DOUBLE_ARRAY = 8
+// An array of strings.  NOT carried by rclc.
+pub const ROS_PARAM_STRING_ARRAY = 9
+
+// How many parameter types ROS 2 defines: 10.
+pub const ROS_PARAM_TYPES = 10
+
+// How many parameters a stock micro-ROS parameter server holds: 4.
+//
+// Fixed at compile time, like every other count in a micro-ROS build.
+pub const ROS_PARAM_MAX = 4
+
+// The longest a parameter's name may be in a stock micro-ROS build: 50
+// characters.
+//
+// A name longer than this is refused at declaration, and a node whose
+// parameter is called `wheel_separation_multiplier_left_front` is over
+// it.
+pub const ROS_PARAM_NAME_MAX = 50
+
+// ── A value ──────────────────────────────────────────────────────────
+
+// One parameter's value, in one of the three types a microcontroller
+// carries.
+//
+// THREE FIELDS AND A TAG, because a `@value` struct cannot hold an
+// enum at all, even one with no payload (E2011), and cannot be an
+// optional.  The unused fields are zero, and `kind` is the only field a
+// reader should consult first.
+pub @value
+struct RosParamValue
+    // One of the `ROS_PARAM_*` constants.
+    kind: Int
+    // The value, when `kind` is `ROS_PARAM_BOOL`.
+    bool_value: Bool
+    // The value, when `kind` is `ROS_PARAM_INTEGER`.
+    int_value: Int
+    // The value, when `kind` is `ROS_PARAM_DOUBLE`.
+    double_value: Float
+
+// A parameter with no value.
+pub fn unset() -> RosParamValue []
+    todo("ros2-nv.rosparam.unset")
+
+// A boolean parameter.
+//
+// ```novo
+// use rosparam
+//
+// fn main() [io]
+//     println("${rosparam.bool_param(true).kind}")   // 1
+// ```
+pub fn bool_param(v: Bool) -> RosParamValue []
+    todo("ros2-nv.rosparam.bool_param")
+
+// An integer parameter.
+pub fn int_param(v: Int) -> RosParamValue []
+    todo("ros2-nv.rosparam.int_param")
+
+// A double parameter.
+pub fn double_param(v: Float) -> RosParamValue []
+    todo("ros2-nv.rosparam.double_param")
+
+// The value as a boolean, or `fallback` when it is not one.
+//
+// A FALLBACK RATHER THAN A REFUSAL, because the caller reading a
+// parameter is almost always a caller that has a default for it —
+// and because a `@value` cannot be an optional's payload.
+pub fn as_bool(v: RosParamValue, fallback: Bool) -> Bool []
+    todo("ros2-nv.rosparam.as_bool")
+
+// The value as an integer, or `fallback`.
+pub fn as_int(v: RosParamValue, fallback: Int) -> Int []
+    todo("ros2-nv.rosparam.as_int")
+
+// The value as a double, or `fallback`.
+pub fn as_double(v: RosParamValue, fallback: Float) -> Float []
+    todo("ros2-nv.rosparam.as_double")
+
+// Whether the parameter has a value at all.
+pub fn is_set(v: RosParamValue) -> Bool []
+    todo("ros2-nv.rosparam.is_set")
+
+// ── The rules ────────────────────────────────────────────────────────
+
+// Whether rclc's parameter server carries this type.
+//
+// True for the boolean, the integer and the double, and false for the
+// other seven.  The question to ask when moving a node from a
+// workstation to a microcontroller, because the string parameters are
+// usually the frame identifier and the device path.
+//
+// ```novo
+// use rosparam
+//
+// fn main() [io]
+//     println("${rosparam.kind_is_supported(rosparam.ROS_PARAM_STRING)}")  // false
+//     println("${rosparam.kind_is_supported(rosparam.ROS_PARAM_DOUBLE)}")  // true
+// ```
+pub fn kind_is_supported(kind: Int) -> Bool []
+    todo("ros2-nv.rosparam.kind_is_supported")
+
+// Whether a value of this type may be assigned to a parameter declared
+// as that one.
+//
+// Only when the types are the same.  ROS 2 does not coerce, so an
+// integer parameter set from a launch file that wrote `1.0` is refused
+// — and the node keeps its default and says nothing.
+pub fn set_is_allowed(declared: Int, new: Int) -> Bool []
+    todo("ros2-nv.rosparam.set_is_allowed")
+
+// The return code setting a value of the wrong type produces.
+//
+// `ROS_RET_OK` when the types agree, `ROS_RET_INVALID_ARGUMENT`
+// otherwise.
+pub fn set_ret(declared: Int, new: Int) -> Int []
+    todo("ros2-nv.rosparam.set_ret")
+
+// Whether a parameter's name fits a micro-ROS build.
+pub fn name_fits(name: Str) -> Bool []
+    todo("ros2-nv.rosparam.name_fits")
+
+// Whether a node may declare another parameter.
+pub fn can_declare(declared_count: Int) -> Bool []
+    todo("ros2-nv.rosparam.can_declare")
+
+// The type in words.
+pub fn kind_name(kind: Int) -> Str []
+    todo("ros2-nv.rosparam.kind_name")
+
+// Whether an integer value is inside a range, for a caller that
+// declared one.
+//
+// ROS 2 describes a parameter's range in its descriptor and leaves
+// enforcing it to the node, so a node that declared a range and did not
+// check it has documentation rather than a constraint.
+pub fn int_in_range(v: RosParamValue, low: Int, high: Int) -> Bool []
+    todo("ros2-nv.rosparam.int_in_range")
+
+// Whether a double value is inside a range.
+pub fn double_in_range(v: RosParamValue, low: Float, high: Float) -> Bool []
+    todo("ros2-nv.rosparam.double_in_range")
+
+// Whether two values are the same type and the same value.
+//
+// What a parameter-change callback asks before it does anything: a
+// parameter service call that sets a parameter to what it already holds
+// still fires the callback, and a callback that reconfigures hardware
+// on every call reconfigures it for nothing.
+pub fn same_value(a: RosParamValue, b: RosParamValue) -> Bool []
+    todo("ros2-nv.rosparam.same_value")
