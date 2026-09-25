@@ -1,6 +1,6 @@
 [package]
 name        = "ros2-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

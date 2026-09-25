@@ -105,14 +105,14 @@ fn main() [io]
     // Check that this publisher will reach that subscription.  A
     // mismatch here connects nothing and reports nothing.
     let t = rosname.type_id("sensor_msgs/msg/Temperature")
-    let pub = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 0, t,
-                                rosqos.sensor_data_profile())
-    let sub = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, t,
-                                rosqos.default_profile())
-    let verdict = rosgraph.can_connect(pub, sub)
+    let publisher = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 0, t,
+                                      rosqos.sensor_data_profile())
+    let subscription = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, t,
+                                         rosqos.default_profile())
+    let verdict = rosgraph.can_connect(publisher, subscription)
     if verdict != rosret.ROS_RET_OK
         println(rosret.ros_ret_name(verdict))
-        println(rosqos.compat_advice(rosgraph.connect_qos(pub, sub)))
+        println(rosqos.compat_advice(rosgraph.connect_qos(publisher, subscription)))
 
     // One spin of the executor.  The middleware says which handles are
     // ready, as a bit each; this program dispatches them itself.

@@ -5,6 +5,13 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-25
+
+The README example compiles with novo 0.10.0.  It named a local `pub`,
+which is a reserved word.  The two endpoints are now named `publisher`
+and `subscription`.  No change to the interface, and every body is
+still `todo()`.
+
 ## 0.0.1 — 2026-09-15
 
 The **interface**: every signature and every effect row, and no bodies.
