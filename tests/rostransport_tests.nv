@@ -35,7 +35,7 @@ impl RosTransport[] for RosTapeLink
 
     fn ros_recv(self, timeout_ms: Int) -> ?Bytes
         if self.open
-            Some(self.canned)
+            Some(bytes.clone(self.canned))
         else
             None
 
