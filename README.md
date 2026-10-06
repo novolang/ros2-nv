@@ -76,6 +76,8 @@ novo pkg add ros2-nv
 
 ## Example
 
+This example compiles; every call in it panics until 0.1.0.
+
 ```novo
 use rosexec
 use rosgraph
@@ -236,8 +238,7 @@ Four modules build for a microcontroller with no heap allocator:
 is a firmware program that calls eighty-one of their functions and is
 compiled for a Cortex-M as part of this package's checks, so the claim
 is built rather than asserted. Those four are also the four a node
-consults before it touches the wire, which is why they are worth having
-even where the wire never works.
+consults before it touches the wire.
 
 The other five are excluded, each for a stated reason.
 
@@ -253,7 +254,16 @@ literals and has nothing to expand.
 payload in a buffer it owns and hands this package a length.
 
 `rosagent` opens a TCP socket, which is the one thing in this package
-that performs anything at all.
+that performs anything at all. The manifest names it in `host_modules`,
+so a device build leaves it out.
+
+The registry measures the tiers per module, and its page for this package
+lists eight modules at the embedded and rt tiers: every module except
+`rosagent`. Its tier check admits a module that allocates, such as
+`rosname`, `rosmsg` and `rostransport`, because a device program has a heap
+of fixed size. The claim in this section is narrower: it covers the four
+modules the probe builds. The system, wasm and app tiers cover all nine
+modules.
 
 ## What is not included
 
@@ -300,10 +310,11 @@ that performs anything at all.
 - **cobs-nv** and **crc-nv** are what a serial `RosTransport` would be
   built from: Micro XRCE-DDS frames a serial link with a begin flag, an
   escape byte and a checksum.
-- **heapless-nv** holds the bookkeeping for a bounded collection while
-  the caller holds the storage. Nothing in this package is a collection
-  — a pool, an executor and a session are each a handful of integers —
-  but a program holding a table of subscriptions would want one.
+- **The language's fixed-capacity collections**, `Vec[T; N]` and its
+  family (SPEC section 14.8), hold a bounded table without an allocator.
+  Nothing in this package is a collection — a pool, an executor and a
+  session are each a handful of integers — but a firmware holding a table
+  of subscriptions keeps it in one.
 
 ## Tests
 

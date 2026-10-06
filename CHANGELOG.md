@@ -5,6 +5,20 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-10-06
+
+README only.  No signature, type or effect row changed, and every body is
+still `todo()`.
+
+- The README's "Running on a microcontroller" section says what the
+  registry shows: eight modules at the embedded and rt tiers, every one
+  except `rosagent`, and all nine at system, wasm and app.  The
+  section's claim, that four modules allocate nothing, is unchanged.
+- The README names the language's fixed-capacity collections (SPEC
+  section 14.8) for a firmware's table of subscriptions.  It named
+  heapless-nv, which is withdrawn.
+- The example carries the interface stamp beside it.
+
 ## 0.0.2 — 2026-09-25
 
 The README example compiles with novo 0.10.0.  It named a local `pub`,
