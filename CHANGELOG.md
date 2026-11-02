@@ -5,6 +5,93 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased — 2026-10-10
+
+### Changed
+
+- **The name tables match on their own constants again.**  Nine
+  functions — `rosret.ros_ret_name`, `rosqos.policy_name` and
+  `rosqos.compat_advice`, `rosgraph.capacity_of`, `rosgraph.used_of`
+  and `rosgraph.entity_name`, `rosexec.semantics_name` and
+  `rosexec.trigger_name`, and `rosname.name_error_name` — spelled each
+  arm's value as a literal with a `// CONSTANT` comment beside it,
+  because a `pub const` named in a `match` pattern was read as a
+  binding on novo 0.20.1.  The compiler defect is fixed in novo 0.20.2,
+  so every arm names its constant and the comments are gone.  The 0.1.0
+  entry below does not name that workaround; this entry is where it is
+  recorded.  Nothing else moved: every signature, effect row, arm value
+  and doc comment is what 0.1.0 published, and the suites and the merged
+  line coverage are unchanged.
+
+## 0.1.0 — 2026-10-10
+
+The bodies.  Everything 0.0.3 declared with a `todo()` answers now, and
+nothing changed shape to let it: every signature, type and effect row is
+the one the interface release published, so a program that compiled
+against 0.0.3 compiles against this.  `stability` is `experimental`.
+
+### Added
+
+- All nine modules, implemented behind the signatures 0.0.1 published.
+- `tests/ros2_edge_tests.nv` — the inputs a node's own cases do not
+  reach.  Every return code and every subsystem through its name table;
+  every rule a name, a profile, a policy or a session state can be
+  refused by; the clamps and the empty ready set an executor can be
+  built with; and the TCP link, driven over a loopback listener the file
+  opens itself.  That listener is why this is the one file in the suite
+  that declares `[net]`, and why `rosagent` is exercised rather than
+  named.
+- Three `use` lines the package's own build could not notice.
+  `rosgraph` uses `rosqos` and `rosret`, `rosexec` uses `rosgraph` and
+  `rosret`, and `rosagent` uses `rostransport`.  A program that imports
+  one module and nothing else is what finds a missing one, because
+  `novo build --check` over the package loads all nine together.
+- One `// cov: skip` marker, in `rosname`, over the empty-string guard
+  in `ends_with_byte`.  Both callers refuse an empty name before they
+  reach it, so no input selects that line.  Every other line under
+  `src/` runs in the suite.
+
+### Named as decided
+
+**The spin walk is over the ready handles, and the cursor counts the
+ones already dispatched.**  `spin_step` skips `cursor` ready handles and
+answers the next one, and `spin_advance` moves the cursor by one, so no
+handle runs twice in one spin and a spin that gives the scheduler its
+turn resumes where it stopped.  Registration order is the schedule.  A
+trigger that names one handle walks a set holding only that handle: the
+policy picks the callback and the walk picks nothing.
+
+**A sequence number is old when its forward distance from the last
+accepted one is less than half the space and it is not the next
+number.**  XRCE sequence numbers are sixteen bits and wrap, so
+`sequence_is_old` asks `(seq - input_seq) mod 65536 < 32768` and then
+excludes the next number.  That exclusion is what makes the story true
+rather than nearly true: 0 arriving after 65535 is the next message and
+not one from an hour ago, and the plain `<` that reads correctly in
+every test rejects every message for half the sequence space once the
+counter has gone round.
+
+**The representation identifier in the encapsulation header is written
+most significant byte first, whatever the payload's byte order is.**
+The four-byte header is a representation identifier and two option
+bytes.  The identifier travels big-endian even when the numbers behind
+it are little-endian, and `rosmsg.encode_envelope` and
+`rosmsg.decode_envelope` are the only two places that asymmetry is
+spelled.
+
+### Named as limited
+
+**A link to an agent cannot be built without a socket, and its `open`
+field cannot be written through `self`.**  `RosAgentLink` is opened by
+`rosagent.connect`, or by `link_over` over a socket a caller already
+has, and both need `[net]`; there is no socket-free constructor for a
+test at a lower row to build one from.  The field records how the link
+is opened and is never cleared: `ros_close` closes the socket and
+leaves `open` true, so a caller that asks `ros_is_open` afterwards gets
+an answer about how the link was made rather than about the socket.
+The two guards that read the field are for a link built directly, by
+the struct literal, rather than by either constructor.
+
 ## 0.0.3 — 2026-10-06
 
 README only.  No signature, type or effect row changed, and every body is

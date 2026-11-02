@@ -8,12 +8,6 @@ microcontroller the client library is
 rest of the system through [micro-ROS](https://micro.ros.org/). This
 package brings rclc's node model to novo-lang.
 
-**Status: NOT IMPLEMENTED — interface only.**  Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called.  The package is published so its design can be
-reviewed and depended on before it is implemented.  Version 0.1.0 will
-be the first working release.
-
 ## What it is
 
 A node on a workstation talks directly to every other node, over a
@@ -76,7 +70,9 @@ novo pkg add ros2-nv
 
 ## Example
 
-This example compiles; every call in it panics until 0.1.0.
+Every call in the example is a pure function, so the program runs
+anywhere: the names, the pool and the endpoint pair are all decided
+before anything is created.
 
 ```novo
 use rosexec
@@ -132,9 +128,7 @@ fn main() [io]
             going = false
 ```
 
-Build and test with `novo pkg build` and `novo test tests`. Today
-`novo test` fails on purpose: every test reaches a `not implemented`
-panic.
+Build and test with `novo pkg build` and `novo test tests`.
 
 ## What the package contains
 
@@ -235,7 +229,7 @@ port.
 
 Four modules build for a microcontroller with no heap allocator:
 `rosret`, `rosqos`, `rosgraph` and `rosexec`. `tests/embedded_probe.nv`
-is a firmware program that calls eighty-one of their functions and is
+is a firmware program that calls ninety-five of their functions and is
 compiled for a Cortex-M as part of this package's checks, so the claim
 is built rather than asserted. Those four are also the four a node
 consults before it touches the wire.
@@ -318,35 +312,26 @@ modules.
 
 ## Tests
 
-The suite is six files under `tests/`, written against the signatures
-and red until the bodies land. What they assert comes from ROS 2's own
-behaviour rather than from an implementation: the return code numbering
-rcl publishes, the six quality-of-service profiles ROS 2 ships and the
-requested-versus-offered rules the DDS specification states, the entity
-maxima a stock micro-ROS build is configured with, and the name rules
-`rmw_validate_topic_name` applies.
+The suite is seven files under `tests/`. What they assert comes from
+ROS 2's own behaviour rather than from an implementation: the return
+code numbering rcl publishes, the six quality-of-service profiles ROS 2
+ships and the requested-versus-offered rules the DDS specification
+states, the entity maxima a stock micro-ROS build is configured with,
+and the name rules `rmw_validate_topic_name` applies.
 
 `tests/rostransport_tests.nv` implements `RosTransport` over a table of
-recorded bytes, at no effect at all, which is both the shape a full test
-suite will take and the demonstration that a program's link can be one
-that touches nothing.
+recorded bytes, at no effect at all, which is the demonstration that a
+program's link can be one that touches nothing.
+
+`tests/ros2_edge_tests.nv` covers the inputs a node's own cases do not
+reach: every return code through its name table, every way a name, a
+profile or a session can be refused, and the TCP link driven over a
+loopback listener the file opens itself. That listener is why this file
+is the one that declares `[net]`, and it is what exercises `rosagent`
+rather than only naming it.
 
 `tests/embedded_probe.nv` is the microcontroller program described
 above.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `rosret` — the return codes and the four that are not failures | no |
-| `rosname` — the name rules, expansion and the DDS mapping | no |
-| `rosqos` — the profiles and the compatibility rules | no |
-| `rosgraph` — the entity pool and endpoint matching | no |
-| `rosexec` — the executor step machine and timers | no |
-| `rosmsg` — the envelope and the transport ceiling | no |
-| `rostransport` — the session and the byte pipe | no |
-| `rosparam` — the three parameter types and their rules | no |
-| `rosagent` — the TCP link to an agent | no |
 
 ## Licence
 

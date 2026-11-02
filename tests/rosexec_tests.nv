@@ -1,8 +1,6 @@
 // rosexec_tests.nv — the executor driven from outside, the two
 // semantics, and a timer that was late.
 //
-// RED ON PURPOSE: the first `todo()` each test reaches ends it.
-//
 // THE DISPATCH LOOP IS WRITTEN HERE, in `drive`, and that is the point
 // of the design: an executor a caller steps is an executor a test can
 // run with no middleware under it and no callbacks registered anywhere.

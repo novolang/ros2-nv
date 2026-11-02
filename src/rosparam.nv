@@ -1,8 +1,6 @@
 // rosparam.nv — the three parameter types a node on a microcontroller
 // can have, and the seven it cannot.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  Nothing here performs anything.
 //
 // ROS 2 HAS TEN PARAMETER TYPES AND rclc CARRIES THREE.  A parameter
@@ -24,6 +22,8 @@
 // in a fixed array beside a node's other state.  The three types it
 // carries are the three rclc carries, which is not a coincidence: a
 // string parameter would need storage this package cannot size.
+
+use rosret
 
 // ── The ten types ────────────────────────────────────────────────────
 
@@ -86,7 +86,9 @@ struct RosParamValue
 
 // A parameter with no value.
 pub fn unset() -> RosParamValue []
-    todo("ros2-nv.rosparam.unset")
+    // Kind 0 and zero in every field: the unused fields are what the
+    // value does not carry, and they are only ever read by mistake.
+    RosParamValue { kind: ROS_PARAM_NOT_SET, bool_value: false, int_value: 0, double_value: 0.0 }
 
 // A boolean parameter.
 //
@@ -97,15 +99,15 @@ pub fn unset() -> RosParamValue []
 //     println("${rosparam.bool_param(true).kind}")   // 1
 // ```
 pub fn bool_param(v: Bool) -> RosParamValue []
-    todo("ros2-nv.rosparam.bool_param")
+    RosParamValue { kind: ROS_PARAM_BOOL, bool_value: v, int_value: 0, double_value: 0.0 }
 
 // An integer parameter.
 pub fn int_param(v: Int) -> RosParamValue []
-    todo("ros2-nv.rosparam.int_param")
+    RosParamValue { kind: ROS_PARAM_INTEGER, bool_value: false, int_value: v, double_value: 0.0 }
 
 // A double parameter.
 pub fn double_param(v: Float) -> RosParamValue []
-    todo("ros2-nv.rosparam.double_param")
+    RosParamValue { kind: ROS_PARAM_DOUBLE, bool_value: false, int_value: 0, double_value: v }
 
 // The value as a boolean, or `fallback` when it is not one.
 //
@@ -113,19 +115,28 @@ pub fn double_param(v: Float) -> RosParamValue []
 // parameter is almost always a caller that has a default for it —
 // and because a `@value` cannot be an optional's payload.
 pub fn as_bool(v: RosParamValue, fallback: Bool) -> Bool []
-    todo("ros2-nv.rosparam.as_bool")
+    if v.kind == ROS_PARAM_BOOL
+        v.bool_value
+    else
+        fallback
 
 // The value as an integer, or `fallback`.
 pub fn as_int(v: RosParamValue, fallback: Int) -> Int []
-    todo("ros2-nv.rosparam.as_int")
+    if v.kind == ROS_PARAM_INTEGER
+        v.int_value
+    else
+        fallback
 
 // The value as a double, or `fallback`.
 pub fn as_double(v: RosParamValue, fallback: Float) -> Float []
-    todo("ros2-nv.rosparam.as_double")
+    if v.kind == ROS_PARAM_DOUBLE
+        v.double_value
+    else
+        fallback
 
 // Whether the parameter has a value at all.
 pub fn is_set(v: RosParamValue) -> Bool []
-    todo("ros2-nv.rosparam.is_set")
+    v.kind != ROS_PARAM_NOT_SET
 
 // ── The rules ────────────────────────────────────────────────────────
 
@@ -144,7 +155,10 @@ pub fn is_set(v: RosParamValue) -> Bool []
 //     println("${rosparam.kind_is_supported(rosparam.ROS_PARAM_DOUBLE)}")  // true
 // ```
 pub fn kind_is_supported(kind: Int) -> Bool []
-    todo("ros2-nv.rosparam.kind_is_supported")
+    // The boolean, the integer and the double are the three the
+    // parameter server carries; the string and every array are the
+    // seven it does not.
+    kind == ROS_PARAM_BOOL or kind == ROS_PARAM_INTEGER or kind == ROS_PARAM_DOUBLE
 
 // Whether a value of this type may be assigned to a parameter declared
 // as that one.
@@ -153,26 +167,42 @@ pub fn kind_is_supported(kind: Int) -> Bool []
 // integer parameter set from a launch file that wrote `1.0` is refused
 // — and the node keeps its default and says nothing.
 pub fn set_is_allowed(declared: Int, new: Int) -> Bool []
-    todo("ros2-nv.rosparam.set_is_allowed")
+    // The declared type and the new one have to be the same one; ROS 2
+    // refuses rather than coerces.
+    declared == new
 
 // The return code setting a value of the wrong type produces.
 //
 // `ROS_RET_OK` when the types agree, `ROS_RET_INVALID_ARGUMENT`
 // otherwise.
 pub fn set_ret(declared: Int, new: Int) -> Int []
-    todo("ros2-nv.rosparam.set_ret")
+    if set_is_allowed(declared, new)
+        rosret.ROS_RET_OK
+    else
+        rosret.ROS_RET_INVALID_ARGUMENT
 
 // Whether a parameter's name fits a micro-ROS build.
 pub fn name_fits(name: Str) -> Bool []
-    todo("ros2-nv.rosparam.name_fits")
+    str.len(name) <= ROS_PARAM_NAME_MAX
 
 // Whether a node may declare another parameter.
 pub fn can_declare(declared_count: Int) -> Bool []
-    todo("ros2-nv.rosparam.can_declare")
+    declared_count < ROS_PARAM_MAX
 
 // The type in words.
 pub fn kind_name(kind: Int) -> Str []
-    todo("ros2-nv.rosparam.kind_name")
+    match kind
+        0 => "not set"   // ROS_PARAM_NOT_SET
+        1 => "bool"   // ROS_PARAM_BOOL
+        2 => "integer"   // ROS_PARAM_INTEGER
+        3 => "double"   // ROS_PARAM_DOUBLE
+        4 => "string"   // ROS_PARAM_STRING
+        5 => "byte array"   // ROS_PARAM_BYTE_ARRAY
+        6 => "bool array"   // ROS_PARAM_BOOL_ARRAY
+        7 => "integer array"   // ROS_PARAM_INTEGER_ARRAY
+        8 => "double array"   // ROS_PARAM_DOUBLE_ARRAY
+        9 => "string array"   // ROS_PARAM_STRING_ARRAY
+        _ => "unknown"
 
 // Whether an integer value is inside a range, for a caller that
 // declared one.
@@ -181,11 +211,12 @@ pub fn kind_name(kind: Int) -> Str []
 // enforcing it to the node, so a node that declared a range and did not
 // check it has documentation rather than a constraint.
 pub fn int_in_range(v: RosParamValue, low: Int, high: Int) -> Bool []
-    todo("ros2-nv.rosparam.int_in_range")
+    // A value of another type is not in any range of integers.
+    v.kind == ROS_PARAM_INTEGER and v.int_value >= low and v.int_value <= high
 
 // Whether a double value is inside a range.
 pub fn double_in_range(v: RosParamValue, low: Float, high: Float) -> Bool []
-    todo("ros2-nv.rosparam.double_in_range")
+    v.kind == ROS_PARAM_DOUBLE and v.double_value >= low and v.double_value <= high
 
 // Whether two values are the same type and the same value.
 //
@@ -194,4 +225,15 @@ pub fn double_in_range(v: RosParamValue, low: Float, high: Float) -> Bool []
 // still fires the callback, and a callback that reconfigures hardware
 // on every call reconfigures it for nothing.
 pub fn same_value(a: RosParamValue, b: RosParamValue) -> Bool []
-    todo("ros2-nv.rosparam.same_value")
+    // A different type is a different value even when the numbers
+    // agree, which is the whole point of the declaration rule.
+    if a.kind != b.kind
+        return false
+    if a.kind == ROS_PARAM_BOOL
+        return a.bool_value == b.bool_value
+    if a.kind == ROS_PARAM_INTEGER
+        return a.int_value == b.int_value
+    if a.kind == ROS_PARAM_DOUBLE
+        return a.double_value == b.double_value
+    // Two values that are both unset are the same value.
+    true

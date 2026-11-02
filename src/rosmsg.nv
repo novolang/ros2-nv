@@ -1,8 +1,6 @@
 // rosmsg.nv — a message as bytes this package does not read, and the
 // four-byte header that says which way round they are.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  Nothing here performs anything.
 //
 // THIS PACKAGE DOES NOT SERIALISE.  A ROS 2 message on the wire is
@@ -67,12 +65,18 @@ pub struct RosMessage
 //
 // Little-endian, which is what every ROS 2 node this will talk to
 // sends.
-pub fn message(payload: Bytes, type_id: Int) -> RosMessage []
-    todo("ros2-nv.rosmsg.message")
+pub @tier(system)
+fn message(payload: Bytes, type_id: Int) -> RosMessage []
+    // Little-endian is what every ROS 2 node this will talk to sends.
+    message_with(payload, type_id, ROS_CDR_LE)
 
 // A message from a payload in a stated byte order.
-pub fn message_with(payload: Bytes, type_id: Int, encapsulation: Int) -> RosMessage []
-    todo("ros2-nv.rosmsg.message_with")
+pub @tier(system)
+fn message_with(payload: Bytes, type_id: Int, encapsulation: Int) -> RosMessage []
+    system
+        // The struct is built whole, and the payload is shared rather
+        // than copied.
+        return RosMessage { payload: payload, type_id: type_id, encapsulation: encapsulation }
 
 // The message a received buffer holds, header and all.
 //
@@ -80,47 +84,82 @@ pub fn message_with(payload: Bytes, type_id: Int, encapsulation: Int) -> RosMess
 // answers a message whose encapsulation is what the header said.  A
 // buffer shorter than four bytes answers a message with an
 // encapsulation of -1.
-pub fn decode_envelope(buffer: Bytes, type_id: Int) -> RosMessage []
-    todo("ros2-nv.rosmsg.decode_envelope")
+pub @tier(system)
+fn decode_envelope(buffer: Bytes, type_id: Int) -> RosMessage []
+    system
+        // A buffer with no room for a header has no header to read and
+        // an encapsulation that is not known; nothing was a header, so
+        // nothing is dropped from it.
+        if bytes.len(buffer) < ROS_ENCAPSULATION_BYTES
+            return RosMessage { payload: buffer, type_id: type_id, encapsulation: 0 - 1 }
+        // The representation identifier goes big-endian in the header
+        // whatever the payload's own byte order is.
+        let encapsulation = bytes.u16_be_at(buffer, 0) ?? 0 - 1
+        let body: Bytes = bytes.slice(buffer, ROS_ENCAPSULATION_BYTES, bytes.len(buffer))
+        return RosMessage { payload: body, type_id: type_id, encapsulation: encapsulation }
 
 // The bytes to send: the four-byte header, then the payload.
-pub fn encode_envelope(m: RosMessage) -> Bytes []
-    todo("ros2-nv.rosmsg.encode_envelope")
+pub @tier(system)
+fn encode_envelope(m: RosMessage) -> Bytes []
+    system
+        // The four bytes are the representation identifier, most
+        // significant first, and two option bytes that are zero in
+        // everything ROS 2 sends.
+        return bytes.u16_be(m.encapsulation) + bytes.zeros(2) + m.payload
 
 // Whether the envelope is one of the four this package knows.
-pub fn envelope_is_known(encapsulation: Int) -> Bool []
-    todo("ros2-nv.rosmsg.envelope_is_known")
+pub @tier(system)
+fn envelope_is_known(encapsulation: Int) -> Bool []
+    // The four identifiers are 0 to 3, so the range is the question.
+    encapsulation >= ROS_CDR_BE and encapsulation <= ROS_PL_CDR_LE
 
 // Whether the payload's numbers are least significant byte first.
 //
 // The one question about a message this package can answer without
 // reading the payload, and the one a serialiser has to be told.
-pub fn is_little_endian(m: RosMessage) -> Bool []
-    todo("ros2-nv.rosmsg.is_little_endian")
+pub @tier(system)
+fn is_little_endian(m: RosMessage) -> Bool []
+    m.encapsulation == ROS_CDR_LE or m.encapsulation == ROS_PL_CDR_LE
 
 // Whether the message carries a parameter list rather than a plain
 // structure.
 //
 // A different layout, used for the discovery messages the middleware
 // exchanges rather than for anything a node publishes.
-pub fn is_parameter_list(m: RosMessage) -> Bool []
-    todo("ros2-nv.rosmsg.is_parameter_list")
+pub @tier(system)
+fn is_parameter_list(m: RosMessage) -> Bool []
+    m.encapsulation == ROS_PL_CDR_BE or m.encapsulation == ROS_PL_CDR_LE
 
 // The payload, with no header on it.
-pub fn payload(m: RosMessage) -> Bytes []
-    todo("ros2-nv.rosmsg.payload")
+pub @tier(system)
+fn payload(m: RosMessage) -> Bytes []
+    system
+        // A copy, because a plain `Bytes` answer hands the caller a
+        // buffer it may write, and the message's own payload is not its
+        // buffer.
+        return bytes.clone(m.payload)
 
 // How many bytes the payload holds.
-pub fn payload_length(m: RosMessage) -> Int []
-    todo("ros2-nv.rosmsg.payload_length")
+pub @tier(system)
+fn payload_length(m: RosMessage) -> Int []
+    bytes.len(m.payload)
 
 // How many bytes go on the wire: the payload and the four-byte header.
-pub fn wire_length(m: RosMessage) -> Int []
-    todo("ros2-nv.rosmsg.wire_length")
+pub @tier(system)
+fn wire_length(m: RosMessage) -> Int []
+    // What the transport counts: the payload and the header in front
+    // of it.
+    bytes.len(m.payload) + ROS_ENCAPSULATION_BYTES
 
 // The encapsulation in words.
-pub fn encapsulation_name(encapsulation: Int) -> Str []
-    todo("ros2-nv.rosmsg.encapsulation_name")
+pub @tier(system)
+fn encapsulation_name(encapsulation: Int) -> Str []
+    match encapsulation
+        0 => "cdr big endian"   // ROS_CDR_BE
+        1 => "cdr little endian"   // ROS_CDR_LE
+        2 => "pl cdr big endian"   // ROS_PL_CDR_BE
+        3 => "pl cdr little endian"   // ROS_PL_CDR_LE
+        _ => "unknown"
 
 // ── The transport's ceiling ──────────────────────────────────────────
 
@@ -146,17 +185,23 @@ pub const ROS_DEFAULT_MTU = 512
 //     let m = rosmsg.message(bytes.zeros(600), 1234)
 //     println("${rosmsg.fits_mtu(m, rosmsg.ROS_DEFAULT_MTU)}")   // false
 // ```
-pub fn fits_mtu(m: RosMessage, mtu: Int) -> Bool []
-    todo("ros2-nv.rosmsg.fits_mtu")
+pub @tier(system)
+fn fits_mtu(m: RosMessage, mtu: Int) -> Bool []
+    // The header goes out too, so it counts against the buffer.
+    wire_length(m) <= mtu
 
 // The largest payload a transport of this size can carry.
 //
 // The size less the four header bytes, and less whatever the session
 // framing takes — `rostransport.framing_overhead` is that number, and
 // this takes it as an argument rather than assuming a transport.
-pub fn max_payload(mtu: Int, framing_overhead: Int) -> Int []
-    todo("ros2-nv.rosmsg.max_payload")
+pub @tier(system)
+fn max_payload(mtu: Int, framing_overhead: Int) -> Int []
+    // The session framing and this module's own header both come out
+    // of the same buffer the payload does.
+    mtu - framing_overhead - ROS_ENCAPSULATION_BYTES
 
 // Whether two messages carry the same type.
-pub fn same_type(a: RosMessage, b: RosMessage) -> Bool []
-    todo("ros2-nv.rosmsg.same_type")
+pub @tier(system)
+fn same_type(a: RosMessage, b: RosMessage) -> Bool []
+    a.type_id == b.type_id

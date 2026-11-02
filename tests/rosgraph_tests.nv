@@ -1,7 +1,5 @@
 // rosgraph_tests.nv — the pool that was fixed before the program
 // started, and the two mismatches that connect nothing and say nothing.
-//
-// RED ON PURPOSE: the first `todo()` each test reaches ends it.
 
 use std.test
 use rosgraph

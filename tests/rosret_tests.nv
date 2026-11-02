@@ -1,11 +1,5 @@
 // rosret_tests.nv — the four codes that are not failures, and the
 // grouping rcl's numbering carries.
-//
-// RED ON PURPOSE.  Every body in this package is a `todo()`, so the
-// first call each test makes ends it with `not implemented`.  What the
-// suite checks today is that every signature can be SPELLED by a
-// consumer with the types a consumer holds, and the assertions are the
-// ones the implementation will have to satisfy.
 
 use std.test
 use rosret

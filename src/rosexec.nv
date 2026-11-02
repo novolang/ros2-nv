@@ -1,8 +1,6 @@
 // rosexec.nv — the executor, as a step a caller drives rather than a
 // loop that calls back.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The executor
 // here decides WHAT to run; the caller runs it.
 //
@@ -37,6 +35,9 @@
 // `handles_required` is the arithmetic, because getting it wrong is a
 // runtime failure on a device.
 
+use rosgraph
+use rosret
+
 // ── How many handles ─────────────────────────────────────────────────
 
 // The most handles one executor here can hold: 64.
@@ -63,7 +64,9 @@ pub const ROS_EXEC_MAX_HANDLES = 64
 pub @tier(embedded)
 fn handles_required(subscriptions: Int, timers: Int, services: Int, clients: Int,
                     guards: Int) -> Int []
-    todo("ros2-nv.rosexec.handles_required")
+    // Five kinds and no sixth: a publisher never becomes ready, so an
+    // executor that counted one would hold a slot nothing can use.
+    subscriptions + timers + services + clients + guards
 
 // ── When a spin dispatches ───────────────────────────────────────────
 
@@ -156,17 +159,54 @@ struct RosExecutor
 // ```
 pub @tier(embedded)
 fn executor(capacity: Int) -> RosExecutor []
-    todo("ros2-nv.rosexec.executor")
+    // The ready set is one integer with a bit per handle, so a capacity
+    // above the ceiling would name handles no ready set could address;
+    // a capacity below zero is not a number of handles either.
+    var room = capacity
+    if room > ROS_EXEC_MAX_HANDLES
+        room = ROS_EXEC_MAX_HANDLES
+    if room < 0
+        room = 0
+    RosExecutor {
+        capacity: room,
+        count: 0,
+        trigger: ROS_TRIGGER_ANY,
+        trigger_index: -1,
+        semantics: ROS_SEMANTICS_ROS2,
+        timeout_ms: 100,
+        cursor: 0 }
 
 // How many more handles will fit.
 pub @tier(embedded)
 fn remaining_handles(e: RosExecutor) -> Int []
-    todo("ros2-nv.rosexec.remaining_handles")
+    // The capacity is fixed at creation, so the room left is what it
+    // was built for less what has been registered.
+    e.capacity - e.count
 
 // Whether one more handle fits.
 pub @tier(embedded)
 fn can_add_handle(e: RosExecutor) -> Bool []
-    todo("ros2-nv.rosexec.can_add_handle")
+    remaining_handles(e) > 0
+
+// The executor with six new field values named one by one.
+//
+// Every setter in this module and `add_handle` are its callers, and it
+// is the one place that spells the seven fields out.  A `@value` struct
+// is replaced whole, and there is no update syntax, so the fields that
+// did not change are carried across by name.  It carries the tier
+// because an unannotated function is `app`, and an embedded caller
+// cannot reach one above it.
+@tier(embedded)
+fn executor_with(e: RosExecutor, count: Int, trigger: Int, trigger_index: Int, semantics: Int,
+                 timeout_ms: Int, cursor: Int) -> RosExecutor
+    RosExecutor {
+        capacity: e.capacity,
+        count: count,
+        trigger: trigger,
+        trigger_index: trigger_index,
+        semantics: semantics,
+        timeout_ms: timeout_ms,
+        cursor: cursor }
 
 // The executor with one more handle.
 //
@@ -175,7 +215,10 @@ fn can_add_handle(e: RosExecutor) -> Bool []
 // with what it thinks it registered.
 pub @tier(embedded)
 fn add_handle(e: RosExecutor) -> RosExecutor []
-    todo("ros2-nv.rosexec.add_handle")
+    if not can_add_handle(e)
+        return e
+    executor_with(e, e.count + 1, e.trigger, e.trigger_index, e.semantics, e.timeout_ms,
+                  e.cursor)
 
 // The return code adding a handle would produce.
 //
@@ -184,7 +227,9 @@ fn add_handle(e: RosExecutor) -> RosExecutor []
 // `handles_required` answers.
 pub @tier(embedded)
 fn add_handle_ret(e: RosExecutor) -> Int []
-    todo("ros2-nv.rosexec.add_handle_ret")
+    if can_add_handle(e)
+        return rosret.ROS_RET_OK
+    rosret.ROS_RET_WAIT_SET_FULL
 
 // Which position the next handle added will take.
 //
@@ -195,7 +240,10 @@ fn add_handle_ret(e: RosExecutor) -> Int []
 // so anywhere.
 pub @tier(embedded)
 fn handle_order(e: RosExecutor) -> Int []
-    todo("ros2-nv.rosexec.handle_order")
+    // The position is the count, because handles take the positions in
+    // the order they were added and nothing is ever removed from the
+    // middle: the table is fixed and the schedule with it.
+    e.count
 
 // The executor with a different trigger policy.
 //
@@ -203,29 +251,53 @@ fn handle_order(e: RosExecutor) -> Int []
 // the other two.
 pub @tier(embedded)
 fn set_trigger(e: RosExecutor, trigger: Int, index: Int) -> RosExecutor []
-    todo("ros2-nv.rosexec.set_trigger")
+    // The index is stored whatever the policy is; only
+    // `ROS_TRIGGER_ONE` ever reads it.
+    executor_with(e, e.count, trigger, index, e.semantics, e.timeout_ms, e.cursor)
 
 // The executor with different semantics.
 pub @tier(embedded)
 fn set_semantics(e: RosExecutor, semantics: Int) -> RosExecutor []
-    todo("ros2-nv.rosexec.set_semantics")
+    executor_with(e, e.count, e.trigger, e.trigger_index, semantics, e.timeout_ms,
+                  e.cursor)
 
 // The executor with a different spin timeout, in milliseconds.
 pub @tier(embedded)
 fn set_timeout(e: RosExecutor, timeout_ms: Int) -> RosExecutor []
-    todo("ros2-nv.rosexec.set_timeout")
+    executor_with(e, e.count, e.trigger, e.trigger_index, e.semantics, timeout_ms,
+                  e.cursor)
 
 // The semantics in words.
 pub @tier(embedded)
 fn semantics_name(semantics: Int) -> Str []
-    todo("ros2-nv.rosexec.semantics_name")
+    match semantics
+        ROS_SEMANTICS_ROS2 => "ros 2 semantics"
+        ROS_SEMANTICS_LET  => "logical execution time"
+        _                  => "unknown"
 
 // The trigger policy in words.
 pub @tier(embedded)
 fn trigger_name(trigger: Int) -> Str []
-    todo("ros2-nv.rosexec.trigger_name")
+    match trigger
+        ROS_TRIGGER_ANY => "any"
+        ROS_TRIGGER_ALL => "all"
+        ROS_TRIGGER_ONE => "one"
+        _               => "unknown"
 
 // ── A spin ───────────────────────────────────────────────────────────
+
+// The low `n` bits of a ready set, which is the part of it that belongs
+// to an executor holding `n` handles.
+//
+// Every bit set is spelled -1 rather than a shift by the ceiling, which
+// would be a shift by the whole width of the integer.
+@tier(embedded)
+fn mask_of(n: Int) -> Int
+    if n <= 0
+        return 0
+    if n >= ROS_EXEC_MAX_HANDLES
+        return -1
+    (1 << n) - 1
 
 // Whether a ready set satisfies the executor's trigger policy.
 //
@@ -242,22 +314,46 @@ fn trigger_name(trigger: Int) -> Str []
 // ```
 pub @tier(embedded)
 fn should_dispatch(e: RosExecutor, ready: Int) -> Bool []
-    todo("ros2-nv.rosexec.should_dispatch")
+    // A trigger that names one handle is asking about that handle and
+    // no other, and a trigger that names none is satisfied by nothing.
+    if e.trigger == ROS_TRIGGER_ONE
+        return e.trigger_index >= 0 and is_ready(ready, e.trigger_index)
+    // The other two count only the handles this executor holds: a bit
+    // for a position it never registered is not one of its handles.
+    let mine = ready & mask_of(e.count)
+    if e.trigger == ROS_TRIGGER_ALL
+        return mine == mask_of(e.count)
+    mine != 0
 
 // The bit in a ready set that belongs to handle `index`.
 pub @tier(embedded)
 fn ready_bit(index: Int) -> Int []
-    todo("ros2-nv.rosexec.ready_bit")
+    // A handle the ready set cannot name has no bit.  The set is one
+    // integer and its width is the handle ceiling, so an index outside
+    // it — the -1 a trigger that names no handle carries, among others
+    // — would otherwise ask for a shift that is not a bit position.
+    if index < 0 or index >= ROS_EXEC_MAX_HANDLES
+        return 0
+    1 << index
 
 // Whether handle `index` is ready in this set.
 pub @tier(embedded)
 fn is_ready(ready: Int, index: Int) -> Bool []
-    todo("ros2-nv.rosexec.is_ready")
+    // `&` binds tighter than the comparison, which is the opposite of
+    // C, so the brackets say which reading is meant.
+    (ready & ready_bit(index)) != 0
 
 // How many handles are ready.
 pub @tier(embedded)
 fn ready_count(ready: Int) -> Int []
-    todo("ros2-nv.rosexec.ready_count")
+    // A counted loop over the set's own width: the embedded tier admits
+    // a `for i in 0..N`, and the ceiling the ready set was built for is
+    // the bound it can read.
+    var ready_handles = 0
+    for i in 0..ROS_EXEC_MAX_HANDLES
+        if is_ready(ready, i)
+            ready_handles = ready_handles + 1
+    ready_handles
 
 // What one step of a spin says to do.
 pub @value
@@ -279,6 +375,31 @@ struct RosExecStep
     // `rosret`.
     ret: Int
 
+// The kind of handle a step reports.
+//
+// The executor holds no kind of its own: what a handle IS lives with
+// the program, and this module stores the index and the policies only.
+// A subscription is the kind an executor is most often built around,
+// and a caller that registered a timer or a guard condition reads its
+// own table at the index the step names.
+@tier(embedded)
+fn step_kind() -> Int
+    rosgraph.ROS_ENTITY_SUBSCRIPTION
+
+// The step that ends a spin.
+//
+// No take ran, so the code is `ROS_RET_OK` and not the result of one:
+// there is no handle it could belong to, and the caller stops on
+// `dispatch`.
+@tier(embedded)
+fn no_step() -> RosExecStep
+    RosExecStep {
+        dispatch: false,
+        index: -1,
+        kind: step_kind(),
+        has_message: false,
+        ret: rosret.ROS_RET_OK }
+
 // What to do next, given what the middleware says is ready.
 //
 // Answers a step with `dispatch` false when the trigger policy is not
@@ -292,12 +413,41 @@ struct RosExecStep
 // every caller's.
 pub @tier(embedded)
 fn spin_step(e: RosExecutor, ready: Int) -> RosExecStep []
-    todo("ros2-nv.rosexec.spin_step")
+    if not should_dispatch(e, ready)
+        return no_step()
+    // What the walk is over.  A trigger that names one handle walks a
+    // set holding only that handle, so the policy decides which
+    // callback this spin is for and the walk decides nothing.  A bit
+    // for a position this executor never registered is not one of its
+    // handles, so the other two policies walk the masked set.
+    var mine = ready & mask_of(e.count)
+    if e.trigger == ROS_TRIGGER_ONE
+        mine = ready_bit(e.trigger_index)
+    // The cursor counts the ready handles this spin has already run —
+    // see `spin_advance` — so the walk skips that many of them and no
+    // handle runs twice in one spin.  They are visited in registration
+    // order, which is the order they are dispatched in, and the walk
+    // ends when no ready handle is left to count up to.
+    var seen = 0
+    for i in 0..e.count
+        if is_ready(mine, i)
+            if seen == e.cursor
+                return RosExecStep {
+                    dispatch: true,
+                    index: i,
+                    kind: step_kind(),
+                    has_message: true,
+                    ret: rosret.ROS_RET_OK }
+            seen = seen + 1
+    no_step()
 
 // The executor after a step has been dispatched.
 pub @tier(embedded)
 fn spin_advance(e: RosExecutor) -> RosExecutor []
-    todo("ros2-nv.rosexec.spin_advance")
+    // One ready handle further along, so the next step is the one after
+    // the handle that just ran and no handle runs twice in one spin.
+    executor_with(e, e.count, e.trigger, e.trigger_index, e.semantics, e.timeout_ms,
+                  e.cursor + 1)
 
 // The executor at the start of a new spin.
 //
@@ -307,12 +457,15 @@ fn spin_advance(e: RosExecutor) -> RosExecutor []
 // resume it.
 pub @tier(embedded)
 fn spin_begin(e: RosExecutor) -> RosExecutor []
-    todo("ros2-nv.rosexec.spin_begin")
+    executor_with(e, e.count, e.trigger, e.trigger_index, e.semantics, e.timeout_ms, 0)
 
 // Whether a spin has walked every handle.
 pub @tier(embedded)
 fn spin_done(e: RosExecutor) -> Bool []
-    todo("ros2-nv.rosexec.spin_done")
+    // The walk is over once the cursor has counted as many ready
+    // handles as the executor holds, and an executor with no handles
+    // has walked all of them from the start.
+    e.cursor >= e.count
 
 // Which handles a spin under these semantics may take from.
 //
@@ -323,7 +476,13 @@ fn spin_done(e: RosExecutor) -> Bool []
 // delay through the node constant.
 pub @tier(embedded)
 fn takeable(e: RosExecutor, ready_at_begin: Int, ready_now: Int) -> Int []
-    todo("ros2-nv.rosexec.takeable")
+    // The one place the two semantics part.  Logical execution time
+    // fixes the set at the start of the spin, so what a callback
+    // publishes during it is taken on the next spin, and the delay
+    // through the node does not depend on who was ready first.
+    if e.semantics == ROS_SEMANTICS_LET
+        return ready_at_begin
+    ready_now
 
 // ── Timers ───────────────────────────────────────────────────────────
 
@@ -363,22 +522,71 @@ struct RosTimer
 // A timer of this period.
 pub @tier(embedded)
 fn timer(period_ms: Int, on_late: Int) -> RosTimer []
-    todo("ros2-nv.rosexec.timer")
+    // A new timer is running, has been running for no time, and owes
+    // nothing yet.
+    RosTimer {
+        period_ms: period_ms,
+        elapsed_ms: 0,
+        on_late: on_late,
+        owed: 0,
+        active: true }
+
+// The timer with four new field values named one by one.
+//
+// Every function that changes a timer is its caller, and it is the one
+// place that spells the five fields out: a `@value` struct is replaced
+// whole and there is no update syntax.  It carries the tier because an
+// unannotated function is `app`, and an embedded caller cannot reach
+// one above it.
+@tier(embedded)
+fn timer_with(t: RosTimer, elapsed_ms: Int, owed: Int, active: Bool) -> RosTimer
+    RosTimer {
+        period_ms: t.period_ms,
+        elapsed_ms: elapsed_ms,
+        on_late: t.on_late,
+        owed: owed,
+        active: active }
 
 // The timer after `delta_ms` more milliseconds.
 pub @tier(embedded)
 fn timer_advance(t: RosTimer, delta_ms: Int) -> RosTimer []
-    todo("ros2-nv.rosexec.timer_advance")
+    // A timer that is not running, a period that is not a period and
+    // time that did not pass are input faults rather than panics, and
+    // each leaves the timer exactly as it was.
+    if not t.active or t.period_ms <= 0 or delta_ms <= 0
+        return t
+    let elapsed = t.elapsed_ms + delta_ms
+    if elapsed < t.period_ms
+        return timer_with(t, elapsed, t.owed, t.active)
+    // The whole periods that went by, and the part of one left over:
+    // the timer comes due on the boundaries it would have kept if the
+    // spin had not been late.
+    let passed = elapsed / t.period_ms
+    if t.on_late == ROS_TIMER_CATCH_UP
+        // A catching-up timer fires once for every period it missed,
+        // which is what makes a blocked spin run its integrator ten
+        // times in a row.
+        return timer_with(t, elapsed % t.period_ms, t.owed + passed, t.active)
+    // A skipping timer fires once and drops the rest, so it owes one
+    // firing however far behind it is.
+    timer_with(t, elapsed % t.period_ms, 1, t.active)
 
 // Whether the timer owes a firing.
 pub @tier(embedded)
 fn timer_is_ready(t: RosTimer) -> Bool []
-    todo("ros2-nv.rosexec.timer_is_ready")
+    // A stopped timer is never ready, and firings owed are what make a
+    // running one ready: the elapsed time is only ever read for the
+    // next one.
+    t.active and t.owed > 0
 
 // The timer with one owed firing taken.
 pub @tier(embedded)
 fn timer_fired(t: RosTimer) -> RosTimer []
-    todo("ros2-nv.rosexec.timer_fired")
+    // One firing, and never below none: taking a firing a timer does
+    // not owe would leave the count negative and the next call due.
+    if t.owed <= 0
+        return t
+    timer_with(t, t.elapsed_ms, t.owed - 1, t.active)
 
 // How many firings the timer owes.
 //
@@ -387,7 +595,11 @@ fn timer_fired(t: RosTimer) -> RosTimer []
 // find out here.
 pub @tier(embedded)
 fn timer_owed(t: RosTimer) -> Int []
-    todo("ros2-nv.rosexec.timer_owed")
+    // A timer that is not running owes nothing, whatever it had
+    // accumulated before it was stopped.
+    if t.active
+        return t.owed
+    0
 
 // How long until the timer next fires, in milliseconds, or 0.
 //
@@ -395,17 +607,29 @@ fn timer_owed(t: RosTimer) -> Int []
 // than this makes the timer late for no reason.
 pub @tier(embedded)
 fn timer_next_ms(t: RosTimer) -> Int []
-    todo("ros2-nv.rosexec.timer_next_ms")
+    // A timer that is not running never comes due, and one that already
+    // owes a firing is due now: neither asks the caller to wait.
+    if not t.active or t.owed > 0
+        return 0
+    if t.elapsed_ms >= t.period_ms
+        return 0
+    t.period_ms - t.elapsed_ms
 
 // The timer, stopped.
 pub @tier(embedded)
 fn timer_cancel(t: RosTimer) -> RosTimer []
-    todo("ros2-nv.rosexec.timer_cancel")
+    // A stopped timer owes nothing, so the firings it had accumulated
+    // go with it.  The elapsed time stays: it is what a report of how
+    // long the timer ran would read.
+    timer_with(t, t.elapsed_ms, 0, false)
 
 // The timer, started again from zero.
 pub @tier(embedded)
 fn timer_reset(t: RosTimer) -> RosTimer []
-    todo("ros2-nv.rosexec.timer_reset")
+    // Started again from zero: the elapsed time goes back to none of
+    // it, the firings owed are dropped, and a timer that had been
+    // cancelled is running again.
+    timer_with(t, 0, 0, true)
 
 // The shortest wait an executor should take, given its own timeout and
 // a timer's, in milliseconds.
@@ -415,4 +639,13 @@ fn timer_reset(t: RosTimer) -> RosTimer []
 // cycle, and nothing reports it.
 pub @tier(embedded)
 fn spin_wait_ms(e: RosExecutor, t: RosTimer) -> Int []
-    todo("ros2-nv.rosexec.spin_wait_ms")
+    // A timer that is not running has no wait to shorten, and the
+    // executor's own timeout is then the whole answer.  Otherwise the
+    // shorter of the two, because a wait that runs past a timer makes
+    // that timer late on every cycle and nothing reports it.
+    if not t.active
+        return e.timeout_ms
+    let next = timer_next_ms(t)
+    if next < e.timeout_ms
+        return next
+    e.timeout_ms

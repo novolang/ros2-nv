@@ -1,0 +1,891 @@
+// ros2_edge_tests.nv — the answers the six suites beside this one never
+// ask for: every code through a name table, each refusal a builder can
+// produce, and the TCP link driven over a loopback socket.
+//
+// This is a second file because a suite written against the behaviour a
+// node depends on checks the answers, not the whole input domain.  A
+// function that turns a code into a word is half checked until every
+// code has been through it; a branch that refuses is half checked until
+// something refuses; and `rosagent` has no caller at all in a suite
+// whose pipe touches nothing, because a link holds a socket.
+//
+// The link tests declare `[net]`, and the listener they talk to is one
+// the test opens itself on an ephemeral port, so nothing outside this
+// process is needed and no fixed port is held.
+//
+// The assertions here are about the arm rather than about a new rule:
+// where a value is checked at all it is checked against the constant
+// the implementation answers with, which the six suites already pin.
+
+use std.bytes
+use std.net
+use std.test
+use rosagent
+use rosgraph
+use rosmsg
+use rosname
+use rosparam
+use rosqos
+use rosret
+use rosexec
+use rostransport
+
+// ── rosret: every code and every subsystem ───────────────────────────
+
+// Every return code rcl defines, plus the two this package adds.
+//
+// A table that answers "unknown" for a code it holds is a log line that
+// names nothing, and it is only found by asking it about each of them.
+@test
+fn test_every_return_code_has_a_name_of_its_own() [io]
+    let codes = [0, 1, 2, 3, 10, 11, 100, 101, 103, 104, 105, 106, 200, 201, 202,
+                 300, 400, 401, 500, 501, 600, 601, 800, 801, 900, 901, 902,
+                 10001, 10002]
+    test.case("a word for each of the twenty-nine")
+    for i in 0..list.len(codes)
+        let named = rosret.ros_ret_name(codes[i])
+        test.assert_ne(named, "unknown")
+        test.assert(str.len(named) > 0)
+
+    test.case("and nothing for a number rcl does not use")
+    test.assert_eq(rosret.ros_ret_name(7), "unknown")
+
+// The subsystem names, one per grouping, and the extension codes that
+// belong to none of them.
+@test
+fn test_every_subsystem_has_a_name_of_its_own() [io]
+    let groups = [0, 1, 2, 3, 4, 5, 6, 8, 9]
+    for i in 0..list.len(groups)
+        let named = rosret.ros_ret_subsystem_name(groups[i])
+        test.assert_ne(named, "none")
+        test.assert(str.len(named) > 0)
+
+    test.case("a grouping rcl has no subsystem for is none")
+    test.assert_eq(rosret.ros_ret_subsystem_name(7), "none")
+
+    test.case("and an extension code belongs to no grouping")
+    // The two codes above 1000 are this package's, so the hundreds
+    // digit they would otherwise be read as is not a subsystem.
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_QOS_INCOMPATIBLE), -1)
+    test.assert_eq(rosret.ros_ret_subsystem(rosret.ROS_RET_AGENT_UNREACHABLE), -1)
+
+// ── rosname: one name per rule ───────────────────────────────────────
+
+// Each rule is a refusal checked in the order the rules are listed, so
+// a name that breaks rule five only reaches it when it breaks none of
+// the four above.
+@test
+fn test_each_node_name_rule_reports_itself() [io]
+    test.case("a character a name may not hold")
+    test.assert_eq(rosname.check_node_name("sensor-1"),
+                   rosname.ROS_NAME_BAD_CHARACTER)
+
+    test.case("a tilde that is not at the start")
+    // A tilde means this node's own namespace, and only as the first
+    // byte.  `~probe` is the private form and is not a fault here.
+    test.assert_eq(rosname.check_node_name("pro~be"),
+                   rosname.ROS_NAME_TILDE_NOT_AT_START)
+
+    test.case("a brace with no partner")
+    test.assert_eq(rosname.check_node_name("pro{be"),
+                   rosname.ROS_NAME_UNBALANCED_BRACES)
+
+    test.case("a name longer than the middleware carries")
+    // Doubled nine times, so the length is far past the limit while
+    // every character in it is a letter.
+    var long = "probe"
+    for i in 0..9
+        long = long + long
+    test.assert_eq(rosname.check_node_name(long), rosname.ROS_NAME_TOO_LONG)
+
+// The brace scan is two rules in one pass, and a name can break it two
+// ways that the rules above it in the list do not catch.
+@test
+fn test_each_brace_rule_reports_itself() [io]
+    test.case("a brace inside a brace")
+    // One pair holds one substitution and a substitution is a word, so
+    // a second brace before the first is closed has no partner.
+    test.assert_eq(rosname.check_node_name("pro{{be}"),
+                   rosname.ROS_NAME_UNBALANCED_BRACES)
+
+    test.case("a closing brace with nothing open")
+    test.assert_eq(rosname.check_node_name("pro}be"),
+                   rosname.ROS_NAME_UNBALANCED_BRACES)
+
+    test.case("and a pair the scan closes again")
+    // `node` is one of the two substitutions ROS 2 defines, and the
+    // scan carries on past a pair it knows rather than stopping at it.
+    test.assert_eq(rosname.check_node_name("pro{node}be"), rosname.ROS_NAME_OK)
+
+    test.case("a pair holding something with no definition is not a brace fault")
+    test.assert_eq(rosname.check_node_name("pro{nope}be"),
+                   rosname.ROS_NAME_UNKNOWN_SUBSTITUTION)
+
+// A namespace is absolute and the root namespace is one slash, which is
+// the single name that ends with one and is right to.
+@test
+fn test_each_namespace_rule_reports_itself() [io]
+    test.case("no namespace at all")
+    test.assert_eq(rosname.check_namespace(""), rosname.ROS_NAME_EMPTY)
+
+    test.case("one that ends with a slash")
+    test.assert_eq(rosname.check_namespace("/sensors/"),
+                   rosname.ROS_NAME_ENDS_WITH_SLASH)
+
+    test.case("two slashes in a row")
+    test.assert_eq(rosname.check_namespace("/sensors//probe"),
+                   rosname.ROS_NAME_REPEATED_SLASH)
+
+    test.case("a character a name may not hold")
+    test.assert_eq(rosname.check_namespace("/sens-ors"),
+                   rosname.ROS_NAME_BAD_CHARACTER)
+
+    test.case("a token that starts with a digit")
+    test.assert_eq(rosname.check_namespace("/2fast"),
+                   rosname.ROS_NAME_TOKEN_STARTS_WITH_DIGIT)
+
+@test
+fn test_each_topic_name_rule_reports_itself() [io]
+    test.case("no topic name at all")
+    test.assert_eq(rosname.check_topic_name(""), rosname.ROS_NAME_EMPTY)
+
+    test.case("a token that starts with a digit")
+    test.assert_eq(rosname.check_topic_name("/2fast"),
+                   rosname.ROS_NAME_TOKEN_STARTS_WITH_DIGIT)
+
+    test.case("and one past the length the wire allows")
+    var long = "probe"
+    for i in 0..9
+        long = long + long
+    test.assert_eq(rosname.check_topic_name(long), rosname.ROS_NAME_TOO_LONG)
+
+// A service travels as two DDS topics with suffixes, so its budget is
+// eight characters shorter than a topic's.
+@test
+fn test_a_service_name_answers_the_topic_rule_it_breaks() [io]
+    test.case("a fault the topic rules already name comes back as itself")
+    test.assert_eq(rosname.check_service_name("add_two-ints"),
+                   rosname.ROS_NAME_BAD_CHARACTER)
+
+    test.case("and one only the reply suffix makes too long")
+    // Under the topic limit and over the service budget, which is the
+    // difference between this function and the one it calls.  The
+    // budget counts the DDS name, so the prefix and the suffix each
+    // come out of the same 255, and a name of 246 characters is inside
+    // one and outside the other.
+    var long = "ab"
+    while long.len(long) < 245
+        long = long + "ab"
+    test.assert(long.len(long) <= rosname.ROS_NAME_MAX)
+    test.assert_eq(rosname.check_topic_name(long), rosname.ROS_NAME_OK)
+    test.assert_eq(rosname.check_service_name(long), rosname.ROS_NAME_TOO_LONG)
+
+@test
+fn test_every_name_error_has_a_word() [io]
+    let codes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    for i in 0..list.len(codes)
+        test.assert_ne(rosname.name_error_name(codes[i]), "unknown")
+
+    test.case("and a number that is not a rule names nothing")
+    test.assert_eq(rosname.name_error_name(99), "unknown")
+
+// The return code a name fault produces depends on what was being
+// named, and two of the four answers are not about the endpoint's kind.
+@test
+fn test_a_name_fault_becomes_the_code_of_the_thing_named() [io]
+    test.case("a name that is fine is no fault")
+    test.assert_eq(rosname.name_error_ret(rosname.ROS_NAME_OK,
+                                          rosgraph.ROS_ENTITY_PUBLISHER),
+                   rosret.ROS_RET_OK)
+
+    test.case("a namespace fault is always the node's")
+    // Whatever was being named: the namespace belongs to the node, and
+    // the endpoint being created with it is not what is wrong.
+    test.assert_eq(rosname.name_error_ret(rosname.ROS_NAME_NAMESPACE_NOT_ABSOLUTE,
+                                          rosgraph.ROS_ENTITY_PUBLISHER),
+                   rosret.ROS_RET_NODE_INVALID_NAMESPACE)
+
+    test.case("a node name fault is the node's")
+    test.assert_eq(rosname.name_error_ret(rosname.ROS_NAME_EMPTY,
+                                          rosgraph.ROS_ENTITY_NODE),
+                   rosret.ROS_RET_NODE_INVALID_NAME)
+
+    test.case("a service and a client answer the service code")
+    test.assert_eq(rosname.name_error_ret(rosname.ROS_NAME_EMPTY,
+                                          rosgraph.ROS_ENTITY_SERVICE),
+                   rosret.ROS_RET_SERVICE_NAME_INVALID)
+    test.assert_eq(rosname.name_error_ret(rosname.ROS_NAME_EMPTY,
+                                          rosgraph.ROS_ENTITY_CLIENT),
+                   rosret.ROS_RET_SERVICE_NAME_INVALID)
+
+    test.case("and a timer, which has no name on the wire, answers neither")
+    test.assert_eq(rosname.name_error_ret(rosname.ROS_NAME_EMPTY,
+                                          rosgraph.ROS_ENTITY_TIMER),
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+
+// The private form of a name is the node's own fully qualified name and
+// whatever follows the tilde, and a bare tilde is the node itself.
+@test
+fn test_the_private_and_dds_forms_of_a_name() [io]
+    test.case("a tilde and nothing after it")
+    test.assert_eq(rosname.expand("~", "/sensors", "probe"), "/sensors/probe")
+
+    test.case("and a name with no leading slash is not a DDS prefix's")
+    // The prefix replaces the leading slash, and a name that has none
+    // keeps every character it had.
+    test.assert_eq(rosname.dds_topic_name("chatter"), "rt/chatter")
+
+// A type name is three non-empty parts, and each way of failing that is
+// a different answer from the same slice.
+@test
+fn test_a_type_name_that_is_not_three_parts() [io]
+    test.case("one part, which is the old ROS 1 spelling's subject")
+    test.assert(not rosname.type_name_is_valid("String"))
+
+    test.case("an empty package, an empty kind, or an empty type")
+    test.assert(not rosname.type_name_is_valid("/msg/String"))
+    test.assert(not rosname.type_name_is_valid("std_msgs//String"))
+    test.assert(not rosname.type_name_is_valid("std_msgs/msg/"))
+
+    test.case("and a fourth part, which makes it something else")
+    test.assert(not rosname.type_name_is_valid("std_msgs/msg/String/Extra"))
+
+    test.case("an action name is a name of the third kind")
+    test.assert_eq(rosname.type_kind("example_interfaces/action/Fibonacci"), 2)
+
+// ── rosgraph: every kind, and the refusals ───────────────────────────
+
+@test
+fn test_every_entity_kind_is_counted_and_named() [io]
+    let g = rosgraph.default_pool()
+
+    test.case("a kind the pool holds has a count")
+    test.assert_eq(rosgraph.used_of(g, rosgraph.ROS_ENTITY_NODE), 0)
+
+    test.case("and one it does not has none, which is the same -1")
+    // A timer costs an executor handle and not a pool slot, and a kind
+    // this package does not know is not a kind.
+    test.assert_eq(rosgraph.used_of(g, rosgraph.ROS_ENTITY_TIMER), -1)
+
+    test.case("one more of each kind the pool holds")
+    test.assert_eq(rosgraph.add(g, rosgraph.ROS_ENTITY_NODE).nodes, 1)
+    test.assert_eq(rosgraph.add(g, rosgraph.ROS_ENTITY_SUBSCRIPTION).subscriptions, 1)
+    test.assert_eq(rosgraph.add(g, rosgraph.ROS_ENTITY_SERVICE).services, 1)
+    test.assert_eq(rosgraph.add(g, rosgraph.ROS_ENTITY_CLIENT).clients, 1)
+
+    test.case("a kind that is not pooled is not moved by adding it")
+    test.assert_eq(rosgraph.add(g, rosgraph.ROS_ENTITY_GUARD).publishers, 0)
+
+    test.case("the word for each kind")
+    let kinds = [0, 1, 2, 3, 4, 5, 6]
+    for i in 0..list.len(kinds)
+        test.assert_ne(rosgraph.entity_name(kinds[i]), "unknown")
+    test.assert_eq(rosgraph.entity_name(99), "unknown")
+
+@test
+fn test_a_pool_that_has_room_says_so() [io]
+    let g = rosgraph.default_pool()
+
+    test.case("a pool with room answers ok rather than an allocation failure")
+    test.assert_eq(rosgraph.add_ret(g, rosgraph.ROS_ENTITY_PUBLISHER),
+                   rosret.ROS_RET_OK)
+
+    test.case("and one that has none answers the allocation failure")
+    // What rmw_microxrcedds answers when a pool is exhausted, which
+    // reads as "out of memory" when it means "built for one".
+    let full = rosgraph.add(g, rosgraph.ROS_ENTITY_PUBLISHER)
+    test.assert_eq(rosgraph.add_ret(full, rosgraph.ROS_ENTITY_PUBLISHER),
+                   rosret.ROS_RET_BAD_ALLOC)
+
+    test.case("giving back something the pool never held changes nothing")
+    // Otherwise the count goes negative and the room left reads larger
+    // than the firmware was built with.
+    let untouched = rosgraph.remove(g, rosgraph.ROS_ENTITY_PUBLISHER)
+    test.assert_eq(untouched.publishers, 0)
+    test.assert_eq(rosgraph.remaining(untouched, rosgraph.ROS_ENTITY_PUBLISHER), 1)
+
+@test
+fn test_the_first_kind_a_program_would_run_out_of() [io]
+    let g = rosgraph.default_pool()
+
+    test.case("in the order the four counts were given")
+    // A program that would run out of two of them can only fix one
+    // first, so the answer is the first.
+    test.assert_eq(rosgraph.first_shortfall(g, 0, 2, 0, 0),
+                   rosgraph.ROS_ENTITY_SUBSCRIPTION)
+    test.assert_eq(rosgraph.first_shortfall(g, 0, 0, 2, 0),
+                   rosgraph.ROS_ENTITY_SERVICE)
+    test.assert_eq(rosgraph.first_shortfall(g, 0, 0, 0, 2),
+                   rosgraph.ROS_ENTITY_CLIENT)
+
+    test.case("and none of them when everything fits")
+    test.assert_eq(rosgraph.first_shortfall(g, 1, 1, 1, 1), -1)
+
+// Two endpoints connect when both were created, the first is a
+// publisher, the second a subscription, and the types and settings
+// agree.  Each refusal is its own answer.
+@test
+fn test_the_endpoints_that_cannot_connect_say_which_one_is_wrong() [io]
+    let t = rosname.type_id("std_msgs/msg/String")
+    let publisher = rosgraph.endpoint(rosgraph.ROS_ENTITY_PUBLISHER, 0, t,
+                                rosqos.default_profile())
+    let subscription = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 0, t,
+                                rosqos.default_profile())
+    let other_sub = rosgraph.endpoint(rosgraph.ROS_ENTITY_SUBSCRIPTION, 1, t,
+                                      rosqos.default_profile())
+
+    test.case("a subscription where the publisher belongs")
+    // The topic rules are the same for both, so a pair the wrong way
+    // round is an argument fault and not a settings one.
+    test.assert_eq(rosgraph.can_connect(other_sub, subscription),
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+
+    test.case("and two of the right kind connect")
+    test.assert_eq(rosgraph.can_connect(publisher, subscription), rosret.ROS_RET_OK)
+
+// ── rosqos: every policy that can refuse, and every word ─────────────
+
+@test
+fn test_each_policy_can_be_the_one_that_refused() [io]
+    let base = rosqos.default_profile()
+
+    test.case("durability, which is the second thing asked")
+    let durability = rosqos.compatible(
+        rosqos.with_durability(base, rosqos.ROS_DURABILITY_VOLATILE),
+        rosqos.with_durability(base, rosqos.ROS_DURABILITY_TRANSIENT_LOCAL))
+    test.assert_eq(durability.policy, rosqos.ROS_QOS_POLICY_DURABILITY)
+    test.assert_eq(rosqos.compat_advice(durability),
+                   "the subscription asks for transient local durability and the publisher offers volatile; relax the subscription to volatile or make the publisher transient local")
+
+    test.case("deadline, which is a promise against a tolerance")
+    // A publisher promising a message every five hundred milliseconds
+    // does not satisfy one that will tolerate only a hundred.
+    let deadline = rosqos.compatible(rosqos.with_deadline(base, 500),
+                                     rosqos.with_deadline(base, 100))
+    test.assert_eq(deadline.policy, rosqos.ROS_QOS_POLICY_DEADLINE)
+    test.assert_eq(deadline.offered, 500)
+    test.assert_eq(deadline.requested, 100)
+    test.assert(str.len(rosqos.compat_advice(deadline)) > 0)
+
+    test.case("liveliness, which is about a stopped control loop")
+    // A process that is running and whose control loop has stopped is
+    // alive under one policy and dead under the other.
+    let liveliness = rosqos.compatible(
+        rosqos.qos(rosqos.ROS_HISTORY_KEEP_LAST, 10, rosqos.ROS_RELIABILITY_RELIABLE,
+                   rosqos.ROS_DURABILITY_VOLATILE, rosqos.ROS_DURATION_INFINITE,
+                   rosqos.ROS_DURATION_INFINITE, rosqos.ROS_LIVELINESS_AUTOMATIC,
+                   rosqos.ROS_DURATION_INFINITE),
+        rosqos.qos(rosqos.ROS_HISTORY_KEEP_LAST, 10, rosqos.ROS_RELIABILITY_RELIABLE,
+                   rosqos.ROS_DURABILITY_VOLATILE, rosqos.ROS_DURATION_INFINITE,
+                   rosqos.ROS_DURATION_INFINITE,
+                   rosqos.ROS_LIVELINESS_MANUAL_BY_TOPIC,
+                   rosqos.ROS_DURATION_INFINITE))
+    test.assert_eq(liveliness.policy, rosqos.ROS_QOS_POLICY_LIVELINESS)
+    test.assert(str.len(rosqos.compat_advice(liveliness)) > 0)
+
+    test.case("the lease, which is the deadline's rule again")
+    let lease = rosqos.compatible(
+        rosqos.qos(rosqos.ROS_HISTORY_KEEP_LAST, 10, rosqos.ROS_RELIABILITY_RELIABLE,
+                   rosqos.ROS_DURABILITY_VOLATILE, rosqos.ROS_DURATION_INFINITE,
+                   rosqos.ROS_DURATION_INFINITE, rosqos.ROS_LIVELINESS_AUTOMATIC, 900),
+        rosqos.qos(rosqos.ROS_HISTORY_KEEP_LAST, 10, rosqos.ROS_RELIABILITY_RELIABLE,
+                   rosqos.ROS_DURABILITY_VOLATILE, rosqos.ROS_DURATION_INFINITE,
+                   rosqos.ROS_DURATION_INFINITE, rosqos.ROS_LIVELINESS_AUTOMATIC, 100))
+    test.assert_eq(lease.policy, rosqos.ROS_QOS_POLICY_LEASE)
+    test.assert(str.len(rosqos.compat_advice(lease)) > 0)
+
+    test.case("and a pair that matches has advice that says so")
+    let good = rosqos.compatible(base, base)
+    test.assert(good.compatible)
+    test.assert_eq(rosqos.compat_advice(good), "the settings match")
+
+@test
+fn test_every_policy_has_a_word() [io]
+    let policies = [0, 1, 2, 3, 4, 5]
+    for i in 0..list.len(policies)
+        test.assert_ne(rosqos.policy_name(policies[i]), "unknown")
+
+    test.case("and a policy this package does not know names nothing")
+    test.assert_eq(rosqos.policy_name(9), "unknown")
+
+    test.case("as does advice about one")
+    // The value is built directly: no pair of profiles produces a
+    // policy outside the five, and a caller that kept one of these
+    // answers has to be answered anyway.
+    let strange = RosQosCompat { compatible: false, policy: 9, offered: 0, requested: 0 }
+    test.assert_eq(rosqos.compat_advice(strange),
+                   "the policy is not one this package knows")
+
+// ── rosexec: the clamps, the refusals and the words ──────────────────
+
+@test
+fn test_an_executor_is_clamped_to_the_ready_set_it_has() [io]
+    test.case("a capacity above the ceiling is the ceiling")
+    // The ready set is one integer with a bit per handle, so a larger
+    // capacity would name handles no ready set could address.
+    test.assert_eq(rosexec.executor(1000).capacity, rosexec.ROS_EXEC_MAX_HANDLES)
+
+    test.case("and one below zero is no handles")
+    test.assert_eq(rosexec.executor(-4).capacity, 0)
+
+@test
+fn test_a_handle_is_refused_from_a_full_executor() [io]
+    test.case("room for one more")
+    test.assert_eq(rosexec.add_handle_ret(rosexec.executor(1)), rosret.ROS_RET_OK)
+
+    test.case("and none")
+    // The code says the number passed to `executor` was smaller than
+    // the number `handles_required` answers.
+    let full = rosexec.add_handle(rosexec.executor(1))
+    test.assert_eq(rosexec.add_handle_ret(full), rosret.ROS_RET_WAIT_SET_FULL)
+
+@test
+fn test_the_two_name_tables_span_their_domains() [io]
+    test.case("the semantics in words")
+    test.assert_eq(rosexec.semantics_name(rosexec.ROS_SEMANTICS_ROS2),
+                   "ros 2 semantics")
+    test.assert_eq(rosexec.semantics_name(9), "unknown")
+
+    test.case("the trigger policies in words")
+    test.assert_eq(rosexec.trigger_name(rosexec.ROS_TRIGGER_ANY), "any")
+    test.assert_eq(rosexec.trigger_name(rosexec.ROS_TRIGGER_ONE), "one")
+    test.assert_eq(rosexec.trigger_name(9), "unknown")
+
+@test
+fn test_a_ready_set_with_no_handles_and_one_at_the_ceiling() [io]
+    test.case("an executor with no handles has no bits")
+    // The mask of no handles is none, and a trigger that dispatches on
+    // anything is satisfied by nothing.
+    test.assert(not rosexec.should_dispatch(rosexec.executor(0), 0x1))
+
+    test.case("and one at the ceiling is all of them")
+    // A shift by the whole width of the integer is not a bit position,
+    // so the mask is spelled -1 at the ceiling.
+    var full = rosexec.executor(rosexec.ROS_EXEC_MAX_HANDLES)
+    for i in 0..rosexec.ROS_EXEC_MAX_HANDLES
+        full = rosexec.add_handle(full)
+    test.assert_eq(full.count, rosexec.ROS_EXEC_MAX_HANDLES)
+    test.assert(rosexec.should_dispatch(full, -1))
+
+    test.case("a bit for a handle no ready set could name")
+    test.assert_eq(rosexec.ready_bit(-1), 0)
+    test.assert_eq(rosexec.ready_bit(rosexec.ROS_EXEC_MAX_HANDLES), 0)
+
+@test
+fn test_a_trigger_that_names_one_handle_walks_only_that_one() [io]
+    // The policy decides which callback the spin is for and the walk
+    // decides nothing, which is what a timer-driven node wants.  The
+    // handles have to be registered for the walk to be over anything.
+    var e = rosexec.executor(3)
+    e = rosexec.add_handle(e)
+    e = rosexec.add_handle(e)
+    e = rosexec.add_handle(e)
+    e = rosexec.set_trigger(e, rosexec.ROS_TRIGGER_ONE, 1)
+    test.assert(rosexec.should_dispatch(e, 0x2))
+    test.assert(not rosexec.should_dispatch(e, 0x1))
+
+    test.case("and the step is that handle and no other")
+    let step = rosexec.spin_step(e, 0x2)
+    test.assert(step.dispatch)
+    test.assert_eq(step.index, 1)
+
+// ── rosexec timers: the input faults and the stopped timer ───────────
+
+@test
+fn test_a_timer_is_left_alone_by_input_that_is_not_time() [io]
+    let running = rosexec.timer(100, rosexec.ROS_TIMER_CATCH_UP)
+
+    test.case("a timer that is not running")
+    let stopped = rosexec.timer_cancel(running)
+    test.assert_eq(rosexec.timer_advance(stopped, 10).elapsed_ms, 0)
+    test.assert_eq(rosexec.timer_owed(stopped), 0)
+    test.assert_eq(rosexec.timer_next_ms(stopped), 0)
+
+    test.case("a period that is not a period")
+    test.assert_eq(rosexec.timer_advance(rosexec.timer(0, rosexec.ROS_TIMER_CATCH_UP),
+                                         10).owed,
+                                         0)
+
+    test.case("and time that did not pass")
+    test.assert_eq(rosexec.timer_advance(running, 0).elapsed_ms, 0)
+
+@test
+fn test_taking_a_firing_a_timer_does_not_owe_changes_nothing() [io]
+    // Otherwise the count goes negative and the next call is due.
+    let fresh = rosexec.timer(100, rosexec.ROS_TIMER_CATCH_UP)
+    test.assert_eq(rosexec.timer_fired(fresh).owed, 0)
+
+@test
+fn test_the_executor_timeout_is_the_whole_wait_without_a_timer() [io]
+    let e = rosexec.set_timeout(rosexec.executor(1), 40)
+
+    test.case("a timer that is not running shortens nothing")
+    test.assert_eq(rosexec.spin_wait_ms(rosexec.set_timeout(e, 40),
+                                        rosexec.timer_cancel(
+                                            rosexec.timer(100, rosexec.ROS_TIMER_CATCH_UP))),
+                   40)
+
+    test.case("and a timer due later than the timeout does not shorten it")
+    // Waiting past a timer is what makes it late; waiting less than the
+    // executor's own timeout is the other mistake.
+    let later = rosexec.timer_advance(rosexec.timer(100, rosexec.ROS_TIMER_SKIP_MISSED), 50)
+    test.assert_eq(rosexec.spin_wait_ms(rosexec.set_timeout(e, 10), later), 10)
+
+    test.case("a period that is not a period asks for no wait")
+    // `timer_advance` names a non-positive period as an input fault and
+    // leaves the timer alone, so its elapsed time never reaches the
+    // period it was built with, and the wait it asks for is none.
+    let broken = rosexec.timer(-100, rosexec.ROS_TIMER_CATCH_UP)
+    test.assert_eq(rosexec.timer_next_ms(broken), 0)
+    test.assert_eq(rosexec.spin_wait_ms(rosexec.set_timeout(e, 40), broken), 0)
+
+// ── rosmsg: the header, and a buffer with no room for one ────────────
+
+@test
+fn test_a_buffer_with_no_room_for_a_header_has_none() [io]
+    // Nothing was a header, so nothing is dropped from the payload and
+    // the encapsulation is not a value this package knows.
+    let m = rosmsg.decode_envelope(bytes.zeros(2), 1234)
+    test.assert_eq(m.encapsulation, -1)
+    test.assert_eq(bytes.len(m.payload), 2)
+    test.assert(not rosmsg.envelope_is_known(m.encapsulation))
+
+@test
+fn test_every_encapsulation_has_a_word() [io]
+    let known = [rosmsg.ROS_CDR_BE, rosmsg.ROS_CDR_LE, rosmsg.ROS_PL_CDR_BE,
+                 rosmsg.ROS_PL_CDR_LE]
+    for i in 0..list.len(known)
+        test.assert_ne(rosmsg.encapsulation_name(known[i]), "unknown")
+
+    test.case("and a number that is not one of the four names nothing")
+    test.assert_eq(rosmsg.encapsulation_name(9), "unknown")
+
+// ── rostransport: the words, and the pipes a session can be handed ───
+
+// A pipe that answers recorded bytes, so the session functions that
+// take a transport can be driven at no effect at all.
+//
+// The same shape `rostransport_tests.nv` uses; this file needs its own
+// because a suite is one file and the six beside this one are the
+// oracle and are not edited.
+struct RosEdgePipe
+    canned: Bytes
+    answers: Bool
+    sent_ok: Bool
+    open: Bool
+
+impl RosTransport[] for RosEdgePipe
+    fn ros_send(self, frame: Bytes) -> Bool
+        self.sent_ok
+
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes
+        if self.answers
+            return Some(bytes.clone(self.canned))
+        return None
+
+    fn ros_is_open(self) -> Bool
+        self.open
+
+    fn ros_close(self)
+        ()
+
+    fn ros_mtu(self) -> Int
+        512
+
+// A pipe that answers one message.
+fn an_answering_pipe() -> RosEdgePipe
+    RosEdgePipe { canned: bytes.zeros(4), answers: true, sent_ok: true, open: true }
+
+// A pipe that sends and never answers.
+fn a_mute_pipe() -> RosEdgePipe
+    RosEdgePipe { canned: bytes.zeros(0), answers: false, sent_ok: true, open: true }
+
+// A pipe that refuses to send.
+fn a_refusing_pipe() -> RosEdgePipe
+    RosEdgePipe { canned: bytes.zeros(0), answers: false, sent_ok: false, open: false }
+
+@test
+fn test_every_stream_kind_and_session_state_has_a_word() [io]
+    let kinds = [rostransport.ROS_STREAM_NONE, rostransport.ROS_STREAM_BEST_EFFORT,
+                 rostransport.ROS_STREAM_RELIABLE]
+    for i in 0..list.len(kinds)
+        test.assert_ne(rostransport.stream_name(kinds[i]), "unknown")
+    test.assert_eq(rostransport.stream_name(9), "unknown")
+
+    test.case("and the four states a session moves through")
+    let states = [rostransport.ROS_SESSION_CLOSED, rostransport.ROS_SESSION_OPENING,
+                  rostransport.ROS_SESSION_ESTABLISHED, rostransport.ROS_SESSION_LOST]
+    for j in 0..list.len(states)
+        test.assert_ne(rostransport.session_state_name(states[j]), "unknown")
+    test.assert_eq(rostransport.session_state_name(9), "unknown")
+
+@test
+fn test_opening_a_session_is_one_exchange() [io]
+    let s = rostransport.session(0xaabbccdd, 512)
+
+    test.case("a pipe that sends and never answers leaves it closed")
+    // One exchange and not a retry loop: a node that cannot reach its
+    // agent decides for itself what to do about it.
+    let silent = rostransport.open_session(a_mute_pipe(), s, 100)
+    test.assert_eq(silent.state, rostransport.ROS_SESSION_CLOSED)
+
+    test.case("and one that answers establishes it")
+    let answered = rostransport.open_session(an_answering_pipe(), s, 100)
+    test.assert_eq(answered.state, rostransport.ROS_SESSION_ESTABLISHED)
+    test.assert(rostransport.session_is_ready(answered))
+
+@test
+fn test_a_message_the_pipe_took_answers_that_it_went() [io]
+    let s = rostransport.session_established(rostransport.session(1, 512), 1)
+    let small = rosmsg.message(bytes.zeros(8), 1234)
+
+    test.case("the pipe took every byte")
+    test.assert_eq(rostransport.send_message(an_answering_pipe(), s, small,
+                                             rostransport.ROS_STREAM_BEST_EFFORT),
+                   rosret.ROS_RET_OK)
+
+    test.case("and one that refused answers that the agent is unreachable")
+    test.assert_eq(rostransport.send_message(a_refusing_pipe(), s, small,
+                                             rostransport.ROS_STREAM_BEST_EFFORT),
+                   rosret.ROS_RET_AGENT_UNREACHABLE)
+
+@test
+fn test_the_heartbeat_leaves_a_session_the_pipe_could_not_carry() [io]
+    let up = rostransport.session_established(rostransport.session(1, 512), 1)
+
+    test.case("a session that is not established")
+    test.assert_eq(rostransport.heartbeat(a_refusing_pipe(), rostransport.session(1, 512),
+                                          10).state,
+                   rostransport.ROS_SESSION_CLOSED)
+
+    test.case("an agent silent past the timeout is gone")
+    // No heartbeat this client sends changes that.
+    test.assert_eq(rostransport.heartbeat(a_refusing_pipe(), up, 1500).state,
+                   rostransport.ROS_SESSION_LOST)
+
+    test.case("and a silence shorter than the interval is not a heartbeat due")
+    test.assert_eq(rostransport.heartbeat(a_refusing_pipe(), up, 50).silent_ms, 50)
+
+    test.case("a pipe that refused the heartbeat leaves the silence standing")
+    test.assert_eq(rostransport.heartbeat(a_refusing_pipe(), up, 200).silent_ms, 200)
+
+    test.case("and one that answers nothing leaves it standing too")
+    test.assert_eq(rostransport.heartbeat(a_mute_pipe(), up, 200).silent_ms, 200)
+
+// ── rosparam: the fallbacks, the words and the comparison ────────────
+
+@test
+fn test_a_value_read_as_the_wrong_type_answers_the_fallback() [io]
+    // A caller reading a parameter almost always has a default for it,
+    // and a value of another type is not that type.
+    test.assert(rosparam.as_bool(rosparam.int_param(1), true))
+    test.assert_eq(rosparam.as_int(rosparam.bool_param(true), 5), 5)
+    test.assert(rosparam.as_int(rosparam.int_param(7), 5) == 7)
+    test.assert(rosparam.as_double(rosparam.int_param(1), 2.5) == 2.5)
+    test.assert(rosparam.as_double(rosparam.double_param(2.5), 0.0) == 2.5)
+
+@test
+fn test_every_parameter_type_has_a_word() [io]
+    let kinds = [rosparam.ROS_PARAM_NOT_SET, rosparam.ROS_PARAM_BOOL,
+                 rosparam.ROS_PARAM_INTEGER, rosparam.ROS_PARAM_DOUBLE,
+                 rosparam.ROS_PARAM_STRING, rosparam.ROS_PARAM_BYTE_ARRAY,
+                 rosparam.ROS_PARAM_BOOL_ARRAY, rosparam.ROS_PARAM_INTEGER_ARRAY,
+                 rosparam.ROS_PARAM_DOUBLE_ARRAY, rosparam.ROS_PARAM_STRING_ARRAY]
+    for i in 0..list.len(kinds)
+        test.assert_ne(rosparam.kind_name(kinds[i]), "unknown")
+
+    test.case("and a number that is not one of the ten names nothing")
+    test.assert_eq(rosparam.kind_name(99), "unknown")
+
+@test
+fn test_two_values_are_the_same_only_within_one_type() [io]
+    test.case("two booleans")
+    test.assert(rosparam.same_value(rosparam.bool_param(true), rosparam.bool_param(true)))
+    test.assert(not rosparam.same_value(rosparam.bool_param(true),
+                                        rosparam.bool_param(false)))
+
+    test.case("two doubles")
+    test.assert(rosparam.same_value(rosparam.double_param(1.5),
+                                    rosparam.double_param(1.5)))
+    test.assert(not rosparam.same_value(rosparam.double_param(1.5),
+                                        rosparam.double_param(2.5)))
+
+    test.case("two unset values")
+    test.assert(rosparam.same_value(rosparam.unset(), rosparam.unset()))
+
+// ── rosagent: the TCP link, over a loopback socket ───────────────────
+
+// A listener, a connection to it, and the link over that connection.
+//
+// A link holds a socket, so building one needs `[net]` and nothing in
+// the six suites beside this one can do it.  The port is asked of the
+// kernel rather than chosen, so two runs of this file cannot collide.
+@test
+fn test_the_tcp_link_frames_and_reassembles_a_message() [io, net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.fail("no loopback listener, so the link cannot be tested")
+        Some(server) =>
+            let port = net.local_port(server)
+            test.assert(port > 0)
+            match net.connect("127.0.0.1", port)
+                None       => test.fail("a listener that would not accept a connection")
+                Some(sock) =>
+                    match net.accept(server)
+                        None       => test.fail("a connection that was not accepted")
+                        Some(pair) =>
+                            let (peer, _) = pair
+                            let l = rosagent.link_over(sock, rosagent.ROS_AGENT_MTU)
+
+                            test.case("the link answers its size and that it is open")
+                            test.assert_eq(l.ros_mtu(), rosagent.ROS_AGENT_MTU)
+                            test.assert(l.ros_is_open())
+
+                            test.case("a message goes out with its length in front")
+                            // The prefix is the stream transport's own
+                            // framing and is not part of the message.
+                            let frame = bytes.zeros(5)
+                            test.assert(l.ros_send(frame))
+                            match net.recv_bytes(peer, 64)
+                                None      => test.assert(false)
+                                Some(got) =>
+                                    test.assert_eq(bytes.len(got), 7)
+                                    test.assert_eq(rosagent.length_of_prefix(got), 5)
+
+                            test.case("and one arrives whole or not at all")
+                            test.assert(net.send_bytes(
+                                peer, rosagent.length_prefix(4) + bytes.zeros(4)))
+                            match l.ros_recv(1000)
+                                None       => test.assert(false)
+                                Some(back) => test.assert_eq(bytes.len(back), 4)
+
+                            test.case("a link with nothing behind it answers nothing")
+                            // A timeout is the caller's, and a pipe with
+                            // no message is the ordinary case.
+                            match l.ros_recv(20)
+                                None    => test.assert(true)
+                                Some(_) => test.assert(false)
+
+                            test.case("closing it twice is harmless")
+                            l.ros_close()
+                            rosagent.disconnect(l)
+
+@test
+fn test_a_message_larger_than_the_link_carries_is_not_sent() [io, net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.fail("no loopback listener, so a link cannot be built")
+        Some(server) =>
+            match net.connect("127.0.0.1", net.local_port(server))
+                None       => test.fail("a listener that would not accept a connection")
+                Some(sock) =>
+                    // A link built for a smaller message than the one it
+                    // is handed, which is what a `connect_with_mtu` on a
+                    // board with less memory produces.
+                    let narrow = rosagent.link_over(sock, 4)
+
+                    test.case("a message that fits goes")
+                    test.assert(narrow.ros_send(bytes.zeros(4)))
+
+                    test.case("and one that does not is refused rather than truncated")
+                    // Truncating it would hand the agent a length that
+                    // disagrees with what follows it.
+                    test.assert(not narrow.ros_send(bytes.zeros(5)))
+
+                    rosagent.disconnect(narrow)
+
+// The two ways into a connection, one of which the agent is not at.
+@test
+fn test_connecting_and_finding_nobody_there() [io, net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.fail("no loopback listener, so an agent cannot be stood in for")
+        Some(server) =>
+            let port = net.local_port(server)
+
+            test.case("a connection the agent answers is a link")
+            match rosagent.connect("127.0.0.1", port)
+                None         => test.assert(false)
+                Some(linked) =>
+                    test.assert(linked.ros_is_open())
+                    test.assert_eq(linked.ros_mtu(), rosagent.ROS_AGENT_MTU)
+                    rosagent.disconnect(linked)
+
+            test.case("and one built for a smaller message keeps that size")
+            match rosagent.connect_with_mtu("127.0.0.1", port, 64)
+                None        => test.assert(false)
+                Some(small) => test.assert_eq(small.ros_mtu(), 64)
+
+            test.case("a port with nothing behind it answers nothing")
+            // The listener is given back first, so this asks about a
+            // port that was in use a moment ago rather than about a
+            // fixed one that may or may not be taken.
+            net.close(server)
+            match rosagent.connect("127.0.0.1", port)
+                None    => test.assert(true)
+                Some(_) => test.assert(false)
+
+// The reassembly a caller driving the link by hand does itself.
+//
+// A partial read cannot be kept by `ros_recv`, which may not write the
+// link's buffer, so the buffer is fed and taken from here.  Bytes two
+// at a time is what a TCP `recv` actually returns.
+@test
+fn test_a_buffered_link_holds_only_whole_messages() [io, net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.fail("no loopback listener, so a link cannot be built")
+        Some(server) =>
+            match net.connect("127.0.0.1", net.local_port(server))
+                None       => test.fail("a listener that would not accept a connection")
+                Some(sock) =>
+                    let l = rosagent.link_over(sock, rosagent.ROS_AGENT_MTU)
+
+                    test.case("an empty link holds no message")
+                    test.assert_eq(rosagent.pending_bytes(l), 0)
+                    test.assert(not rosagent.has_whole_frame(l))
+
+                    test.case("and neither do two bytes of a length")
+                    let half = rosagent.feed(l, rosagent.length_prefix(8))
+                    test.assert_eq(rosagent.pending_bytes(half), 2)
+                    test.assert(not rosagent.has_whole_frame(half))
+
+                    test.case("the eight that follow make one")
+                    let whole = rosagent.feed(half, bytes.zeros(8))
+                    test.assert(rosagent.has_whole_frame(whole))
+
+                    test.case("taking it shortens the link by the whole frame")
+                    let (rest, frame) = rosagent.take_frame(whole)
+                    test.assert_eq(bytes.len(frame), 8)
+                    test.assert_eq(rosagent.pending_bytes(rest), 0)
+
+                    test.case("and taking one that is not there answers nothing")
+                    let (same, none) = rosagent.take_frame(half)
+                    test.assert_eq(bytes.len(none), 0)
+                    test.assert_eq(rosagent.pending_bytes(same), 2)
+
+                    net.close(sock)
+
+// A link whose socket was never opened.
+//
+// No constructor here produces one, and both of the guards that read
+// the field exist for it, so the value is built directly.
+@test
+fn test_a_link_that_was_never_opened_refuses_both_ways() [io, net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.fail("no loopback listener, so a socket cannot be had")
+        Some(server) =>
+            match net.connect("127.0.0.1", net.local_port(server))
+                None       => test.fail("a listener that would not accept a connection")
+                Some(sock) =>
+                    let shut = RosAgentLink {
+                        sock: sock,
+                        pending: bytes.zeros(0),
+                        mtu: rosagent.ROS_AGENT_MTU,
+                        open: false }
+
+                    test.case("nothing goes out")
+                    test.assert(not shut.ros_send(bytes.zeros(4)))
+
+                    test.case("and nothing comes in")
+                    match shut.ros_recv(0)
+                        None    => test.assert(true)
+                        Some(_) => test.assert(false)
+
+                    net.close(sock)

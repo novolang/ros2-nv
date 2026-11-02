@@ -1,8 +1,6 @@
 // rostransport_tests.nv — the session, the stream kinds, and the whole
 // package driven over a byte pipe that touches nothing.
 //
-// RED ON PURPOSE: the first `todo()` each test reaches ends it.
-//
 // `RosTapeLink` SATISFIES `RosTransport[]` — the empty supply, which is
 // how an implementation asserts it is pure (SPEC § 5.6) — so every
 // session function is called here at NO EFFECT AT ALL.  That is the
@@ -14,8 +12,7 @@
 //
 // THE AGENT MODULE IS NAMED THROUGH A FUNCTION THAT IS NEVER REACHED.
 // `over_a_real_agent` names `connect`, `disconnect` and the rest with
-// their `[net]` row; it is guarded by a host nothing listens on, and
-// the first `todo()` ends the test before it.
+// their `[net]` row; it is guarded by a host nothing listens on.
 
 use std.bytes
 use std.test

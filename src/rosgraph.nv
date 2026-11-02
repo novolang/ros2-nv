@@ -1,8 +1,6 @@
 // rosgraph.nv — how many of each thing a node may have, counted
 // against a table that was fixed before the program started.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT and `@tier(embedded)` on all of it.  Everything here
 // is a count.
 //
@@ -27,6 +25,9 @@
 // holds a name or a handle: those live wherever the program keeps them.
 // What this module owns is the arithmetic that says whether the next
 // entity fits.
+
+use rosqos
+use rosret
 
 // ── The kinds of entity ──────────────────────────────────────────────
 
@@ -87,13 +88,35 @@ struct RosGraph
 // ```
 pub @tier(embedded)
 fn default_pool() -> RosGraph []
-    todo("ros2-nv.rosgraph.default_pool")
+    RosGraph {
+        max_nodes: 1,
+        max_publishers: 1,
+        max_subscriptions: 1,
+        max_services: 1,
+        max_clients: 1,
+        max_history: 4,
+        nodes: 0,
+        publishers: 0,
+        subscriptions: 0,
+        services: 0,
+        clients: 0 }
 
 // A pool from the maxima a firmware was built with.
 pub @tier(embedded)
 fn pool(max_nodes: Int, max_publishers: Int, max_subscriptions: Int, max_services: Int,
         max_clients: Int, max_history: Int) -> RosGraph []
-    todo("ros2-nv.rosgraph.pool")
+    RosGraph {
+        max_nodes: max_nodes,
+        max_publishers: max_publishers,
+        max_subscriptions: max_subscriptions,
+        max_services: max_services,
+        max_clients: max_clients,
+        max_history: max_history,
+        nodes: 0,
+        publishers: 0,
+        subscriptions: 0,
+        services: 0,
+        clients: 0 }
 
 // The maximum for one kind of entity, or -1 for a kind the middleware
 // does not pool.
@@ -102,17 +125,38 @@ fn pool(max_nodes: Int, max_publishers: Int, max_subscriptions: Int, max_service
 // and not a middleware entity, and `rosexec` is where they are counted.
 pub @tier(embedded)
 fn capacity_of(g: RosGraph, kind: Int) -> Int []
-    todo("ros2-nv.rosgraph.capacity_of")
+    // A kind the firmware does not pool has no maximum, and -1 says so.
+    match kind
+        ROS_ENTITY_NODE         => g.max_nodes
+        ROS_ENTITY_PUBLISHER    => g.max_publishers
+        ROS_ENTITY_SUBSCRIPTION => g.max_subscriptions
+        ROS_ENTITY_SERVICE      => g.max_services
+        ROS_ENTITY_CLIENT       => g.max_clients
+        // A timer and a guard condition cost an executor handle and not
+        // a middleware entity, and `rosexec` is where they are counted.
+        _                       => -1
 
 // How many of one kind have been created.
 pub @tier(embedded)
 fn used_of(g: RosGraph, kind: Int) -> Int []
-    todo("ros2-nv.rosgraph.used_of")
+    // The same five kinds `capacity_of` answers a maximum for.  A kind
+    // the pool does not hold has nothing created either, which is the
+    // same -1.
+    match kind
+        ROS_ENTITY_NODE         => g.nodes
+        ROS_ENTITY_PUBLISHER    => g.publishers
+        ROS_ENTITY_SUBSCRIPTION => g.subscriptions
+        ROS_ENTITY_SERVICE      => g.services
+        ROS_ENTITY_CLIENT       => g.clients
+        _                       => -1
 
 // How many more of one kind will fit.
 pub @tier(embedded)
 fn remaining(g: RosGraph, kind: Int) -> Int []
-    todo("ros2-nv.rosgraph.remaining")
+    // A kind the middleware does not pool answers -1 for both its
+    // maximum and its count, and the subtraction leaves the 0 that says
+    // no more will fit.
+    capacity_of(g, kind) - used_of(g, kind)
 
 // Whether one more of this kind fits.
 //
@@ -120,7 +164,46 @@ fn remaining(g: RosGraph, kind: Int) -> Int []
 // afterwards is a return code on a device with no console.
 pub @tier(embedded)
 fn can_add(g: RosGraph, kind: Int) -> Bool []
-    todo("ros2-nv.rosgraph.can_add")
+    remaining(g, kind) > 0
+
+// The pool with one kind's count moved by `delta`.
+//
+// `add` and `remove` are the only callers, and this is the one place
+// that spells the eleven fields out.  A `@value` struct is replaced
+// whole, so the count that moves is named beside the four that do not.
+// It carries the tier because an unannotated function is `app`, and an
+// embedded caller cannot reach one above it.
+@tier(embedded)
+fn counts_moved(g: RosGraph, kind: Int, delta: Int) -> RosGraph
+    var nodes = g.nodes
+    var publishers = g.publishers
+    var subscriptions = g.subscriptions
+    var services = g.services
+    var clients = g.clients
+    if kind == ROS_ENTITY_NODE
+        nodes = nodes + delta
+    elif kind == ROS_ENTITY_PUBLISHER
+        publishers = publishers + delta
+    elif kind == ROS_ENTITY_SUBSCRIPTION
+        subscriptions = subscriptions + delta
+    elif kind == ROS_ENTITY_SERVICE
+        services = services + delta
+    elif kind == ROS_ENTITY_CLIENT
+        clients = clients + delta
+    // A timer, a guard condition and a kind this package does not know
+    // are not counted by this pool at all, and move nothing.
+    RosGraph {
+        max_nodes: g.max_nodes,
+        max_publishers: g.max_publishers,
+        max_subscriptions: g.max_subscriptions,
+        max_services: g.max_services,
+        max_clients: g.max_clients,
+        max_history: g.max_history,
+        nodes: nodes,
+        publishers: publishers,
+        subscriptions: subscriptions,
+        services: services,
+        clients: clients }
 
 // The pool with one more of this kind taken.
 //
@@ -129,7 +212,9 @@ fn can_add(g: RosGraph, kind: Int) -> Bool []
 // the middleware does not have.
 pub @tier(embedded)
 fn add(g: RosGraph, kind: Int) -> RosGraph []
-    todo("ros2-nv.rosgraph.add")
+    if not can_add(g, kind)
+        return g
+    counts_moved(g, kind, 1)
 
 // The return code adding one of this kind would produce.
 //
@@ -138,12 +223,19 @@ fn add(g: RosGraph, kind: Int) -> RosGraph []
 // when it means "this firmware was built for one".
 pub @tier(embedded)
 fn add_ret(g: RosGraph, kind: Int) -> Int []
-    todo("ros2-nv.rosgraph.add_ret")
+    if can_add(g, kind)
+        return rosret.ROS_RET_OK
+    rosret.ROS_RET_BAD_ALLOC
 
 // The pool with one of this kind given back.
 pub @tier(embedded)
 fn remove(g: RosGraph, kind: Int) -> RosGraph []
-    todo("ros2-nv.rosgraph.remove")
+    // A release of something the pool never held must not make room for
+    // another one: the count would go negative and `remaining` would
+    // then report more room than the firmware was built with.
+    if used_of(g, kind) <= 0
+        return g
+    counts_moved(g, kind, -1)
 
 // Whether a pool can hold everything a program intends to create.
 //
@@ -153,18 +245,44 @@ fn remove(g: RosGraph, kind: Int) -> RosGraph []
 pub @tier(embedded)
 fn pool_admits(g: RosGraph, publishers: Int, subscriptions: Int, services: Int,
                clients: Int) -> Bool []
-    todo("ros2-nv.rosgraph.pool_admits")
+    // Against the room left in the pool as it stands, so a program that
+    // has already created three publishers asks whether three more fit.
+    // The nodes are not asked about: a micro-ROS node creates its one
+    // node before it has anything to compare, and the four counts are
+    // the ones that run out.
+    publishers <= remaining(g, ROS_ENTITY_PUBLISHER)
+        and subscriptions <= remaining(g, ROS_ENTITY_SUBSCRIPTION)
+        and services <= remaining(g, ROS_ENTITY_SERVICE)
+        and clients <= remaining(g, ROS_ENTITY_CLIENT)
 
 // The first kind of entity a program would run out of, or -1.
 pub @tier(embedded)
 fn first_shortfall(g: RosGraph, publishers: Int, subscriptions: Int, services: Int,
                    clients: Int) -> Int []
-    todo("ros2-nv.rosgraph.first_shortfall")
+    // In the order the four counts were given, because a program that
+    // would run out of two of them can only fix one first.
+    if publishers > remaining(g, ROS_ENTITY_PUBLISHER)
+        return ROS_ENTITY_PUBLISHER
+    if subscriptions > remaining(g, ROS_ENTITY_SUBSCRIPTION)
+        return ROS_ENTITY_SUBSCRIPTION
+    if services > remaining(g, ROS_ENTITY_SERVICE)
+        return ROS_ENTITY_SERVICE
+    if clients > remaining(g, ROS_ENTITY_CLIENT)
+        return ROS_ENTITY_CLIENT
+    -1
 
 // The kind in words.
 pub @tier(embedded)
 fn entity_name(kind: Int) -> Str []
-    todo("ros2-nv.rosgraph.entity_name")
+    match kind
+        ROS_ENTITY_NODE         => "node"
+        ROS_ENTITY_PUBLISHER    => "publisher"
+        ROS_ENTITY_SUBSCRIPTION => "subscription"
+        ROS_ENTITY_SERVICE      => "service"
+        ROS_ENTITY_CLIENT       => "client"
+        ROS_ENTITY_TIMER        => "timer"
+        ROS_ENTITY_GUARD        => "guard condition"
+        _                       => "unknown"
 
 // ── An endpoint ──────────────────────────────────────────────────────
 
@@ -191,12 +309,26 @@ struct RosEndpoint
 // An endpoint.
 pub @tier(embedded)
 fn endpoint(kind: Int, index: Int, type_id: Int, q: RosQos) -> RosEndpoint []
-    todo("ros2-nv.rosgraph.endpoint")
+    RosEndpoint {
+        kind: kind,
+        index: index,
+        type_id: type_id,
+        qos: q,
+        valid: true }
 
 // An endpoint that was not created.
 pub @tier(embedded)
 fn no_endpoint(kind: Int) -> RosEndpoint []
-    todo("ros2-nv.rosgraph.no_endpoint")
+    // The index and the type are -1 because there is no position and no
+    // type to name, and the settings are the middleware's own defaults
+    // because nothing was chosen: what matters is `valid`, which is the
+    // first thing `can_connect` asks.
+    RosEndpoint {
+        kind: kind,
+        index: -1,
+        type_id: -1,
+        qos: rosqos.system_default_profile(),
+        valid: false }
 
 // Whether two endpoints will connect, as a return code.
 //
@@ -228,7 +360,20 @@ fn no_endpoint(kind: Int) -> RosEndpoint []
 // ```
 pub @tier(embedded)
 fn can_connect(publisher: RosEndpoint, subscription: RosEndpoint) -> Int []
-    todo("ros2-nv.rosgraph.can_connect")
+    // The argument is asked about first, then the types, then the
+    // settings: each answer is more specific than the one before, and a
+    // caller that fixes the first can ask again.
+    if not publisher.valid or not subscription.valid
+        return rosret.ROS_RET_INVALID_ARGUMENT
+    if publisher.kind != ROS_ENTITY_PUBLISHER
+        return rosret.ROS_RET_INVALID_ARGUMENT
+    if subscription.kind != ROS_ENTITY_SUBSCRIPTION
+        return rosret.ROS_RET_INVALID_ARGUMENT
+    if not same_type(publisher, subscription)
+        return rosret.ROS_RET_ERROR
+    if not rosqos.compatible(publisher.qos, subscription.qos).compatible
+        return rosret.ROS_RET_QOS_INCOMPATIBLE
+    rosret.ROS_RET_OK
 
 // Which quality-of-service policy stopped two endpoints, in full.
 //
@@ -237,12 +382,16 @@ fn can_connect(publisher: RosEndpoint, subscription: RosEndpoint) -> Int []
 // why `can_connect` is the question and this is the follow-up.
 pub @tier(embedded)
 fn connect_qos(publisher: RosEndpoint, subscription: RosEndpoint) -> RosQosCompat []
-    todo("ros2-nv.rosgraph.connect_qos")
+    // The whole detail, whatever `can_connect` answered: a pair that
+    // differs for some other reason is still compatible here.
+    rosqos.compatible(publisher.qos, subscription.qos)
 
 // Whether two endpoints carry the same message type.
 pub @tier(embedded)
 fn same_type(a: RosEndpoint, b: RosEndpoint) -> Bool []
-    todo("ros2-nv.rosgraph.same_type")
+    // The type identity and nothing else: whether either endpoint was
+    // created is a question `can_connect` asks before this one.
+    a.type_id == b.type_id
 
 // How many messages an endpoint's settings will actually be given.
 //
@@ -252,10 +401,14 @@ fn same_type(a: RosEndpoint, b: RosEndpoint) -> Bool []
 // program that sized its buffer from its own profile is wrong by two.
 pub @tier(embedded)
 fn effective_depth(g: RosGraph, e: RosEndpoint) -> Int []
-    todo("ros2-nv.rosgraph.effective_depth")
+    // The firmware's limit is the one the profile cannot raise, so the
+    // smaller of the two is what the endpoint is really given.
+    if e.qos.depth < g.max_history
+        return e.qos.depth
+    g.max_history
 
 // Whether the pool will give this endpoint the depth its settings asked
 // for.
 pub @tier(embedded)
 fn depth_is_honoured(g: RosGraph, e: RosEndpoint) -> Bool []
-    todo("ros2-nv.rosgraph.depth_is_honoured")
+    effective_depth(g, e) == e.qos.depth

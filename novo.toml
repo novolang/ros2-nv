@@ -1,15 +1,10 @@
 [package]
 name        = "ros2-nv"
-version     = "0.0.3"
-description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `core`, with one host module named below, and the plan's row for this
 # package says `host`.
@@ -42,7 +37,7 @@ tags        = ["ros2", "ros", "rclc", "micro-ros", "robotics", "xrce-dds",
                "dds", "qos", "embedded", "no-alloc"]
 repository  = "https://github.com/novolang/ros2-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

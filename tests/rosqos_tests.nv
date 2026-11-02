@@ -1,8 +1,6 @@
 // rosqos_tests.nv — the pair that never connects, and the five
 // policies that decide it.
 //
-// RED ON PURPOSE: the first `todo()` each test reaches ends it.
-//
 // THE ASSERTIONS ARE THE RxO RULES.  A publisher offers and a
 // subscription requests, and a match needs the offer to be at least as
 // strong as the request.  Every case below is one a real ROS 2 system

@@ -297,11 +297,11 @@ fn score() -> Int
 @tier(rt)
 fn main() [hw]
     bsp.board.init()
-    // 81 is the number of checks in `score`.  The count is printed on a
+    // 95 is the number of checks in `score`.  The count is printed on a
     // failure rather than only compared, so a device that disagrees with
     // the host says HOW MANY it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 81
+    if n == 95
         hal.uart.write("PASS: ros2-embedded\n")
     else
         hal.uart.write("FAIL: ros2-embedded score=")

@@ -1,8 +1,6 @@
 // rosname.nv — the rules a name has to obey, checked before anything
 // is created with it.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  Nothing here performs anything.
 //
 // NOT CLAIMED FOR A DEVICE, and the reason is the strings.  Expanding a
@@ -26,6 +24,9 @@
 // request to `rq/` and a reply to `rr/`.  That is why a DDS monitoring
 // tool shows names nobody wrote, and why the length limit bites three
 // characters earlier than the number suggests.
+
+use rosgraph
+use rosret
 
 // ── What is wrong with a name ────────────────────────────────────────
 
@@ -77,6 +78,123 @@ pub const ROS_DDS_REPLY_PREFIX = "rr/"
 
 // ── Checking ─────────────────────────────────────────────────────────
 
+// Whether `i` begins a token of a name: the first byte unless that byte
+// is the private marker, or the byte after a forward slash.  The rules
+// about what a token may start with are written against this.
+@tier(system)
+fn is_token_head(s: Str, i: Int) -> Bool
+    if i == 0
+        return str.byte_at_or(s, 0, 0) != '~'
+    return str.byte_at_or(s, i - 1, 0) == '/'
+
+// Whether a byte is one a name may hold: a letter, a digit, an
+// underscore, a forward slash, a tilde or a substitution brace.
+// Anything else is a byte the middleware will not carry.
+@tier(system)
+fn is_name_byte(b: Int) -> Bool
+    b >= 'a' and b <= 'z'
+        or b >= 'A' and b <= 'Z'
+        or b >= '0' and b <= '9'
+        or b == '_' or b == '/' or b == '~' or b == '{' or b == '}'
+
+// Whether a byte is a decimal digit.  Two of the rules below ask it,
+// and this is the one place the range is written.
+@tier(system)
+fn is_digit_byte(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// Whether any byte of the name is outside the set a name may hold.
+@tier(system)
+fn has_bad_character(s: Str) -> Bool
+    var i = 0
+    while true
+        if i >= str.len(s)
+            return false
+        if not is_name_byte(str.byte_at_or(s, i, 0))
+            return true
+        i = i + 1
+
+// Whether any token of the name starts with a digit.  `/2fast` is
+// refused and `/fast2` is not, which is why this asks about the byte
+// that begins a token rather than about the name.
+@tier(system)
+fn starts_token_with_digit(s: Str) -> Bool
+    var i = 0
+    while true
+        if i >= str.len(s)
+            return false
+        if is_token_head(s, i) and is_digit_byte(str.byte_at_or(s, i, 0))
+            return true
+        i = i + 1
+
+// Whether two forward slashes appear in a row.
+@tier(system)
+fn has_repeated_slash(s: Str) -> Bool
+    var i = 1
+    while true
+        if i >= str.len(s)
+            return false
+        if str.byte_at_or(s, i, 0) == '/' and str.byte_at_or(s, i - 1, 0) == '/'
+            return true
+        i = i + 1
+
+// Whether the name's last byte is `want`.  An empty name ends with
+// nothing.
+@tier(system)
+fn ends_with_byte(s: Str, want: Int) -> Bool
+    let n = str.len(s)
+    if n == 0
+        // cov: skip — both callers refuse an empty name before this
+        return false
+    return str.byte_at_or(s, n - 1, 0) == want
+
+// Whether a tilde appears anywhere but the first byte.  A tilde means
+// this node's own namespace, and it has that meaning only at the start
+// of a name.
+@tier(system)
+fn tilde_not_at_start(s: Str) -> Bool
+    var i = 1
+    while true
+        if i >= str.len(s)
+            return false
+        if str.byte_at_or(s, i, 0) == '~'
+            return true
+        i = i + 1
+
+// Whether `name` is one of the two substitutions ROS 2 defines.
+@tier(system)
+fn substitution_is_known(name: Str) -> Bool
+    name == "node" or name == "ns"
+
+// The two brace rules as one scan: `ROS_NAME_UNBALANCED_BRACES` for a
+// brace with no partner or a brace inside a brace, and
+// `ROS_NAME_UNKNOWN_SUBSTITUTION` for a balanced pair holding something
+// with no definition.
+@tier(system)
+fn brace_error(s: Str) -> Int
+    system
+        var i = 0
+        var open_at = 0
+        var depth = 0
+        while true
+            if i >= str.len(s)
+                if depth != 0
+                    return ROS_NAME_UNBALANCED_BRACES
+                return ROS_NAME_OK
+            let b = str.byte_at_or(s, i, 0)
+            if b == '{'
+                if depth != 0
+                    return ROS_NAME_UNBALANCED_BRACES
+                depth = 1
+                open_at = i + 1
+            if b == '}'
+                if depth == 0
+                    return ROS_NAME_UNBALANCED_BRACES
+                if not substitution_is_known(str.slice(s, open_at, i))
+                    return ROS_NAME_UNKNOWN_SUBSTITUTION
+                depth = 0
+            i = i + 1
+
 // What is wrong with a node's name, or `ROS_NAME_OK`.
 //
 // A node name is one token: letters, digits and underscores, not
@@ -89,15 +207,50 @@ pub const ROS_DDS_REPLY_PREFIX = "rr/"
 //     println("${rosname.check_node_name("temperature_sensor")}")   // 0
 //     println("${rosname.check_node_name("/sensors/temp")}")        // 10
 // ```
-pub fn check_node_name(name: Str) -> Int []
-    todo("ros2-nv.rosname.check_node_name")
+pub @tier(system)
+fn check_node_name(name: Str) -> Int []
+    if str.len(name) == 0
+        return ROS_NAME_EMPTY
+    // A node has a name and a namespace, and the slash belongs to the
+    // namespace: `/sensors/temp` is the two of them run together.
+    if str.contains(name, "/")
+        return ROS_NAME_NODE_HAS_SLASH
+    if has_bad_character(name)
+        return ROS_NAME_BAD_CHARACTER
+    if starts_token_with_digit(name)
+        return ROS_NAME_TOKEN_STARTS_WITH_DIGIT
+    if str.len(name) > ROS_NAME_MAX
+        return ROS_NAME_TOO_LONG
+    if tilde_not_at_start(name)
+        return ROS_NAME_TILDE_NOT_AT_START
+    let braces = brace_error(name)
+    if braces != ROS_NAME_OK
+        return braces
+    ROS_NAME_OK
 
 // What is wrong with a namespace, or `ROS_NAME_OK`.
 //
 // A namespace is absolute: it begins with a forward slash.  `/` alone
 // is the root namespace and is valid.
-pub fn check_namespace(ns: Str) -> Int []
-    todo("ros2-nv.rosname.check_namespace")
+pub @tier(system)
+fn check_namespace(ns: Str) -> Int []
+    if str.len(ns) == 0
+        return ROS_NAME_EMPTY
+    if not str.starts_with(ns, "/")
+        return ROS_NAME_NAMESPACE_NOT_ABSOLUTE
+    // The root namespace is one slash: the one name that ends with a
+    // slash and is right to.
+    if str.len(ns) == 1
+        return ROS_NAME_OK
+    if ends_with_byte(ns, '/')
+        return ROS_NAME_ENDS_WITH_SLASH
+    if has_repeated_slash(ns)
+        return ROS_NAME_REPEATED_SLASH
+    if has_bad_character(ns)
+        return ROS_NAME_BAD_CHARACTER
+    if starts_token_with_digit(ns)
+        return ROS_NAME_TOKEN_STARTS_WITH_DIGIT
+    ROS_NAME_OK
 
 // What is wrong with a topic name, or `ROS_NAME_OK`.
 //
@@ -112,19 +265,62 @@ pub fn check_namespace(ns: Str) -> Int []
 //     println("${rosname.check_topic_name("/cmd_vel")}")     // 0
 //     println("${rosname.check_topic_name("/cmd//vel")}")    // 4
 // ```
-pub fn check_topic_name(name: Str) -> Int []
-    todo("ros2-nv.rosname.check_topic_name")
+pub @tier(system)
+fn check_topic_name(name: Str) -> Int []
+    // The rules are checked in the order they are listed above, so a
+    // name with two problems reports the first.
+    if str.len(name) == 0
+        return ROS_NAME_EMPTY
+    if ends_with_byte(name, '/')
+        return ROS_NAME_ENDS_WITH_SLASH
+    if has_bad_character(name)
+        return ROS_NAME_BAD_CHARACTER
+    if has_repeated_slash(name)
+        return ROS_NAME_REPEATED_SLASH
+    if starts_token_with_digit(name)
+        return ROS_NAME_TOKEN_STARTS_WITH_DIGIT
+    if str.len(name) > ROS_NAME_MAX
+        return ROS_NAME_TOO_LONG
+    if tilde_not_at_start(name)
+        return ROS_NAME_TILDE_NOT_AT_START
+    let braces = brace_error(name)
+    if braces != ROS_NAME_OK
+        return braces
+    ROS_NAME_OK
 
 // What is wrong with a service name, or `ROS_NAME_OK`.
 //
 // The same rules as a topic, with the shorter length budget the `rq/`
 // and `rr/` prefixes and the request and reply suffixes leave.
-pub fn check_service_name(name: Str) -> Int []
-    todo("ros2-nv.rosname.check_service_name")
+pub @tier(system)
+fn check_service_name(name: Str) -> Int []
+    let code = check_topic_name(name)
+    if code != ROS_NAME_OK
+        return code
+    // A service travels as two DDS topics, `rq/<name>_Request` and
+    // `rr/<name>_Reply`, so the longest suffix comes out of the same
+    // budget the prefix does.
+    if effective_length(name) + 8 > ROS_NAME_MAX
+        return ROS_NAME_TOO_LONG
+    ROS_NAME_OK
 
 // The problem in words.
-pub fn name_error_name(code: Int) -> Str []
-    todo("ros2-nv.rosname.name_error_name")
+pub @tier(system)
+fn name_error_name(code: Int) -> Str []
+    match code
+        ROS_NAME_OK                      => "ok"
+        ROS_NAME_EMPTY                   => "empty"
+        ROS_NAME_ENDS_WITH_SLASH         => "ends with slash"
+        ROS_NAME_BAD_CHARACTER           => "bad character"
+        ROS_NAME_REPEATED_SLASH          => "repeated slash"
+        ROS_NAME_TOKEN_STARTS_WITH_DIGIT => "token starts with digit"
+        ROS_NAME_TOO_LONG                => "too long"
+        ROS_NAME_TILDE_NOT_AT_START      => "tilde not at start"
+        ROS_NAME_UNBALANCED_BRACES       => "unbalanced braces"
+        ROS_NAME_UNKNOWN_SUBSTITUTION    => "unknown substitution"
+        ROS_NAME_NODE_HAS_SLASH          => "node name has slash"
+        ROS_NAME_NAMESPACE_NOT_ABSOLUTE  => "namespace not absolute"
+        _                                => "unknown"
 
 // The rcl return code a name problem produces.
 //
@@ -132,18 +328,35 @@ pub fn name_error_name(code: Int) -> Str []
 // `ROS_RET_NODE_INVALID_NAME` or `ROS_RET_NODE_INVALID_NAMESPACE`,
 // depending on what was being named.  `kind` is one of `rosgraph`'s
 // `ROS_ENTITY_*` values.
-pub fn name_error_ret(code: Int, kind: Int) -> Int []
-    todo("ros2-nv.rosname.name_error_ret")
+pub @tier(system)
+fn name_error_ret(code: Int, kind: Int) -> Int []
+    if code == ROS_NAME_OK
+        return rosret.ROS_RET_OK
+    // A namespace fault belongs to the node rather than to the endpoint
+    // being named, so it answers the node's own code whatever the kind.
+    if code == ROS_NAME_NAMESPACE_NOT_ABSOLUTE
+        return rosret.ROS_RET_NODE_INVALID_NAMESPACE
+    if kind == rosgraph.ROS_ENTITY_NODE
+        return rosret.ROS_RET_NODE_INVALID_NAME
+    if kind == rosgraph.ROS_ENTITY_PUBLISHER or kind == rosgraph.ROS_ENTITY_SUBSCRIPTION
+        return rosret.ROS_RET_TOPIC_NAME_INVALID
+    if kind == rosgraph.ROS_ENTITY_SERVICE or kind == rosgraph.ROS_ENTITY_CLIENT
+        return rosret.ROS_RET_SERVICE_NAME_INVALID
+    // A timer and a guard condition have no name on the wire, so a name
+    // fault reported against one names nothing the caller can fix.
+    rosret.ROS_RET_INVALID_ARGUMENT
 
 // ── Shapes ───────────────────────────────────────────────────────────
 
 // Whether the name begins with a forward slash.
-pub fn is_absolute(name: Str) -> Bool []
-    todo("ros2-nv.rosname.is_absolute")
+pub @tier(system)
+fn is_absolute(name: Str) -> Bool []
+    str.starts_with(name, "/")
 
 // Whether the name begins with a tilde.
-pub fn is_private(name: Str) -> Bool []
-    todo("ros2-nv.rosname.is_private")
+pub @tier(system)
+fn is_private(name: Str) -> Bool []
+    str.starts_with(name, "~")
 
 // Whether any token of the name begins with an underscore.
 //
@@ -151,10 +364,22 @@ pub fn is_private(name: Str) -> Bool []
 // `--include-hidden-topics`, and `ros2 topic echo` still works on it.
 // A program whose topic silently fails to appear in a listing has very
 // often named it with a leading underscore by accident.
-pub fn is_hidden(name: Str) -> Bool []
-    todo("ros2-nv.rosname.is_hidden")
+pub @tier(system)
+fn is_hidden(name: Str) -> Bool []
+    // A token begins with an underscore exactly when the name begins
+    // with one or holds `/_`, so this is a search and not a scan.
+    str.starts_with(name, "_") or str.contains(name, "/_")
 
 // ── Expansion ────────────────────────────────────────────────────────
+
+// The two substitutions ROS 2 defines, applied to a name that has been
+// resolved already: `{node}` is the node's own name and `{ns}` the
+// namespace it lives in.
+@tier(system)
+fn substituted(name: Str, namespace: Str, node_name: Str) -> Str
+    system
+        let with_node: Str = str.replace(name, "{node}", node_name)
+        return str.replace(with_node, "{ns}", namespace)
 
 // The fully qualified name a relative or private name resolves to.
 //
@@ -171,41 +396,106 @@ pub fn is_hidden(name: Str) -> Bool []
 //     println(rosname.expand("~/state", "/sensors", "probe"))
 //     // /sensors/probe/state
 // ```
-pub fn expand(name: Str, namespace: Str, node: Str) -> Str []
-    todo("ros2-nv.rosname.expand")
+pub @tier(system)
+fn expand(name: Str, namespace: Str, node: Str) -> Str []
+    system
+        // A private name is the node's own fully qualified name and what
+        // follows the tilde, an absolute name is already resolved, and a
+        // relative one is joined to the namespace.
+        if is_private(name)
+            if str.len(name) < 3
+                return substituted(fully_qualified(namespace, node), namespace, node)
+            return substituted(fully_qualified(namespace, node)
+                               + "/" + str.slice(name, 2, str.len(name)),
+                               namespace, node)
+        if is_absolute(name)
+            return substituted(name, namespace, node)
+        return substituted(fully_qualified(namespace, name), namespace, node)
 
 // The node's own fully qualified name.
 //
 // `/` and the node name for the root namespace, and the namespace and
 // the node name otherwise.
-pub fn fully_qualified(namespace: Str, node: Str) -> Str []
-    todo("ros2-nv.rosname.fully_qualified")
+pub @tier(system)
+fn fully_qualified(namespace: Str, node: Str) -> Str []
+    system
+        // The root namespace is a single slash, and a name joined to it
+        // must not come out with two.
+        if namespace == "/"
+            return "/" + node
+        return namespace + "/" + node
+
+// The name as a DDS prefix takes it: the prefix replaces the leading
+// slash rather than following it, which is why a topic name costs two
+// characters of the budget rather than three.
+@tier(system)
+fn without_leading_slash(name: Str) -> Str
+    system
+        if str.starts_with(name, "/")
+            return str.slice(name, 1, str.len(name))
+        return name
 
 // The DDS topic name a ROS topic maps to.
 //
 // `rt/` and the name with its leading slash removed.  Published because
 // a DDS monitoring tool shows this and not the ROS name, and because it
 // is the string the length limit applies to.
-pub fn dds_topic_name(fully_qualified_name: Str) -> Str []
-    todo("ros2-nv.rosname.dds_topic_name")
+pub @tier(system)
+fn dds_topic_name(fully_qualified_name: Str) -> Str []
+    system
+        return ROS_DDS_TOPIC_PREFIX + without_leading_slash(fully_qualified_name)
 
 // The DDS topic name a service's requests travel on.
-pub fn dds_request_name(fully_qualified_name: Str) -> Str []
-    todo("ros2-nv.rosname.dds_request_name")
+pub @tier(system)
+fn dds_request_name(fully_qualified_name: Str) -> Str []
+    system
+        return ROS_DDS_REQUEST_PREFIX + without_leading_slash(fully_qualified_name)
 
 // The DDS topic name a service's replies travel on.
-pub fn dds_reply_name(fully_qualified_name: Str) -> Str []
-    todo("ros2-nv.rosname.dds_reply_name")
+pub @tier(system)
+fn dds_reply_name(fully_qualified_name: Str) -> Str []
+    system
+        return ROS_DDS_REPLY_PREFIX + without_leading_slash(fully_qualified_name)
 
 // How many characters of the budget a fully qualified name uses.
 //
 // The DDS name's length, prefix included, which is three more than the
 // ROS name's.  A name of 254 characters is inside `ROS_NAME_MAX` and
 // still refused.
-pub fn effective_length(fully_qualified_name: Str) -> Int []
-    todo("ros2-nv.rosname.effective_length")
+pub @tier(system)
+fn effective_length(fully_qualified_name: Str) -> Int []
+    system
+        // The DDS name is the prefix plus the name with its leading
+        // slash dropped, and it is the DDS name the middleware measures.
+        return str.len(ROS_DDS_TOPIC_PREFIX)
+            + str.len(without_leading_slash(fully_qualified_name))
 
 // ── Message types ────────────────────────────────────────────────────
+
+// The middle part of a three-part type name, or an empty string when
+// the name is not exactly three non-empty parts.  Everything about a
+// type name is answered from this one slice.
+@tier(system)
+fn type_middle(type_name: Str) -> Str
+    system
+        // The three-part shape is `package/kind/Type`: the middle part
+        // lies between the first slash and the second.
+        let first = str.index(type_name, "/") ?? 0 - 1
+        if first < 0
+            return ""
+        let rest: Str = str.slice(type_name, first + 1, str.len(type_name))
+        let second = str.index(rest, "/") ?? 0 - 1
+        if second < 0
+            return ""
+        let tail: Str = str.slice(rest, second + 1, str.len(rest))
+        // An empty package, an empty kind or an empty type name is not
+        // a name, and a fourth part makes the shape something else
+        // again.
+        if first == 0 or second == 0 or str.len(tail) == 0
+            return ""
+        if str.contains(tail, "/")
+            return ""
+        return str.slice(rest, 0, second)
 
 // Whether a type name has the three-part shape ROS 2 requires.
 //
@@ -214,8 +504,10 @@ pub fn effective_length(fully_qualified_name: Str) -> Int []
 // `std_msgs/String` — two parts, the old ROS 1 spelling — is refused,
 // and the refusal is worth having because that spelling still appears
 // in tutorials.
-pub fn type_name_is_valid(type_name: Str) -> Bool []
-    todo("ros2-nv.rosname.type_name_is_valid")
+pub @tier(system)
+fn type_name_is_valid(type_name: Str) -> Bool []
+    // A name is valid exactly when it names one of the three kinds.
+    type_kind(type_name) >= 0
 
 // A number that stands for a message type.
 //
@@ -230,12 +522,31 @@ pub fn type_name_is_valid(type_name: Str) -> Bool []
 // yes and the middleware still refuses.  It cannot produce a false
 // refusal, which is the direction that matters: the check never rejects
 // a pair that would have worked.
-pub fn type_id(type_name: Str) -> Int []
-    todo("ros2-nv.rosname.type_id")
+pub @tier(system)
+fn type_id(type_name: Str) -> Int []
+    // FNV-1a over the name's bytes: the offset basis read as a signed
+    // sixty-four bit number, then one exclusive-or and one wrapping
+    // multiply per byte.  A published mixing step, so two builds of this
+    // package agree on the number a type is known by.
+    var mixed = -3750763034362895579
+    var i = 0
+    while true
+        if i >= str.len(type_name)
+            return mixed
+        mixed = int.wrapping_mul(mixed ^ str.byte_at_or(type_name, i, 0), 1099511628211)
+        i = i + 1
 
 // The three kinds of interface a type name can name.
 //
 // 0 for a message, 1 for a service, 2 for an action, and -1 for a name
 // that is not valid.
-pub fn type_kind(type_name: Str) -> Int []
-    todo("ros2-nv.rosname.type_kind")
+pub @tier(system)
+fn type_kind(type_name: Str) -> Int []
+    let middle = type_middle(type_name)
+    if middle == "msg"
+        return 0
+    if middle == "srv"
+        return 1
+    if middle == "action"
+        return 2
+    0 - 1

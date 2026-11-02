@@ -1,8 +1,6 @@
 // rosret.nv — rcl's return codes, and the four of them that are not
 // failures.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A return code is
 // an integer; nothing here allocates and nothing here performs.
 //
@@ -137,7 +135,7 @@ pub const ROS_RET_AGENT_UNREACHABLE = 10002
 // ```
 pub @tier(embedded)
 fn ros_ret_is_ok(ret: Int) -> Bool []
-    todo("ros2-nv.rosret.ros_ret_is_ok")
+    ret == ROS_RET_OK
 
 // Whether something is WRONG, which is a different question.
 //
@@ -158,7 +156,7 @@ fn ros_ret_is_ok(ret: Int) -> Bool []
 // ```
 pub @tier(embedded)
 fn ros_ret_is_error(ret: Int) -> Bool []
-    todo("ros2-nv.rosret.ros_ret_is_error")
+    not ros_ret_is_ok(ret) and ret != ROS_RET_TIMEOUT and not ros_ret_is_take_failed(ret)
 
 // Whether the code means a take found nothing.
 //
@@ -166,7 +164,9 @@ fn ros_ret_is_error(ret: Int) -> Bool []
 // that wants to move on to the next handle.
 pub @tier(embedded)
 fn ros_ret_is_take_failed(ret: Int) -> Bool []
-    todo("ros2-nv.rosret.ros_ret_is_take_failed")
+    ret == ROS_RET_SUBSCRIPTION_TAKE_FAILED
+        or ret == ROS_RET_CLIENT_TAKE_FAILED
+        or ret == ROS_RET_SERVICE_TAKE_FAILED
 
 // Whether the code means a handle is not usable at all.
 //
@@ -175,7 +175,11 @@ fn ros_ret_is_take_failed(ret: Int) -> Bool []
 // makes it right.
 pub @tier(embedded)
 fn ros_ret_is_invalid_handle(ret: Int) -> Bool []
-    todo("ros2-nv.rosret.ros_ret_is_invalid_handle")
+    // A handle fault is the round hundred of its subsystem — 200 for the
+    // node, 300 for a publisher, on to 900 for the wait set.  A name
+    // fault carries the digits instead, at 201, 202, 103 and 104, and is
+    // a mistake about a string rather than about a handle.
+    ret >= ROS_RET_NODE_INVALID and ret <= ROS_RET_WAIT_SET_INVALID and ret % 100 == 0
 
 // Which subsystem a code belongs to: its hundreds digit, or -1 for a
 // code with no subsystem.
@@ -187,12 +191,27 @@ fn ros_ret_is_invalid_handle(ret: Int) -> Bool []
 // which of the twelve things they wrote is at fault.
 pub @tier(embedded)
 fn ros_ret_subsystem(ret: Int) -> Int []
-    todo("ros2-nv.rosret.ros_ret_subsystem")
+    // The extensions sit above 1000 and belong to no subsystem, which is
+    // what the -1 says.
+    if ret >= 0 and ret < 1000
+        ret / 100
+    else
+        0 - 1
 
 // The subsystem in words.
 pub @tier(embedded)
 fn ros_ret_subsystem_name(subsystem: Int) -> Str []
-    todo("ros2-nv.rosret.ros_ret_subsystem_name")
+    match subsystem
+        0 => "general"
+        1 => "context"
+        2 => "node"
+        3 => "publisher"
+        4 => "subscription"
+        5 => "client"
+        6 => "service"
+        8 => "timer"
+        9 => "wait set"
+        _ => "none"
 
 // The code in words, for a log line.
 //
@@ -206,7 +225,37 @@ fn ros_ret_subsystem_name(subsystem: Int) -> Str []
 // ```
 pub @tier(embedded)
 fn ros_ret_name(ret: Int) -> Str []
-    todo("ros2-nv.rosret.ros_ret_name")
+    match ret
+        ROS_RET_OK                       => "ok"
+        ROS_RET_ERROR                    => "error"
+        ROS_RET_TIMEOUT                  => "timeout"
+        ROS_RET_UNSUPPORTED              => "unsupported"
+        ROS_RET_BAD_ALLOC                => "bad alloc"
+        ROS_RET_INVALID_ARGUMENT         => "invalid argument"
+        ROS_RET_ALREADY_INIT             => "already init"
+        ROS_RET_NOT_INIT                 => "not init"
+        ROS_RET_TOPIC_NAME_INVALID       => "topic name invalid"
+        ROS_RET_SERVICE_NAME_INVALID     => "service name invalid"
+        ROS_RET_UNKNOWN_SUBSTITUTION     => "unknown substitution"
+        ROS_RET_ALREADY_SHUTDOWN         => "already shutdown"
+        ROS_RET_NODE_INVALID             => "node invalid"
+        ROS_RET_NODE_INVALID_NAME        => "node invalid name"
+        ROS_RET_NODE_INVALID_NAMESPACE   => "node invalid namespace"
+        ROS_RET_PUBLISHER_INVALID        => "publisher invalid"
+        ROS_RET_SUBSCRIPTION_INVALID     => "subscription invalid"
+        ROS_RET_SUBSCRIPTION_TAKE_FAILED => "subscription take failed"
+        ROS_RET_CLIENT_INVALID           => "client invalid"
+        ROS_RET_CLIENT_TAKE_FAILED       => "client take failed"
+        ROS_RET_SERVICE_INVALID          => "service invalid"
+        ROS_RET_SERVICE_TAKE_FAILED      => "service take failed"
+        ROS_RET_TIMER_INVALID            => "timer invalid"
+        ROS_RET_TIMER_CANCELED           => "timer canceled"
+        ROS_RET_WAIT_SET_INVALID         => "wait set invalid"
+        ROS_RET_WAIT_SET_EMPTY           => "wait set empty"
+        ROS_RET_WAIT_SET_FULL            => "wait set full"
+        ROS_RET_QOS_INCOMPATIBLE         => "qos incompatible"
+        ROS_RET_AGENT_UNREACHABLE        => "agent unreachable"
+        _                                => "unknown"
 
 // Whether this package invented the code rather than taking it from
 // rcl.
@@ -215,4 +264,4 @@ fn ros_ret_name(ret: Int) -> Str []
 // to something that expects rcl's own numbering.
 pub @tier(embedded)
 fn ros_ret_is_extension(ret: Int) -> Bool []
-    todo("ros2-nv.rosret.ros_ret_is_extension")
+    ret >= ROS_RET_QOS_INCOMPATIBLE

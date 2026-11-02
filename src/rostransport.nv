@@ -1,8 +1,6 @@
 // rostransport.nv — the session with the agent, and the byte pipe
 // underneath it.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A MICRO-ROS NODE IS NOT A ROS 2 PARTICIPANT.  A node on a workstation
 // speaks DDS to every other node directly.  A node on a
 // microcontroller speaks Micro XRCE-DDS to an AGENT — a process on
@@ -36,6 +34,7 @@
 // `session_is_stale` exists.
 
 use rosmsg
+use rosret
 
 // ── Stream kinds ─────────────────────────────────────────────────────
 
@@ -66,12 +65,24 @@ pub const ROS_STREAM_RELIABLE = 2
 //     println("${rostransport.stream_for(rosqos.ROS_RELIABILITY_BEST_EFFORT)}")
 //     // 1, a best-effort stream
 // ```
-pub fn stream_for(reliability: Int) -> Int []
-    todo("ros2-nv.rostransport.stream_for")
+pub @tier(system)
+fn stream_for(reliability: Int) -> Int []
+    // 2 is `rosqos.ROS_RELIABILITY_BEST_EFFORT`; a reliable setting
+    // (1) and the middleware's own default (0) both take a reliable
+    // stream, which is the safe direction.
+    if reliability == 2
+        ROS_STREAM_BEST_EFFORT
+    else
+        ROS_STREAM_RELIABLE
 
 // The stream kind in words.
-pub fn stream_name(kind: Int) -> Str []
-    todo("ros2-nv.rostransport.stream_name")
+pub @tier(system)
+fn stream_name(kind: Int) -> Str []
+    match kind
+        0 => "none"   // ROS_STREAM_NONE
+        1 => "best effort"   // ROS_STREAM_BEST_EFFORT
+        2 => "reliable"   // ROS_STREAM_RELIABLE
+        _ => "unknown"
 
 // How many messages a reliable stream holds for retransmission in a
 // stock micro-ROS build: 4.
@@ -128,28 +139,70 @@ struct RosSession
 // fn main() [io]
 //     println("${rostransport.session(0xaabbccdd, 512).state}")   // 0
 // ```
-pub fn session(client_key: Int, mtu: Int) -> RosSession []
-    todo("ros2-nv.rostransport.session")
+pub @tier(system)
+fn session(client_key: Int, mtu: Int) -> RosSession []
+    system
+        // Every counter starts at zero and the session is closed until
+        // an agent has answered.  The first request identifier is 1,
+        // because 0 is what an XRCE header carries when there is no
+        // request.
+        return RosSession {
+            state: ROS_SESSION_CLOSED,
+            client_key: client_key,
+            session_id: 0,
+            next_request: 1,
+            output_seq: 0,
+            input_seq: 0,
+            mtu: mtu,
+            silent_ms: 0 }
 
 // Whether the session may carry messages.
-pub fn session_is_ready(s: RosSession) -> Bool []
-    todo("ros2-nv.rostransport.session_is_ready")
+pub @tier(system)
+fn session_is_ready(s: RosSession) -> Bool []
+    s.state == ROS_SESSION_ESTABLISHED
 
 // The session with `delta_ms` more milliseconds of silence.
-pub fn session_silent(s: RosSession, delta_ms: Int) -> RosSession []
-    todo("ros2-nv.rostransport.session_silent")
+pub @tier(system)
+fn session_silent(s: RosSession, delta_ms: Int) -> RosSession []
+    system
+        // The caller owns the clock; this only accumulates what it is
+        // told.
+        return RosSession {
+            state: s.state,
+            client_key: s.client_key,
+            session_id: s.session_id,
+            next_request: s.next_request,
+            output_seq: s.output_seq,
+            input_seq: s.input_seq,
+            mtu: s.mtu,
+            silent_ms: s.silent_ms + delta_ms }
 
 // The session with the silence cleared, because the agent answered.
-pub fn session_heard(s: RosSession) -> RosSession []
-    todo("ros2-nv.rostransport.session_heard")
+pub @tier(system)
+fn session_heard(s: RosSession) -> RosSession []
+    system
+        // An answer from the agent is the only thing that clears the
+        // silence.
+        return RosSession {
+            state: s.state,
+            client_key: s.client_key,
+            session_id: s.session_id,
+            next_request: s.next_request,
+            output_seq: s.output_seq,
+            input_seq: s.input_seq,
+            mtu: s.mtu,
+            silent_ms: 0 }
 
 // Whether the agent has been silent longer than it should be.
 //
 // The one thing that notices an agent restart.  Until this answers
 // true, every write succeeds locally and arrives nowhere, because the
 // client still believes in entities the new agent has never heard of.
-pub fn session_is_stale(s: RosSession, timeout_ms: Int) -> Bool []
-    todo("ros2-nv.rostransport.session_is_stale")
+pub @tier(system)
+fn session_is_stale(s: RosSession, timeout_ms: Int) -> Bool []
+    // Strictly longer: a silence exactly at the timeout has not yet
+    // outlasted it.
+    s.silent_ms > timeout_ms
 
 // How long a client should wait between heartbeats, in milliseconds:
 // 100.
@@ -160,24 +213,63 @@ pub const ROS_HEARTBEAT_MS = 100
 pub const ROS_SESSION_TIMEOUT_MS = 1000
 
 // The session after the agent acknowledged it.
-pub fn session_established(s: RosSession, session_id: Int) -> RosSession []
-    todo("ros2-nv.rostransport.session_established")
+pub @tier(system)
+fn session_established(s: RosSession, session_id: Int) -> RosSession []
+    system
+        // The agent answered, so the silence is cleared as well as the
+        // state changed.
+        return RosSession {
+            state: ROS_SESSION_ESTABLISHED,
+            client_key: s.client_key,
+            session_id: session_id,
+            next_request: s.next_request,
+            output_seq: s.output_seq,
+            input_seq: s.input_seq,
+            mtu: s.mtu,
+            silent_ms: 0 }
 
 // The session with its next request identifier taken.
-pub fn session_next_request(s: RosSession) -> RosSession []
-    todo("ros2-nv.rostransport.session_next_request")
+pub @tier(system)
+fn session_next_request(s: RosSession) -> RosSession []
+    system
+        // Taken before it is used: a request carries this field's
+        // value, and the request after it carries the next one.
+        return RosSession {
+            state: s.state,
+            client_key: s.client_key,
+            session_id: s.session_id,
+            next_request: s.next_request + 1,
+            output_seq: s.output_seq,
+            input_seq: s.input_seq,
+            mtu: s.mtu,
+            silent_ms: s.silent_ms }
 
 // The session after one message went out on the reliable stream.
-pub fn session_wrote(s: RosSession) -> RosSession []
-    todo("ros2-nv.rostransport.session_wrote")
+pub @tier(system)
+fn session_wrote(s: RosSession) -> RosSession []
+    system
+        // Sixteen bits and wrap, which is the space a reliable stream's
+        // sequence numbers live in.
+        return RosSession {
+            state: s.state,
+            client_key: s.client_key,
+            session_id: s.session_id,
+            next_request: s.next_request,
+            output_seq: (s.output_seq + 1) % 65536,
+            input_seq: s.input_seq,
+            mtu: s.mtu,
+            silent_ms: s.silent_ms }
 
 // Whether a sequence number from the agent is the next one expected.
 //
 // A number that is not is either a retransmission, which is dropped, or
 // a gap, which the client acknowledges negatively.  Getting this
 // backwards makes a link that works until the first lost byte.
-pub fn sequence_is_next(s: RosSession, seq: Int) -> Bool []
-    todo("ros2-nv.rostransport.sequence_is_next")
+pub @tier(system)
+fn sequence_is_next(s: RosSession, seq: Int) -> Bool []
+    // The number expected is the last accepted one plus one, sixteen
+    // bits and wrap.
+    seq == (s.input_seq + 1) % 65536
 
 // Whether a sequence number is one already seen.
 //
@@ -186,12 +278,23 @@ pub fn sequence_is_next(s: RosSession, seq: Int) -> Bool []
 // a plain comparison rejects every message for half the sequence space
 // once the counter has gone round, about an hour into a run at a
 // hundred messages a second.
-pub fn sequence_is_old(s: RosSession, seq: Int) -> Bool []
-    todo("ros2-nv.rostransport.sequence_is_old")
+pub @tier(system)
+fn sequence_is_old(s: RosSession, seq: Int) -> Bool []
+    // Sixteen bits and wrap: a number is behind the last accepted one
+    // when its distance forward from it is less than half the space,
+    // and it is not the number the next message will carry.
+    let ahead = (seq + 65536 - s.input_seq) % 65536
+    ahead < 32768 and ahead != 1
 
 // The session state in words.
-pub fn session_state_name(state: Int) -> Str []
-    todo("ros2-nv.rostransport.session_state_name")
+pub @tier(system)
+fn session_state_name(state: Int) -> Str []
+    match state
+        0 => "closed"   // ROS_SESSION_CLOSED
+        1 => "opening"   // ROS_SESSION_OPENING
+        2 => "established"   // ROS_SESSION_ESTABLISHED
+        3 => "lost"   // ROS_SESSION_LOST
+        _ => "unknown"
 
 // ── Framing ───────────────────────────────────────────────────────────
 
@@ -201,16 +304,26 @@ pub fn session_state_name(state: Int) -> Str []
 // the transport's buffer before the payload does.  `kind` is one of
 // `ROS_STREAM_*`: a reliable stream costs two more bytes than a
 // best-effort one, for its sequence number.
-pub fn framing_overhead(kind: Int) -> Int []
-    todo("ros2-nv.rostransport.framing_overhead")
+pub @tier(system)
+fn framing_overhead(kind: Int) -> Int []
+    // The XRCE message header is four bytes and the submessage header
+    // two, and a reliable stream adds its two-byte sequence number.
+    let header_bytes = 6
+    if kind == ROS_STREAM_RELIABLE
+        header_bytes + 2
+    else
+        header_bytes
 
 // Whether a message fits this session's transport.
 //
 // The payload, the encapsulation header and the framing, against the
 // session's own buffer size.  A message that does not fit is DROPPED BY
 // THE TRANSPORT, below the layer that could report it.
-pub fn message_fits(s: RosSession, m: RosMessage, kind: Int) -> Bool []
-    todo("ros2-nv.rostransport.message_fits")
+pub @tier(system)
+fn message_fits(s: RosSession, m: RosMessage, kind: Int) -> Bool []
+    // The payload, its encapsulation header and the session's framing
+    // all come out of one buffer.
+    rosmsg.wire_length(m) + framing_overhead(kind) <= s.mtu
 
 // ── The byte pipe ────────────────────────────────────────────────────
 
@@ -241,6 +354,30 @@ pub trait RosTransport[e]
     // without performing anything, because a driver asks it once.
     fn ros_mtu(self) -> Int
 
+// The four bytes that identify this client: the key a create request
+// carries, and the whole of what this package can send without a
+// serialiser.
+@tier(system)
+fn client_key_bytes(s: RosSession) -> Bytes
+    system
+        return bytes.u32_le(s.client_key)
+
+// A session with one field changed, which is the shape a `@value`
+// struct needs: four callers change the state and would otherwise each
+// spell the same eight-field literal.
+@tier(system)
+fn session_with_state(s: RosSession, state: Int) -> RosSession
+    system
+        return RosSession {
+            state: state,
+            client_key: s.client_key,
+            session_id: s.session_id,
+            next_request: s.next_request,
+            output_seq: s.output_seq,
+            input_seq: s.input_seq,
+            mtu: s.mtu,
+            silent_ms: s.silent_ms }
+
 // Open a session with the agent.
 //
 // `[e]`, so the cost is the pipe's.  Sends the create request and takes
@@ -252,12 +389,31 @@ pub trait RosTransport[e]
 // has to decide what to do about it — wait, blink a light, carry on
 // measuring into a buffer — and a library that hid the retry would
 // decide for it.
-pub fn open_session<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> RosSession [e]
-    todo("ros2-nv.rostransport.open_session")
+pub @tier(system)
+fn open_session<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> RosSession [e]
+    system
+        // One create request and one status, not a retry loop: a node
+        // that cannot reach its agent decides for itself what to do
+        // about it.
+        if not t.ros_send(client_key_bytes(s))
+            return session_with_state(s, ROS_SESSION_CLOSED)
+        let status = t.ros_recv(timeout_ms)
+        if status == None
+            return session_with_state(s, ROS_SESSION_CLOSED)
+        // The session identifier is in the status, which is a
+        // serialiser's to read; what this records is that an agent
+        // answered.
+        return session_established(s, 0)
 
 // Tell the agent the session is over.
-pub fn close_session<T: RosTransport[e]>(t: T, s: RosSession) -> RosSession [e]
-    todo("ros2-nv.rostransport.close_session")
+pub @tier(system)
+fn close_session<T: RosTransport[e]>(t: T, s: RosSession) -> RosSession [e]
+    system
+        // The delete request carries the same four bytes the create
+        // did.  The client's state is closed whatever the pipe says,
+        // because the decision to end the session is the client's.
+        t.ros_send(client_key_bytes(s))
+        return session_with_state(s, ROS_SESSION_CLOSED)
 
 // Send one message on a stream.
 //
@@ -265,25 +421,58 @@ pub fn close_session<T: RosTransport[e]>(t: T, s: RosSession) -> RosSession [e]
 // session that is not established, `ROS_RET_INVALID_ARGUMENT` for a
 // message larger than the transport, and `ROS_RET_AGENT_UNREACHABLE`
 // when the pipe refused it.
-pub fn send_message<T: RosTransport[e]>(t: T, s: RosSession, m: RosMessage, kind: Int) -> Int [e]
-    todo("ros2-nv.rostransport.send_message")
+pub @tier(system)
+fn send_message<T: RosTransport[e]>(t: T, s: RosSession, m: RosMessage, kind: Int) -> Int [e]
+    system
+        // The checks are in the order the caller can act on them: an
+        // established session, a message the transport can carry, and
+        // then the pipe.
+        if not session_is_ready(s)
+            return rosret.ROS_RET_NOT_INIT
+        if not message_fits(s, m, kind)
+            return rosret.ROS_RET_INVALID_ARGUMENT
+        if t.ros_send(rosmsg.encode_envelope(m))
+            return rosret.ROS_RET_OK
+        return rosret.ROS_RET_AGENT_UNREACHABLE
 
 // Take one message from the agent, or nothing.
 //
 // Answers the raw bytes; `rosmsg.decode_envelope` is what turns them
 // into a message, and which type they are is the caller's, because only
 // the caller knows which subscription the object identifier belongs to.
-pub fn take_message<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> ?Bytes [e]
-    todo("ros2-nv.rostransport.take_message")
+pub @tier(system)
+fn take_message<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> ?Bytes [e]
+    // The bytes and not a message: which type they hold is the
+    // caller's, because only the caller knows which subscription the
+    // object identifier belongs to.
+    t.ros_recv(timeout_ms)
 
 // Send a heartbeat if one is due, and answer the session.
 //
 // `elapsed_ms` is how long since this was last called.  The one
 // periodic obligation a micro-ROS client has, and the only thing that
 // notices an agent that went away.
-pub fn heartbeat<T: RosTransport[e]>(t: T, s: RosSession, elapsed_ms: Int) -> RosSession [e]
-    todo("ros2-nv.rostransport.heartbeat")
+pub @tier(system)
+fn heartbeat<T: RosTransport[e]>(t: T, s: RosSession, elapsed_ms: Int) -> RosSession [e]
+    system
+        // Silence accumulates first: an agent quiet for longer than the
+        // timeout is gone, and no heartbeat this client sends changes
+        // that.
+        let waited = session_silent(s, elapsed_ms)
+        if not session_is_ready(waited)
+            return waited
+        if session_is_stale(waited, ROS_SESSION_TIMEOUT_MS)
+            return session_with_state(waited, ROS_SESSION_LOST)
+        if waited.silent_ms < ROS_HEARTBEAT_MS
+            return waited
+        if not t.ros_send(client_key_bytes(waited))
+            return waited
+        let answer = t.ros_recv(0)
+        if answer == None
+            return waited
+        return session_heard(waited)
 
 // Whether the pipe reports itself open and the session established.
-pub fn is_connected<T: RosTransport[e]>(t: T, s: RosSession) -> Bool [e]
-    todo("ros2-nv.rostransport.is_connected")
+pub @tier(system)
+fn is_connected<T: RosTransport[e]>(t: T, s: RosSession) -> Bool [e]
+    t.ros_is_open() and session_is_ready(s)

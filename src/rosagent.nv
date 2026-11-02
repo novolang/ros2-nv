@@ -1,7 +1,5 @@
 // rosagent.nv — the byte pipe to a micro-ROS agent, over TCP.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE ONE MODULE IN THIS PACKAGE THAT PERFORMS ANYTHING, and its row is
 // `[net]` and nothing else.  No clock: every timeout here is handed to
 // the socket, which is what measures it.
@@ -30,6 +28,8 @@
 // frames of its own and a reader that took whatever `recv` returned
 // would get half a message as often as it got two.  `recv_frame` is
 // what reassembles them, and it is the reason the link holds a buffer.
+
+use rostransport
 
 // The port a micro-ROS agent listens on by default: 8888.
 pub const ROS_AGENT_DEFAULT_PORT = 8888
@@ -65,24 +65,68 @@ pub struct RosAgentLink
 
 impl RosTransport[net] for RosAgentLink
     // Send one message, with its two-byte length in front.
+    @tier(system)
     fn ros_send(self, frame: Bytes) -> Bool [net]
-        todo("ros2-nv.rosagent.ros_send")
+        system
+            // The length is the stream transport's own framing and is
+            // not part of the message; a link that skipped it would
+            // have the agent read the first payload byte as a length.
+            if not self.open
+                return false
+            if bytes.len(frame) > self.mtu
+                return false
+            return net.send_bytes(self.sock,
+                                  length_prefix(bytes.len(frame)) + frame)
 
     // Take one whole message, or nothing.
     //
     // Reads into the link's buffer and answers a message only when a
     // whole one is there, which is what a length prefix is for.
+    @tier(system)
     fn ros_recv(self, timeout_ms: Int) -> ?Bytes [net]
-        todo("ros2-nv.rosagent.ros_recv")
+        system
+            // What is already buffered is what this call trusts; the
+            // rest is read from the socket one known length at a time,
+            // and never past the end of the frame the prefix asks for.
+            // A partial frame read here cannot be kept, because
+            // `pending` belongs to a link this method may not write, so
+            // a caller that needs the buffer drives `feed` and
+            // `take_frame` itself.
+            if not self.open
+                return None
+            if timeout_ms > 0
+                net.set_recv_timeout(self.sock, timeout_ms)
+            var buffered: Bytes = bytes.clone(self.pending)
+            while true
+                let frame_len = length_of_prefix(buffered)
+                let wanted = if frame_len < 0
+                    ROS_TCP_LENGTH_BYTES - bytes.len(buffered)
+                else
+                    ROS_TCP_LENGTH_BYTES + frame_len - bytes.len(buffered)
+                if frame_len >= 0 and wanted <= 0
+                    return Some(bytes.slice(buffered, ROS_TCP_LENGTH_BYTES,
+                                            ROS_TCP_LENGTH_BYTES + frame_len))
+                let chunk = net.recv_bytes(self.sock, wanted)
+                let arrived: Bytes = chunk ?? bytes.zeros(0)
+                if bytes.len(arrived) == 0
+                    return None
+                buffered = buffered + arrived
 
+    @tier(system)
     fn ros_is_open(self) -> Bool [net]
-        todo("ros2-nv.rosagent.ros_is_open")
+        self.open
 
+    @tier(system)
     fn ros_close(self) [net]
-        todo("ros2-nv.rosagent.ros_close")
+        // The field says how the link was opened and cannot be written
+        // through `self`; what closing means here is closing the
+        // socket.
+        if self.open
+            net.close(self.sock)
 
+    @tier(system)
     fn ros_mtu(self) -> Int
-        todo("ros2-nv.rosagent.ros_mtu")
+        self.mtu
 
 // Open a connection to an agent.
 //
@@ -99,24 +143,46 @@ impl RosTransport[net] for RosAgentLink
 //         Some(_) => println("agent found")
 //         None    => println("no agent on this machine")
 // ```
-pub fn connect(host: Str, port: Int) -> ?RosAgentLink [net]
-    todo("ros2-nv.rosagent.connect")
+pub @tier(system)
+fn connect(host: Str, port: Int) -> ?RosAgentLink [net]
+    // The default size is the agent transport's own; a caller with a
+    // different one calls `connect_with_mtu`.
+    connect_with_mtu(host, port, ROS_AGENT_MTU)
 
 // Open a connection with a stated message size.
-pub fn connect_with_mtu(host: Str, port: Int, mtu: Int) -> ?RosAgentLink [net]
-    todo("ros2-nv.rosagent.connect_with_mtu")
+pub @tier(system)
+fn connect_with_mtu(host: Str, port: Int, mtu: Int) -> ?RosAgentLink [net]
+    system
+        // An open socket makes a link, and no socket is nothing; the
+        // link itself is built by `link_over`.
+        let made = match net.connect(host, port)
+            Some(sock) => Some(link_over(sock, mtu))
+            None       => None
+        return made
 
 // Close the connection.
-pub fn disconnect(l: RosAgentLink) [net]
-    todo("ros2-nv.rosagent.disconnect")
+pub @tier(system)
+fn disconnect(l: RosAgentLink) [net]
+    // Closing twice is harmless, and the link's own field records how
+    // it was opened.
+    if l.open
+        net.close(l.sock)
 
 // A link over a socket somebody else opened.
 //
 // For a program that got its socket from elsewhere — a test harness, a
 // connection accepted rather than made — and the reason `connect` is
 // not the only way in.
-pub fn link_over(sock: Sock, mtu: Int) -> RosAgentLink []
-    todo("ros2-nv.rosagent.link_over")
+pub @tier(system)
+fn link_over(sock: Sock, mtu: Int) -> RosAgentLink []
+    system
+        // An empty buffer and an open socket, which is what a link that
+        // has not read anything looks like.
+        return RosAgentLink {
+            sock: sock,
+            pending: bytes.zeros(0),
+            mtu: mtu,
+            open: true }
 
 // The two bytes that go in front of a message of this length.
 //
@@ -124,19 +190,29 @@ pub fn link_over(sock: Sock, mtu: Int) -> RosAgentLink []
 // whatever the payload's own byte order is.  Published because it is
 // the one piece of framing a caller writing its own transport has to
 // match.
-pub fn length_prefix(n: Int) -> Bytes []
-    todo("ros2-nv.rosagent.length_prefix")
+pub @tier(system)
+fn length_prefix(n: Int) -> Bytes []
+    system
+        // Little-endian, whatever the payload's own byte order is.
+        return bytes.u16_le(n)
 
 // The message length two prefix bytes describe, or -1.
-pub fn length_of_prefix(b: Bytes) -> Int []
-    todo("ros2-nv.rosagent.length_of_prefix")
+pub @tier(system)
+fn length_of_prefix(b: Bytes) -> Int []
+    if bytes.len(b) < ROS_TCP_LENGTH_BYTES
+        return 0 - 1
+    bytes.u16_le_at(b, 0) ?? 0 - 1
 
 // Whether the link's buffer holds a whole message.
 //
 // The question `ros_recv` asks before it answers anything, and the one
 // a caller draining a link by hand has to ask too.
-pub fn has_whole_frame(l: RosAgentLink) -> Bool []
-    todo("ros2-nv.rosagent.has_whole_frame")
+pub @tier(system)
+fn has_whole_frame(l: RosAgentLink) -> Bool []
+    // Two bytes before there is a length to trust, and then the whole
+    // of what the length says.
+    let frame_len = length_of_prefix(l.pending)
+    frame_len >= 0 and bytes.len(l.pending) >= ROS_TCP_LENGTH_BYTES + frame_len
 
 // The whole message at the front of the link's buffer, and the link
 // without it.
@@ -145,17 +221,41 @@ pub fn has_whole_frame(l: RosAgentLink) -> Bool []
 // whole message.  Two answers from one call, because taking a message
 // and shortening the buffer are one operation and doing them
 // separately is how a reader loses a message.
-pub fn take_frame(l: RosAgentLink) -> (RosAgentLink, Bytes) []
-    todo("ros2-nv.rosagent.take_frame")
+pub @tier(system)
+fn take_frame(l: RosAgentLink) -> (RosAgentLink, Bytes) []
+    system
+        // A prefix and a length that are not all there answer an empty
+        // message and the link untouched.
+        let frame_len = length_of_prefix(l.pending)
+        if frame_len < 0 or bytes.len(l.pending) < ROS_TCP_LENGTH_BYTES + frame_len
+            return (l, bytes.zeros(0))
+        let end = ROS_TCP_LENGTH_BYTES + frame_len
+        let rest: Bytes = bytes.slice(l.pending, end, bytes.len(l.pending))
+        let frame: Bytes = bytes.slice(l.pending, ROS_TCP_LENGTH_BYTES, end)
+        let shortened = RosAgentLink {
+            sock: l.sock,
+            pending: rest,
+            mtu: l.mtu,
+            open: l.open }
+        return (shortened, frame)
 
 // The link with more bytes appended to its buffer.
-pub fn feed(l: RosAgentLink, chunk: Bytes) -> RosAgentLink []
-    todo("ros2-nv.rosagent.feed")
+pub @tier(system)
+fn feed(l: RosAgentLink, chunk: Bytes) -> RosAgentLink []
+    system
+        // A whole-value replacement: the buffer grows, and the socket
+        // and the size do not change.
+        return RosAgentLink {
+            sock: l.sock,
+            pending: l.pending + chunk,
+            mtu: l.mtu,
+            open: l.open }
 
 // How many bytes are waiting to become a message.
 //
 // Worth logging when a link stops producing messages: a number that
 // grows without a message coming out means the length prefix and the
 // stream have lost their alignment, which nothing else reports.
-pub fn pending_bytes(l: RosAgentLink) -> Int []
-    todo("ros2-nv.rosagent.pending_bytes")
+pub @tier(system)
+fn pending_bytes(l: RosAgentLink) -> Int []
+    bytes.len(l.pending)

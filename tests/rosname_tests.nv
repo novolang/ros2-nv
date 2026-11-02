@@ -1,8 +1,6 @@
 // rosname_tests.nv — the name rules, the DDS names nobody writes, the
 // message envelope, and the three parameter types a microcontroller
 // has.
-//
-// RED ON PURPOSE: the first `todo()` each test reaches ends it.
 
 use std.bytes
 use std.test
