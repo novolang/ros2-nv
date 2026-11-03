@@ -5,7 +5,7 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased — 2026-10-10
+## 0.1.0 — 2026-11-03
 
 ### Changed
 
@@ -22,6 +22,8 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
   recorded.  Nothing else moved: every signature, effect row, arm value
   and doc comment is what 0.1.0 published, and the suites and the merged
   line coverage are unchanged.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-10
 
@@ -91,6 +93,10 @@ leaves `open` true, so a caller that asks `ros_is_open` afterwards gets
 an answer about how the link was made rather than about the socket.
 The two guards that read the field are for a link built directly, by
 the struct literal, rather than by either constructor.
+
+## 0.0.4 — 2026-10-25
+
+A file that names a sibling module's type, function or constant now has the `use` line for that module (E2033, E2003).  No signature and no behaviour changed.
 
 ## 0.0.3 — 2026-10-06
 
