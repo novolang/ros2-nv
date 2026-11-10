@@ -27,12 +27,62 @@ use rosexec
 use rosgraph
 use rosqos
 use rosret
+use rostransport
+use xrceframe
+use xrcewire
 
 // The pair a real ROS 2 system produces most often: a camera that
 // offers best-effort delivery and a program that requests the default.
 @tier(embedded)
 fn a_mismatched_pair() -> RosQosCompat
     rosqos.compatible(rosqos.sensor_data_profile(), rosqos.default_profile())
+
+// A STATUS as an agent sends it: request 1, object 0x0015, status OK.
+const A_STATUS = [0x81, 0x01, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, 0x00, 0x01, 0x00, 0x15,
+                  0x00, 0x00]
+
+// The serial framing and the session messages, built and read back in
+// buffers on the stack: no allocation, which is what `@no_alloc` makes
+// the build prove.  Six checks.
+@tier(embedded)
+@no_alloc
+fn wire_score() -> Int
+    var n = 0
+    // The catalogue's check value for CRC-16/ARC over "123456789".
+    var c = 0
+    for k in 0..9
+        c = xrceframe.crc16_step(c, 49 + k)
+    if c == 0xBB3D
+        n = n + 1
+
+    // A payload with a flag byte and an escape in it goes round.
+    var p: Vec[u8; 512] = Vec.new()
+    let _a = p.push(0x41)
+    let _b = p.push(0x7E)
+    let _c = p.push(0x7D)
+    var f: Vec[u8; 1037] = Vec.new()
+    if xrceframe.encode(var f, var p, 1, 0)
+        n = n + 1
+    var d = xrceframe.deframer(0)
+    if xrceframe.feed(var d, var f, 0) == xrceframe.XRCE_PUSH_FRAME
+        n = n + 1
+    if d.payload.len() == 3 and d.payload[1] == 0x7E and d.payload[2] == 0x7D
+        n = n + 1
+
+    // The opening message is 24 bytes, and a status read out of a
+    // message built by hand is the one that was put in.
+    var m: Vec[u8; 512] = Vec.new()
+    if xrcewire.create_client(var m, 0xAABBCCDD, 512) and m.len() == 24
+        n = n + 1
+    var r = rostransport.session(1, 512)
+    r = rostransport.session_established(r, xrcewire.XRCE_SESSION_ID)
+    var s: Vec[u8; 512] = Vec.new()
+    for i in 0..14
+        let _s = s.push(A_STATUS[i] as u8)
+    let reply = xrcewire.read_reply(var s)
+    if reply.kind == xrcewire.XRCE_REPLY_STATUS and reply.request == r.next_request
+        n = n + 1
+    n
 
 // Every answer this probe checks, folded into one number so a single
 // comparison decides the run.
@@ -292,16 +342,16 @@ fn score() -> Int
     if rosexec.spin_wait_ms(rosexec.set_timeout(e, 100), early) == 60
         n = n + 1
 
-    n
+    n + wire_score()
 
 @tier(rt)
 fn main() [hw]
     bsp.board.init()
-    // 95 is the number of checks in `score`.  The count is printed on a
+    // 101 is the number of checks in `score` and `wire_score`.  The count is printed on a
     // failure rather than only compared, so a device that disagrees with
     // the host says HOW MANY it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 95
+    if n == 101
         hal.uart.write("PASS: ros2-embedded\n")
     else
         hal.uart.write("FAIL: ros2-embedded score=")

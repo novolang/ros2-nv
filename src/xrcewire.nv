@@ -1,0 +1,460 @@
+// xrcewire.nv — the Micro XRCE-DDS messages a client sends and the two
+// replies it reads, built in a buffer the caller owns.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A message is
+// written into a `Vec[u8; 512]`, so a device builds one with no heap and
+// a host builds the same bytes and wraps them for its own link.
+//
+// WHAT THE BYTES ARE.  The layout is the one the eProsima client
+// writes (Micro-XRCE-DDS-Client, `src/c/core/session/session_info.c`,
+// `create_entities_xml.c`, `common_create_entities.c`,
+// `src/c/core/serialization/xrce_header.c` and `xrce_types.c`) and the
+// agent reads (`src/cpp/processor/Processor.cpp`).  Every field is
+// little-endian, which each submessage's flags byte declares, and a
+// multi-byte field sits at a multiple of its own size counted from the
+// first byte of the MESSAGE, not of the submessage.
+//
+//   message header   session id (1), stream id (1), sequence number (2),
+//                    and the client key (4) only when the session id is
+//                    below 128.  This module uses session id 0x81, which
+//                    is above 128, so the header is four bytes.
+//   submessage       submessage id (1), flags (1), length (2), at an
+//                    offset that is a multiple of 4; the length counts
+//                    the payload and not the header or the padding.
+//
+//   CREATE_CLIENT (0)  "XRCE", version 1.0, vendor 0x01 0x0F, client key
+//                    (most significant byte first), session id, a zero
+//                    byte for "no properties", the MTU (2).  16 bytes.
+//                    Its message header carries session id 0x80 (the
+//                    session id with only the top bit kept), stream 0,
+//                    sequence 0.
+//   CREATE (1)       request id (2), object id (2), object kind (1),
+//                    representation format (1: 2 means an XML string),
+//                    two bytes of padding, the string's length including
+//                    its terminating zero (4), the string, and then the
+//                    kind's own trailer: for a participant its domain id
+//                    (2, aligned to 2), for every other kind the object
+//                    id of its parent (2).
+//   WRITE_DATA (7)   request id (2), object id (2), then the sample.
+//   STATUS_AGENT (4) the agent's answer to CREATE_CLIENT: status (1),
+//                    implementation status (1), then the agent's own
+//                    representation.
+//   STATUS (5)       request id (2), object id (2), status (1),
+//                    implementation status (1).
+//   GET_INFO (2)     request id (2), the agent's object id 0xFFFD (2),
+//                    an information mask (4).  Sent outside a session,
+//                    with session id 0x80, it is a ping: the agent
+//                    answers INFO (6) to whoever asked, session or not.
+//
+// AN OBJECT ID IS TWELVE BITS OF NUMBER AND FOUR OF KIND, written most
+// significant byte first: id 1 of kind 5 is 0x00 0x15.
+//
+// THE SAMPLE CARRIES NO ENCAPSULATION HEADER.  The agent writes the
+// four-byte representation header (0x00 0x01 0x00 0x00, plain CDR
+// little-endian) itself before it hands the sample to the DDS writer
+// (Micro-XRCE-DDS-Agent, `src/cpp/types/TopicPubSubType.cpp`,
+// `serialize`), so the bytes after the WRITE_DATA payload header are the
+// CDR body alone: for a std_msgs/msg/Int32 they are the four bytes of the
+// number.  A sample that began with its own header would reach every
+// subscriber with eight bytes of header and the number read from the
+// wrong place.  `rosmsg.encode_envelope` is for a message that travels
+// with its header, and is not what a WRITE_DATA carries.
+
+use std.str
+
+// The session id this module uses: 0x81.
+//
+// Above 127, so the message header has no client key and the agent finds
+// the client from the link it came in on.
+pub const XRCE_SESSION_ID = 0x81
+// The stream that carries a session's own messages: 0.
+pub const XRCE_STREAM_NONE = 0
+// The first best-effort stream: 1.
+pub const XRCE_STREAM_BEST_EFFORT = 1
+
+// Submessage ids, from the client's `SubmessageId`.
+pub const XRCE_SUB_CREATE_CLIENT = 0
+// Submessage id of CREATE: 1.
+pub const XRCE_SUB_CREATE = 1
+// Submessage id of GET_INFO: 2.
+pub const XRCE_SUB_GET_INFO = 2
+// Submessage id of DELETE: 3.
+pub const XRCE_SUB_DELETE = 3
+// Submessage id of STATUS_AGENT, the answer to CREATE_CLIENT: 4.
+pub const XRCE_SUB_STATUS_AGENT = 4
+// Submessage id of STATUS, the answer to CREATE and DELETE: 5.
+pub const XRCE_SUB_STATUS = 5
+// Submessage id of INFO, the answer to GET_INFO: 6.
+pub const XRCE_SUB_INFO = 6
+// Submessage id of WRITE_DATA: 7.
+pub const XRCE_SUB_WRITE_DATA = 7
+
+// Object kinds, from the client's `DDS_XRCE_OBJK_*`.
+pub const XRCE_KIND_PARTICIPANT = 1
+// Object kind of a topic: 2.
+pub const XRCE_KIND_TOPIC = 2
+// Object kind of a publisher: 3.
+pub const XRCE_KIND_PUBLISHER = 3
+// Object kind of a data writer: 5.
+pub const XRCE_KIND_DATAWRITER = 5
+
+// What the agent answers, from the client's `UXR_STATUS_*`.
+pub const XRCE_STATUS_OK = 0
+// The request found an entity already there and reused it: 1.
+pub const XRCE_STATUS_OK_MATCHED = 1
+// The DDS layer behind the agent refused the request: 0x80.  An XML description it cannot parse answers this.
+pub const XRCE_STATUS_ERR_DDS_ERROR = 0x80
+// The entity exists with a description that differs: 0x81.
+pub const XRCE_STATUS_ERR_MISMATCH = 0x81
+// The entity exists and the request did not allow reuse or replacement: 0x82.
+pub const XRCE_STATUS_ERR_ALREADY_EXISTS = 0x82
+// The agent denied the request: 0x83.
+pub const XRCE_STATUS_ERR_DENIED = 0x83
+// The request names an entity the agent does not hold, such as a parent never created: 0x84.
+pub const XRCE_STATUS_ERR_UNKNOWN_REFERENCE = 0x84
+// The request was malformed, or its XML did not describe an entity of that kind: 0x85.
+pub const XRCE_STATUS_ERR_INVALID_DATA = 0x85
+// The agent and the client disagree on the protocol version: 0x86.
+pub const XRCE_STATUS_ERR_INCOMPATIBLE = 0x86
+// The agent ran out of room for the entity: 0x87.
+pub const XRCE_STATUS_ERR_RESOURCES = 0x87
+
+// Where a sample begins in a message built by `begin_write_data`: byte
+// 12, after the message header (4), the submessage header (4) and the
+// request and object ids (4).
+pub const XRCE_SAMPLE_START = 12
+
+// Creation flags, from the client's `UXR_REUSE` and `UXR_REPLACE`: they
+// ride in the submessage's flags byte.
+pub const XRCE_CREATE_REUSE = 0x02
+// Creation flag: replace an entity of the same id: 0x04.
+pub const XRCE_CREATE_REPLACE = 0x04
+
+// Which reply a received message held.
+pub const XRCE_REPLY_NONE = 0
+// The message held a STATUS_AGENT: 4.
+pub const XRCE_REPLY_STATUS_AGENT = 4
+// The message held a STATUS: 5.
+pub const XRCE_REPLY_STATUS = 5
+// The message held an INFO: 6.
+pub const XRCE_REPLY_INFO = 6
+
+// The agent's answer, read out of a received message.
+//
+// `kind` is one of `XRCE_REPLY_*`; for `XRCE_REPLY_STATUS_AGENT` the
+// `request` and `object` are 0.
+pub @value
+struct XrceReply
+    kind: Int
+    request: Int
+    object: Int
+    status: Int
+    implementation: Int
+
+// The id of an object of a kind, as the two bytes that go on the wire,
+// folded into one number: `number` in the top twelve bits and `kind` in
+// the low four.
+//
+// ```novo
+// use xrcewire
+//
+// fn main() [io]
+//     println("${xrcewire.object_id(1, xrcewire.XRCE_KIND_DATAWRITER)}")   // 21, which is 0x0015
+// ```
+pub @tier(embedded)
+@no_alloc
+fn object_id(number: Int, kind: Int) -> Int []
+    ((number & 0xFFF) << 4) | (kind & 0xF)
+
+// Append one byte.
+@tier(embedded)
+@no_alloc
+fn put_u8(var m: Vec[u8; 512], v: Int) -> Bool []
+    match m.push((v & 0xFF) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append two bytes, least significant first.
+@tier(embedded)
+@no_alloc
+fn put_u16(var m: Vec[u8; 512], v: Int) -> Bool []
+    put_u8(var m, v) and put_u8(var m, v >>> 8)
+
+// Append four bytes, least significant first.
+@tier(embedded)
+@no_alloc
+fn put_u32(var m: Vec[u8; 512], v: Int) -> Bool []
+    put_u16(var m, v) and put_u16(var m, v >>> 16)
+
+// Append two bytes, most significant first: an object id or a request id.
+//
+// Both are two-byte arrays on the wire rather than numbers, and the
+// client fills them high byte first (`uxr_init_base_object_request`,
+// `uxr_object_id_to_raw`); the agent echoes a request id back as it
+// received it.
+@tier(embedded)
+@no_alloc
+fn put_object(var m: Vec[u8; 512], v: Int) -> Bool []
+    put_u8(var m, v >>> 8) and put_u8(var m, v)
+
+// Append zero bytes until the length is a multiple of `to`.
+@tier(embedded)
+@no_alloc
+fn put_pad(var m: Vec[u8; 512], to: Int) -> Bool []
+    var ok = true
+    for _i in 0..to
+        if ok and m.len() % to != 0
+            ok = put_u8(var m, 0)
+    ok
+
+// Append a string and its terminating zero.
+@tier(embedded)
+@no_alloc
+fn put_text(var m: Vec[u8; 512], s: Str) -> Bool []
+    var ok = true
+    for i in 0..str.len(s)
+        ok = ok and put_u8(var m, str.byte_at_or(s, i, 0))
+    ok and put_u8(var m, 0)
+
+// Append the message header: the four bytes every message starts with.
+@tier(embedded)
+@no_alloc
+fn put_message_header(var m: Vec[u8; 512], session: Int, stream: Int, seq: Int) -> Bool []
+    put_u8(var m, session) and put_u8(var m, stream) and put_u16(var m, seq)
+
+// Append a submessage header at the next multiple of four.
+@tier(embedded)
+@no_alloc
+fn put_submessage_header(var m: Vec[u8; 512], id: Int, flags: Int, length: Int) -> Bool []
+    // Bit 0 of the flags says the numbers are little-endian.
+    put_pad(var m, 4) and put_u8(var m, id) and put_u8(var m, flags | 1)
+        and put_u16(var m, length)
+
+// Build the message that opens a session, replacing what `m` held.
+//
+// `key` is the four-byte client key as one number, `mtu` the largest
+// message the link carries.  The message is 24 bytes and always fits, so
+// the answer is always true; it is a `Bool` so that the builders have one
+// shape.
+//
+// ```novo
+// use xrcewire
+//
+// fn main() [io]
+//     var m: Vec[u8; 512] = Vec.new()
+//     println("${xrcewire.create_client(var m, 0xAABBCCDD, 512)}")   // true
+//     println("${m.len()}")   // 24
+// ```
+pub @tier(embedded)
+@no_alloc
+fn create_client(var m: Vec[u8; 512], key: Int, mtu: Int) -> Bool []
+    m.clear()
+    var ok = put_message_header(var m, XRCE_SESSION_ID & 0x80, XRCE_STREAM_NONE, 0)
+    ok = ok and put_submessage_header(var m, XRCE_SUB_CREATE_CLIENT, 0, 16)
+    // "XRCE", then the protocol version 1.0 and the vendor id.
+    ok = ok and put_u8(var m, 0x58) and put_u8(var m, 0x52) and put_u8(var m, 0x43)
+        and put_u8(var m, 0x45)
+    ok = ok and put_u8(var m, 1) and put_u8(var m, 0) and put_u8(var m, 0x01)
+        and put_u8(var m, 0x0F)
+    // The key goes most significant byte first.
+    ok = ok and put_u8(var m, key >>> 24) and put_u8(var m, key >>> 16)
+        and put_u8(var m, key >>> 8) and put_u8(var m, key)
+    ok = ok and put_u8(var m, XRCE_SESSION_ID) and put_u8(var m, 0) and put_u16(var m, mtu)
+    ok
+
+// Build the message that ends a session, replacing what `m` held.
+// Always fits, and answers true.
+pub @tier(embedded)
+@no_alloc
+fn delete_client(var m: Vec[u8; 512], request: Int) -> Bool []
+    m.clear()
+    var ok = put_message_header(var m, XRCE_SESSION_ID, XRCE_STREAM_NONE, 0)
+    ok = ok and put_submessage_header(var m, XRCE_SUB_DELETE, 0, 4)
+    // The object id of the client is 0xFFFE.
+    ok = ok and put_object(var m, request) and put_object(var m, 0xFFFE)
+    ok
+
+// Build the message that asks the agent whether it is there, replacing
+// what `m` held.
+//
+// A GET_INFO for the agent with the configuration and activity bits of
+// the information mask, sent with session id 0x80, which the agent
+// answers whether or not a session exists.  Any INFO that comes back
+// means the agent is running.  The message is 16 bytes and always fits,
+// and the answer is true.
+pub @tier(embedded)
+@no_alloc
+fn ping(var m: Vec[u8; 512], request: Int) -> Bool []
+    m.clear()
+    var ok = put_message_header(var m, XRCE_SESSION_ID & 0x80, XRCE_STREAM_NONE, 0)
+    ok = ok and put_submessage_header(var m, XRCE_SUB_GET_INFO, 0, 8)
+    ok = ok and put_object(var m, request) and put_object(var m, 0xFFFD) and put_u32(var m, 3)
+    ok
+
+// Build a message that creates one entity from an XML string, replacing
+// what `m` held.
+//
+// `stream` and `seq` are the stream and its next sequence number,
+// `request` identifies the request in the agent's status, `object` is
+// the new entity's id (see `object_id`), `kind` its kind, `parent` the
+// id of the entity it belongs to (for a participant: its domain id),
+// `xml` its description and `flags` is `XRCE_CREATE_REPLACE`,
+// `XRCE_CREATE_REUSE` or 0.  Answers whether it fitted.
+//
+// ```novo
+// use xrcewire
+//
+// fn main() [io]
+//     var m: Vec[u8; 512] = Vec.new()
+//     let xml = "<dds><topic><name>rt/x</name><dataType>T</dataType></topic></dds>"
+//     let ok = xrcewire.create_entity(var m, 1, 0, 10, xrcewire.object_id(1, 2),
+//                                     xrcewire.XRCE_KIND_TOPIC, xrcewire.object_id(1, 1),
+//                                     xml, xrcewire.XRCE_CREATE_REPLACE)
+//     println("${ok}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn create_entity(var m: Vec[u8; 512], stream: Int, seq: Int, request: Int, object: Int, kind: Int,
+                 parent: Int, xml: Str, flags: Int) -> Bool []
+    m.clear()
+    var ok = put_message_header(var m, XRCE_SESSION_ID, stream, seq)
+    // The length of the payload: the request and object ids, the kind,
+    // the format and two bytes of padding, the string's length and the
+    // string with its zero, and the trailer of two bytes.  A participant
+    // pads to an even offset before its domain id.
+    let text = str.len(xml) + 1
+    var length = 4 + 1 + 1 + 2 + 4 + text + 2
+    if kind == XRCE_KIND_PARTICIPANT and (length - 2) % 2 != 0
+        length = length + 1
+    ok = ok and put_submessage_header(var m, XRCE_SUB_CREATE, flags, length)
+    ok = ok and put_object(var m, request) and put_object(var m, object)
+    ok = ok and put_u8(var m, kind) and put_u8(var m, 2) and put_u16(var m, 0)
+    ok = ok and put_u32(var m, text) and put_text(var m, xml)
+    if kind == XRCE_KIND_PARTICIPANT
+        ok = ok and put_pad(var m, 2) and put_u16(var m, parent)
+    else
+        ok = ok and put_object(var m, parent)
+    if not ok
+        m.clear()
+    ok
+
+// Start a message that writes one sample, replacing what `m` held.
+//
+// The message header, the submessage header and the request and object
+// ids are written; the caller then appends the sample's bytes with
+// `put_sample_byte` and finishes with `finish_write_data`, which stamps
+// the length.  The sample is the CDR body without the representation
+// header (see the top of this file).
+pub @tier(embedded)
+@no_alloc
+fn begin_write_data(var m: Vec[u8; 512], stream: Int, seq: Int, request: Int,
+                    writer: Int) -> Bool []
+    m.clear()
+    var ok = put_message_header(var m, XRCE_SESSION_ID, stream, seq)
+    ok = ok and put_submessage_header(var m, XRCE_SUB_WRITE_DATA, 0, 0)
+    ok = ok and put_object(var m, request) and put_object(var m, writer)
+    ok
+
+// Append one byte of the sample.
+pub @tier(embedded)
+@no_alloc
+fn put_sample_byte(var m: Vec[u8; 512], v: Int) -> Bool []
+    put_u8(var m, v)
+
+// Append a 32-bit integer to the sample, least significant byte first,
+// padded so that it starts at a multiple of four from the start of the
+// sample.
+//
+// CDR aligns a four-byte number to four bytes counted from the start of
+// the sample body, which is byte 12 of a message built by
+// `begin_write_data`.  Twelve is a multiple of four, so for four-byte
+// alignment the message offset gives the same answer; an eight-byte
+// field (a double) is aligned from byte 12, not from a multiple of
+// eight in the message.
+pub @tier(embedded)
+@no_alloc
+fn put_sample_i32(var m: Vec[u8; 512], v: Int) -> Bool []
+    var ok = true
+    for _i in 0..4
+        if ok and (m.len() - XRCE_SAMPLE_START) % 4 != 0
+            ok = put_u8(var m, 0)
+    ok and put_u32(var m, v)
+
+// Fix the length of a write-data submessage after its sample is in.
+//
+// Answers the submessage's length.
+pub @tier(embedded)
+@no_alloc
+fn finish_write_data(var m: Vec[u8; 512]) -> Int []
+    let length = m.len() - 8
+    m[6] = (length & 0xFF) as u8
+    m[7] = ((length >>> 8) & 0xFF) as u8
+    length
+
+// Read the first status in a received message.
+//
+// Walks the submessages of `m` and answers the first STATUS_AGENT,
+// STATUS or INFO found; any other submessage (a heartbeat, an acknowledgement)
+// is stepped over by its length.  A message with no status, or one cut
+// short, answers `kind = XRCE_REPLY_NONE`.
+pub @tier(embedded)
+@no_alloc
+fn read_reply(var m: Vec[u8; 512]) -> XrceReply []
+    var out = XrceReply { kind: XRCE_REPLY_NONE, request: 0, object: 0, status: 0,
+                          implementation: 0 }
+    let header = if m.len() > 0 and (m[0] as Int) < 128
+        8
+    else
+        4
+    var at = header
+    var done = false
+    for _i in 0..16
+        // A submessage starts at a multiple of four.
+        at = (at + 3) / 4 * 4
+        if not done and at + 4 <= m.len()
+            let id = m[at] as Int
+            let length = m[at + 2] as Int + m[at + 3] as Int * 256
+            let body = at + 4
+            if id == XRCE_SUB_STATUS_AGENT and body + 2 <= m.len()
+                out = XrceReply { kind: XRCE_REPLY_STATUS_AGENT, request: 0, object: 0,
+                                  status: m[body] as Int, implementation: m[body + 1] as Int }
+                done = true
+            else if id == XRCE_SUB_STATUS and body + 6 <= m.len()
+                out = XrceReply { kind: XRCE_REPLY_STATUS,
+                                  request: m[body] as Int * 256 + m[body + 1] as Int,
+                                  object: m[body + 2] as Int * 256 + m[body + 3] as Int,
+                                  status: m[body + 4] as Int,
+                                  implementation: m[body + 5] as Int }
+                done = true
+            else if id == XRCE_SUB_INFO
+                out = XrceReply { kind: XRCE_REPLY_INFO, request: 0, object: 0, status: 0,
+                                  implementation: 0 }
+                done = true
+            else
+                at = body + length
+    out
+
+// Whether a status number means the request was carried out.
+//
+// `XRCE_STATUS_OK`, and `XRCE_STATUS_OK_MATCHED` for a request that
+// reused an entity already there.
+pub @tier(embedded)
+@no_alloc
+fn status_is_ok(status: Int) -> Bool []
+    status == XRCE_STATUS_OK or status == XRCE_STATUS_OK_MATCHED
+
+// A status number in words.
+pub @tier(embedded)
+fn status_name(status: Int) -> Str []
+    match status
+        XRCE_STATUS_OK                    => "ok"
+        XRCE_STATUS_OK_MATCHED            => "ok, matched an existing entity"
+        XRCE_STATUS_ERR_DDS_ERROR         => "DDS error"
+        XRCE_STATUS_ERR_MISMATCH          => "mismatch with the existing entity"
+        XRCE_STATUS_ERR_ALREADY_EXISTS    => "already exists"
+        XRCE_STATUS_ERR_DENIED            => "denied"
+        XRCE_STATUS_ERR_UNKNOWN_REFERENCE => "unknown reference"
+        XRCE_STATUS_ERR_INVALID_DATA      => "invalid data"
+        XRCE_STATUS_ERR_INCOMPATIBLE      => "incompatible"
+        XRCE_STATUS_ERR_RESOURCES         => "out of resources"
+        _                                 => "unknown"

@@ -140,7 +140,10 @@ Build and test with `novo pkg build` and `novo test tests`.
 | `rosgraph` | How many of each thing a firmware was built to hold, how many have been created, and whether two endpoints will connect. |
 | `rosexec` | The executor as a step a caller drives, the two dispatch semantics, the three trigger policies, and periodic timers counted in the caller's own milliseconds. |
 | `rosmsg` | A serialised message as bytes this package does not read, the four-byte header that says which byte order they are in, and whether the whole thing fits the transport. |
-| `rostransport` | The session with the agent, the two stream kinds, and `RosTransport`, the byte pipe a program implements over its own link. |
+| `rostransport` | The session with the agent, the two stream kinds, `RosTransport`, the byte pipe a program implements over its own link, and the functions that open a session, create entities and write samples over one. |
+| `xrcewire` | The Micro XRCE-DDS messages a client sends and the replies it reads, built in a buffer the caller owns. |
+| `xrceframe` | The framing of a serial link to an agent: begin flag, addresses, length, byte stuffing and CRC-16, as a framer and a de-framer that allocate nothing. |
+| `rosuart` | The session over a UART, for a device: the same requests as `rostransport`, with no heap, over `XrceUart`, the trait a board's UART implements. |
 | `rosparam` | The three parameter types a microcontroller node can have, the seven it cannot, and the rule that a parameter keeps the type it was declared with. |
 | `rosagent` | A byte pipe to a micro-ROS agent over TCP. The only module in the package that opens anything. |
 
@@ -155,8 +158,14 @@ exists, and it is most of what it is for.
 **A program with a link to an agent calls `rostransport`.** Its
 functions take a `RosTransport` and cost whatever that implementation
 costs. A program on a development machine gets one from
-`rosagent.connect`; a program on a device writes one over its own serial
-port.
+`rosagent.connect`, and `examples/host_talker.nv` is one that publishes a
+counter through it.
+
+**A program on a device calls `rosuart`.** Its functions take an
+`XrceUart`, which `rosuart.console_uart` supplies from the board's
+`hal.uart`, and allocate nothing; `examples/dk_talker.nv` is the same
+counter on an nRF54LM20 DK. `docs/agent-run.md` has the steps to run
+either against an agent.
 
 **A program on a device calls the four modules that build for it.** See
 "Running on a microcontroller".
@@ -227,12 +236,31 @@ port.
 
 ## Running on a microcontroller
 
-Four modules build for a microcontroller with no heap allocator:
-`rosret`, `rosqos`, `rosgraph` and `rosexec`. `tests/embedded_probe.nv`
-is a firmware program that calls ninety-five of their functions and is
-compiled for a Cortex-M as part of this package's checks, so the claim
-is built rather than asserted. Those four are also the four a node
-consults before it touches the wire.
+Seven modules build for a microcontroller with no heap allocator:
+`rosret`, `rosqos`, `rosgraph` and `rosexec`, which a node consults before
+it touches the wire, and `xrceframe`, `xrcewire` and `rosuart`, which are
+the wire. `tests/embedded_probe.nv` is a firmware program that runs a
+hundred and one checks over them and is compiled for a Cortex-M as part of
+this package's checks, so the claim is built rather than asserted. The
+program runs under QEMU and prints `PASS`.
+
+The wire is a node's session with an agent over a UART. `xrceframe` frames
+a message the way the eProsima client does: a begin flag, two addresses, a
+length, byte stuffing and a CRC-16. `xrcewire` builds the messages that
+open a session, create a participant, a topic, a publisher and a data
+writer, and write a sample, and reads the agent's status. `rosuart` sends
+them through `XrceUart`, a trait of three functions (put a byte, get a
+byte, wait a millisecond) that `rosuart.console_uart` implements over
+`hal.uart`. The buffers are `Vec` values the caller holds: a 512-byte
+message, a 1037-byte frame and a de-framer of 584 bytes. The pure functions
+of `rostransport`, which are the session's counters, build for a device
+too.
+
+`examples/dk_talker.nv` is a node on an nRF54LM20 DK that publishes
+a counter on `/novo_counter` once a second. It is 22,840 bytes of flash and
+2,712 bytes of static RAM, and it ran against a real agent on a PC with the
+board's two register accesses replaced by standard input and output
+(`examples/uart_stdio.nv`); the run is recorded in `docs/agent-run.md`.
 
 The other five are excluded, each for a stated reason.
 
@@ -244,20 +272,22 @@ which half a function belongs to. A node in firmware holds its names as
 literals and has nothing to expand.
 
 `rosmsg` holds a payload, and a payload is a heap value.
-`rostransport`'s session holds one too. A firmware node keeps its
-payload in a buffer it owns and hands this package a length.
+`rostransport`'s functions that take a `RosTransport` move a `Bytes`, which
+is a heap value too, and `Bytes` is not admitted at the embedded tier. A
+firmware node keeps its payload in a buffer it owns, and `rosuart` moves
+that buffer instead.
 
 `rosagent` opens a TCP socket, which is the one thing in this package
 that performs anything at all. The manifest names it in `host_modules`,
 so a device build leaves it out.
 
 The registry measures the tiers per module, and its page for this package
-lists eight modules at the embedded and rt tiers: every module except
-`rosagent`. Its tier check admits a module that allocates, such as
-`rosname`, `rosmsg` and `rostransport`, because a device program has a heap
-of fixed size. The claim in this section is narrower: it covers the four
-modules the probe builds. The system, wasm and app tiers cover all nine
-modules.
+lists every module except `rosagent` at the embedded and rt tiers. Its tier
+check admits a module that allocates, such as `rosname`, `rosmsg` and
+`rostransport`, because a device program has a heap of fixed size. The
+claim in this section is narrower: it covers the seven modules the probe
+builds and the session counters of `rostransport`. The system, wasm and app
+tiers cover all twelve modules.
 
 ## What is not included
 
@@ -278,13 +308,23 @@ modules.
   toolchain with it. The consequence is that this package cannot talk
   to a DDS network directly — it talks to a micro-ROS agent, which is
   what a microcontroller does anyway.
-- **UDP and serial transports.** A micro-ROS agent listens on four
-  links and this package reaches one of them. A UDP datagram comes back
-  from the standard library as a NUL-terminated string, so it is
-  truncated at its first zero byte, and a Micro XRCE-DDS message has a
-  zero in its second byte. There is no serial port in the standard
-  library at all — no baud rate, no parity, no inter-character timeout.
-  A device brings its own `RosTransport` over its own UART.
+- **A UDP transport.** A micro-ROS agent listens on four links. This
+  package reaches two: TCP, through `rosagent`, and a serial line, through
+  `rosuart` on a device. A UDP datagram comes back from the standard
+  library as a NUL-terminated string, so it is truncated at its first zero
+  byte, and a Micro XRCE-DDS message has a zero in its second byte. A
+  program with a UDP link brings its own `RosTransport`.
+- **A serial port for a PC.** There is no serial port in the standard
+  library, with no baud rate, parity or inter-character timeout. A device
+  has `hal.uart`; a PC reaches the same code through standard input and
+  output, which is how `examples/uart_stdio.nv` runs it.
+- **Reliable streams.** Every message goes out on the best-effort stream.
+  A reliable stream numbers its messages, keeps a history for
+  retransmission and answers the agent's heartbeats, and none of that is
+  here. A sample lost on the wire is lost.
+- **Subscriptions.** The node publishes; the requests that make a data
+  reader, and the agent's DATA submessages that carry samples back, are
+  not written.
 - **Actions.** ROS 2's third communication pattern, with goals,
   feedback and results, is built on five topics and two services. It is
   a package of its own and rclc treats it that way.
@@ -301,9 +341,15 @@ modules.
   program reaches a robot's hardware. CAN is the bus inside a vehicle
   and Modbus is the protocol on an industrial sensor; ROS 2 is the layer
   above both, and a gateway node would use one of them and this one.
-- **cobs-nv** and **crc-nv** are what a serial `RosTransport` would be
-  built from: Micro XRCE-DDS frames a serial link with a begin flag, an
-  escape byte and a checksum.
+- **crc-nv** has the polynomial the serial framing uses, 0x8005 reflected,
+  as `crc16_modbus`. That function starts from 0xFFFF, and the framing
+  starts from 0, which gives a different checksum (CRC-16/ARC, whose check
+  value over `123456789` is 0xBB3D). It is also a host function that builds
+  a table in a list, and a device program cannot call it. `xrceframe`
+  therefore computes the checksum itself, in a loop of eight steps a
+  byte, and holds it to the catalogue's check value in its tests.
+  **cobs-nv** is not used: the framing stuffs two byte values, which
+  is not COBS.
 - **The language's fixed-capacity collections**, `Vec[T; N]` and its
   family (SPEC section 14.8), hold a bounded table without an allocator.
   Nothing in this package is a collection — a pool, an executor and a
@@ -312,7 +358,7 @@ modules.
 
 ## Tests
 
-The suite is seven files under `tests/`. What they assert comes from
+The suite is nine files under `tests/`. What they assert comes from
 ROS 2's own behaviour rather than from an implementation: the return
 code numbering rcl publishes, the six quality-of-service profiles ROS 2
 ships and the requested-versus-offered rules the DDS specification
@@ -329,6 +375,13 @@ profile or a session can be refused, and the TCP link driven over a
 loopback listener the file opens itself. That listener is why this file
 is the one that declares `[net]`, and it is what exercises `rosagent`
 rather than only naming it.
+
+`tests/xrce_tests.nv` holds the serial framing to vectors worked out by
+hand, a round trip over generated payloads and the cases a line produces:
+a flag inside a payload, a wrong CRC, an escape at the end of a buffer and
+a frame cut in two. `tests/rosclient_tests.nv` holds the messages to the
+bytes a real Micro XRCE-DDS Agent accepted, and drives the session over a
+scripted pipe and a fake UART.
 
 `tests/embedded_probe.nv` is the microcontroller program described
 above.

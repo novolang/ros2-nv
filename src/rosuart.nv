@@ -1,0 +1,260 @@
+// rosuart.nv — the session of this package over a UART, for a device.
+//
+// `@tier(embedded)` ON ALL OF IT AND NO ALLOCATION.  A message is built
+// in a `Vec[u8; 512]`, framed into a `Vec[u8; 1037]`, and read back
+// through a `XrceDeframer`, all of them values the caller holds, so a node
+// whose agent sits on the other end of a serial cable runs with no heap.
+//
+// THE UART IS A TRAIT, `XrceUart[e]`, for the reason `RosTransport[e]`
+// is one: the code that frames, retries and matches a reply to its
+// request is the part worth testing, and it is the same whether the
+// bytes cross a pin or a table in a test.  `ConsoleUart` is the board's
+// own: `hal.uart`, which is the console the board's log uses, and the
+// UART itself when the image is built with `--hci-uart=physical` (on the
+// nRF54LM20 DK that is UARTE30 on P0.06 to P0.09, the J-Link's first
+// virtual COM port; `docs/hal/README.md` lists each board's).  A board
+// that logs over RTT, the default, has no UART in `hal.uart`: the build
+// must say `--hci-uart=physical`, and the console's log lines must go
+// elsewhere, because the same wire carries the agent's frames.
+//
+// WHY NOT `RosTransport`.  That trait's unit is a `Bytes`, and a
+// `Bytes` is a heap value that the embedded tier does not admit
+// (`bytes.byte_at` and `bytes.from_byte_list` allocate or are refused).
+// The device functions here take the message in a `Vec` instead, and
+// say what they did in a `RosOutcome`, as the host functions in
+// `rostransport` do.  Both are built from the same `xrcewire` and the
+// same `RosSession`.
+//
+// NO CLOCK.  A wait is a number of milliseconds the caller names, spent
+// as that many calls to the UART's `uart_pause_ms` between polls.  The
+// console's pause is `hal.timer.delay_ms`, so the wait is the board's
+// own time and the tests spend none.
+
+use rostransport
+use rosret
+use xrceframe
+use xrcewire
+
+// What a UART supplies to this package: a byte out, a byte in, and a
+// pause.
+pub trait XrceUart[e]
+    // Offer one byte to the transmitter.  Answers whether it took it;
+    // a transmitter still busy with the byte before answers false and
+    // the caller offers the byte again.
+    fn uart_put(self, byte: Int) -> Bool [e]
+    // The next received byte, 0 to 255, or -1 when none is waiting.
+    fn uart_get(self) -> Int [e]
+    // Wait about this many milliseconds.
+    fn uart_pause_ms(self, ms: Int) [e]
+
+// The board's console as an `XrceUart`.
+//
+// A `@value` with no fields: the UART is the board's, and the handle
+// only names which implementation of the trait a program wants.
+pub @value
+struct ConsoleUart
+    // Unused; a `@value` needs a field.
+    unused: Int
+
+// A handle to the board's console UART.
+pub @tier(embedded)
+@no_alloc
+fn console_uart() -> ConsoleUart []
+    ConsoleUart { unused: 0 }
+
+impl XrceUart[hw] for ConsoleUart
+    @tier(embedded)
+    // cov: skip — a board's register write; the fake UART in the tests stands in for it
+    fn uart_put(self, byte: Int) -> Bool [hw]
+        hal.uart.try_write_byte(byte) == 0
+
+    @tier(embedded)
+    // cov: skip — a board's register read; the fake UART in the tests stands in for it
+    fn uart_get(self) -> Int [hw]
+        hal.uart.try_read_byte()
+
+    @tier(embedded)
+    // cov: skip — the board's timer; the fake UART in the tests stands in for it
+    fn uart_pause_ms(self, ms: Int) [hw]
+        hal.timer.delay_ms(ms)
+
+// How many times a byte is offered to a busy transmitter before the
+// frame is given up: 100000, which at the pause below is far longer than
+// a byte takes at the slowest rate in use.
+pub const ROS_UART_TX_TRIES = 100000
+
+// Frame the message in `m` and send it, byte by byte.
+//
+// `f` is the caller's frame buffer, cleared and used here.  Answers
+// whether every byte of the frame was taken by the transmitter: a byte
+// refused `ROS_UART_TX_TRIES` times in a row stops the send and answers
+// false.
+pub @tier(embedded)
+@no_alloc
+fn send<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037]) -> Bool [e]
+    f.clear()
+    // A 512-byte payload always frames into 1037 bytes, so this is true.
+    var ok = xrceframe.encode(var f, var m, xrceframe.XRCE_ADDR_CLIENT, xrceframe.XRCE_ADDR_AGENT)
+    for i in 0..f.len()
+        if ok
+            var taken = false
+            for _try in 0..ROS_UART_TX_TRIES
+                if not taken and u.uart_put(f[i] as Int)
+                    taken = true
+                    break
+            ok = taken
+    ok
+
+// Wait for one frame from the agent and copy its payload into `m`.
+//
+// `d` is the caller's de-framer, kept between calls so that a frame cut
+// across two calls is not lost.  Polls the UART, one pause of 1 ms
+// between rounds, for at most `timeout_ms` milliseconds; a timeout of 0
+// takes what is already there.  Answers `XRCE_PUSH_FRAME` when a frame
+// arrived, the error code of a frame that arrived damaged
+// (`XRCE_PUSH_BAD_CRC`, `XRCE_PUSH_TOO_LONG`), or `XRCE_PUSH_NONE` when
+// nothing whole came in time.
+pub @tier(embedded)
+@no_alloc
+fn receive<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                           timeout_ms: Int) -> Int [e]
+    var result = xrceframe.XRCE_PUSH_NONE
+    for round in 0..timeout_ms + 1
+        if result == xrceframe.XRCE_PUSH_NONE
+            // Everything the receiver holds, up to a bound so that a
+            // line that never stops cannot hold the caller.
+            for _k in 0..2048
+                if result == xrceframe.XRCE_PUSH_NONE
+                    let b = u.uart_get()
+                    if b >= 0
+                        result = xrceframe.push_byte(var d, b)
+            if result == xrceframe.XRCE_PUSH_NONE and round < timeout_ms
+                u.uart_pause_ms(1)
+    if result == xrceframe.XRCE_PUSH_FRAME
+        m.clear()
+        for i in 0..d.payload.len()
+            let _ = m.push(d.payload[i])
+    result
+
+// An outcome from its three parts.
+@tier(embedded)
+@no_alloc
+fn outcome(s: rostransport.RosSession, code: Int, status: Int) -> rostransport.RosOutcome []
+    rostransport.RosOutcome { session: s, code: code, status: status }
+
+// Open a session with the agent over the UART.
+//
+// Sends CREATE_CLIENT and waits up to `timeout_ms` for the agent's
+// STATUS_AGENT.  Answers the session established, or closed when the
+// bytes did not go out, nothing came back, or the agent's status was not
+// OK.  One exchange and not a retry loop.
+pub @tier(embedded)
+@no_alloc
+fn open<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                        var f: Vec[u8; 1037], s: rostransport.RosSession,
+                        timeout_ms: Int) -> rostransport.RosSession [e]
+    let closed = rostransport.session_with_state(s, rostransport.ROS_SESSION_CLOSED)
+    let mtu = if s.mtu < 512
+        s.mtu
+    else
+        512
+    let _built = xrcewire.create_client(var m, s.client_key, mtu)
+    if not send(u, var m, var f)
+        return closed
+    if receive(u, var d, var m, timeout_ms) != xrceframe.XRCE_PUSH_FRAME
+        return closed
+    let reply = xrcewire.read_reply(var m)
+    if reply.kind == xrcewire.XRCE_REPLY_STATUS_AGENT and xrcewire.status_is_ok(reply.status)
+        return rostransport.session_established(s, xrcewire.XRCE_SESSION_ID)
+    closed
+
+// Create one entity on the agent from an XML description, and wait for
+// its status.
+//
+// The arguments are those of `rostransport.create_entity`, and so is
+// the outcome: `ROS_RET_NOT_INIT` for a session not established,
+// `ROS_RET_INVALID_ARGUMENT` when the message does not fit,
+// `ROS_RET_AGENT_UNREACHABLE` when the bytes did not go out,
+// `ROS_RET_TIMEOUT` when no status for this request came back, and
+// `ROS_RET_ERROR` with the agent's number in `status` when it refused.
+pub @tier(embedded)
+@no_alloc
+fn create<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                          var f: Vec[u8; 1037], s: rostransport.RosSession, object: Int, kind: Int,
+                          parent: Int, xml: Str, timeout_ms: Int) -> rostransport.RosOutcome [e]
+    if not rostransport.session_is_ready(s)
+        return outcome(s, rosret.ROS_RET_NOT_INIT, 0 - 1)
+    let request = s.next_request
+    let sent = rostransport.session_wrote(rostransport.session_next_request(s))
+    if not xrcewire.create_entity(var m, xrcewire.XRCE_STREAM_BEST_EFFORT, s.output_seq,
+                                  request, object, kind, parent, xml,
+                                  xrcewire.XRCE_CREATE_REPLACE)
+        return outcome(s, rosret.ROS_RET_INVALID_ARGUMENT, 0 - 1)
+    if not send(u, var m, var f)
+        return outcome(s, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+    if receive(u, var d, var m, timeout_ms) != xrceframe.XRCE_PUSH_FRAME
+        return outcome(sent, rosret.ROS_RET_TIMEOUT, 0 - 1)
+    let reply = xrcewire.read_reply(var m)
+    if reply.kind != xrcewire.XRCE_REPLY_STATUS or reply.request != request
+        return outcome(sent, rosret.ROS_RET_TIMEOUT, 0 - 1)
+    if xrcewire.status_is_ok(reply.status)
+        return outcome(rostransport.session_heard(sent), rosret.ROS_RET_OK, reply.status)
+    outcome(rostransport.session_heard(sent), rosret.ROS_RET_ERROR, reply.status)
+
+// Publish one 32-bit integer to a data writer whose topic is
+// std_msgs/msg/Int32.
+//
+// The sample is the four bytes of the number, least significant first:
+// the CDR body of an Int32, without the representation header, which the
+// agent writes itself.  Sent on the best-effort stream and not waited
+// for.  The outcome's code is `ROS_RET_OK` when every byte of the frame
+// went out, `ROS_RET_NOT_INIT` for a session not established, and
+// `ROS_RET_AGENT_UNREACHABLE` when the transmitter refused.
+pub @tier(embedded)
+@no_alloc
+fn publish_i32<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                               s: rostransport.RosSession, writer: Int,
+                               value: Int) -> rostransport.RosOutcome [e]
+    if not rostransport.session_is_ready(s)
+        return outcome(s, rosret.ROS_RET_NOT_INIT, 0 - 1)
+    let request = s.next_request
+    let sent = rostransport.session_wrote(rostransport.session_next_request(s))
+    let _begun = xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_BEST_EFFORT,
+                                           s.output_seq, request, writer)
+    let _put = xrcewire.put_sample_i32(var m, value)
+    let _len = xrcewire.finish_write_data(var m)
+    if not send(u, var m, var f)
+        return outcome(s, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+    outcome(sent, rosret.ROS_RET_OK, 0 - 1)
+
+// Ping the agent if a heartbeat is due, and answer the session.
+//
+// `elapsed_ms` is how long since this was last called, and `wait_ms` how
+// long to wait for the agent's answer. The silence accumulates first. A
+// session that is not established is returned as it is; one silent past
+// `ROS_SESSION_TIMEOUT_MS` becomes `ROS_SESSION_LOST`, and the node's
+// loop then opens a session again; a silence shorter than
+// `ROS_HEARTBEAT_MS` sends nothing. Otherwise a GET_INFO goes out and any
+// INFO that comes back clears the silence. This is the only thing that
+// notices an agent that was restarted: until it does, every publish
+// answers `ROS_RET_OK` and arrives nowhere.
+pub @tier(embedded)
+@no_alloc
+fn heartbeat<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                             var f: Vec[u8; 1037], s: rostransport.RosSession, elapsed_ms: Int,
+                             wait_ms: Int) -> rostransport.RosSession [e]
+    let waited = rostransport.session_silent(s, elapsed_ms)
+    if not rostransport.session_is_ready(waited)
+        return waited
+    if rostransport.session_is_stale(waited, rostransport.ROS_SESSION_TIMEOUT_MS)
+        return rostransport.session_with_state(waited, rostransport.ROS_SESSION_LOST)
+    if waited.silent_ms < rostransport.ROS_HEARTBEAT_MS
+        return waited
+    let _built = xrcewire.ping(var m, waited.next_request)
+    if not send(u, var m, var f)
+        return waited
+    if receive(u, var d, var m, wait_ms) != xrceframe.XRCE_PUSH_FRAME
+        return waited
+    if xrcewire.read_reply(var m).kind == xrcewire.XRCE_REPLY_INFO
+        return rostransport.session_heard(rostransport.session_next_request(waited))
+    waited

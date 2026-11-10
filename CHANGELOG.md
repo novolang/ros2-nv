@@ -5,6 +5,119 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.1 — 2026-11-10
+
+A node can be a micro-ROS node over a UART. Additive: every signature and
+type of 0.1.0 is unchanged, and three behaviours that never worked against
+a real agent now do, as named below.
+
+### Added
+
+- **`xrceframe`**, the serial framing of Micro XRCE-DDS with no
+  allocation. A framer (`encode`) writes begin flag, source and remote
+  address, a 16-bit length, the payload and a CRC-16 into a buffer the
+  caller owns, stuffing every byte after the flag; a de-framer (`deframer`,
+  `push_byte`, `feed`) takes bytes one at a time or in a slice and answers
+  whole frames. The layout and the polynomial are the eProsima client's
+  (`stream_framing_protocol.c`): 0x7E begins, 0x7D escapes and the next
+  byte is exclusive-ored with 0x20, the length counts the payload before
+  stuffing, and the CRC is CRC-16/ARC (0x8005 reflected, initial value 0,
+  no final exclusive-or) over the payload before stuffing, low byte first.
+- **`xrcewire`**, the messages of a client in a `Vec[u8; 512]`:
+  CREATE_CLIENT, CREATE (XML) for a participant, topic, publisher and
+  data writer, WRITE_DATA, DELETE and a GET_INFO ping, and `read_reply`,
+  which finds the agent's STATUS_AGENT, STATUS or INFO in a received
+  message.
+- **`rosuart`**, the session over a UART for a device, with no heap:
+  `open`, `create`, `publish_i32`, `heartbeat`, `send` and `receive`, over
+  `XrceUart[e]`, a trait of three functions; `console_uart` implements it
+  over `hal.uart`.
+- **`rostransport.create_entity` and `rostransport.write_sample`**, the
+  host counterparts over any `RosTransport`, with `RosOutcome`, which
+  carries the session, a `rosret` code and the agent's status number.
+- **`examples/host_talker.nv`**, a talker over the TCP link;
+  **`examples/dk_talker.nv`**, the same on an nRF54LM20 DK over its UART;
+  **`examples/uart_stdio.nv`**, the device's code run on a PC with standard
+  input and output as the UART.
+- **`docs/agent-run.md`**, the steps to run a node against an agent, what
+  `ros2 topic echo` shows, what each failure looks like in the return
+  codes, and a run against a Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy
+  recorded on 2026-11-10.
+- Two test files, `tests/xrce_tests.nv` and `tests/rosclient_tests.nv`,
+  and six more checks in `tests/embedded_probe.nv`, which runs under QEMU.
+
+### Changed
+
+- **`open_session`, `close_session` and `heartbeat` speak XRCE.** They
+  sent four bytes of client key and took any reply for an answer, which a
+  real agent ignores. `open_session` now sends CREATE_CLIENT and reads the
+  STATUS_AGENT, `close_session` sends DELETE, and `heartbeat` sends a
+  GET_INFO ping and takes an INFO for the answer. The recorded-frame tests
+  that had accepted the old behaviour use a STATUS_AGENT the agent sent.
+- **The pure session functions of `rostransport` are embedded tier**:
+  `session`, `session_is_ready`, `session_silent`, `session_heard`,
+  `session_is_stale`, `session_established`, `session_next_request`,
+  `session_wrote`, `session_with_state` (now `pub`), `sequence_is_next`,
+  `sequence_is_old`, `session_state_name`, `framing_overhead`,
+  `stream_for` and `stream_name`. They are integer arithmetic over a
+  `@value`; they were system tier only because they spelled the struct in
+  a `system` block.
+
+### Named as decided
+
+**The sample in a WRITE_DATA carries no encapsulation header.** The agent
+writes `00 01 00 00` itself before the sample reaches DDS
+(`TopicPubSubType::serialize`), so for a `std_msgs/msg/Int32` the bytes are
+the four of the number. A sample that began with its own header arrived in
+ROS 2 as 256. `rosmsg.encode_envelope`, which writes a header, is not what
+a WRITE_DATA carries.
+
+**A request id is two bytes, high byte first.** The agent echoes the bytes
+it received, and a reader that compares them as a number must read them the
+way they were written. The first version of the new code wrote them low byte
+first and no answer ever matched.
+
+**Everything goes on the best-effort stream, with session id 0x81.** The
+session id has its top bit set, so the message header has no client key
+(the agent finds the client by the link), and CREATE carries the replace
+flag so that a node that restarts does not meet its own entities.
+
+**The CRC is written here and not taken from crc-nv.** crc-nv has the
+polynomial as `crc16_modbus`, which starts from 0xFFFF where the framing
+starts from 0, and it is an app-tier function that builds a list, so a
+device program cannot call it. The loop is eight steps a byte, and the
+tests hold it to the catalogue's check value for CRC-16/ARC.
+
+**The device functions do not implement `RosTransport`.** The trait moves a
+`Bytes`, and the embedded tier admits `len` and the region functions of
+`bytes` and nothing that reads or builds one. `rosuart` moves a `Vec`
+instead, and `RosOutcome` is the shared answer.
+
+### Named as limited
+
+**Streams are best-effort only.** A reliable stream's numbering, history
+and acknowledgements are not written, so a sample lost on the wire is lost.
+
+**`send_message` still sends an envelope and nothing else.** It sends the
+four-byte header and the payload without an XRCE message around them, which
+no agent reads as a sample. `write_sample` is the function that publishes;
+`send_message` is kept as it was so that no signature changes.
+
+**There are no subscriptions.** The requests that create a data reader and
+the DATA submessages that carry samples back are not written.
+
+**Seven loops copy a `Vec` into a list one element at a time.** The
+standard library has no conversion for the family and a lambda may not
+capture a `Vec`, so each loop carries the tag
+`workaround(vec-has-no-list-conversion)`, the filing in the novo
+repository that names the missing conversion. One loop is in `rostransport`
+(`wire_bytes`) and six are in the tests.
+
+**The board run is prepared and not made.** The talker for the nRF54LM20 DK
+builds (22,840 bytes of flash, 2,712 bytes of static RAM) and its code ran
+against a real agent over a serial line on a PC; the DK itself was not
+flashed.
+
 ## 0.1.0 — 2026-11-03
 
 ### Changed

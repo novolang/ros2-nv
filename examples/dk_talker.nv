@@ -1,0 +1,97 @@
+// dk_talker.nv — a micro-ROS node on a microcontroller: it opens a
+// session with a Micro XRCE-DDS Agent over the board's UART, creates a
+// participant, the topic /novo_counter of type std_msgs/msg/Int32, a
+// publisher and a data writer, and publishes a counter once a second.
+//
+// Built for the nRF54LM20 DK, whose UARTE30 is the J-Link's first
+// virtual COM port, with the console on the UART rather than on RTT:
+//
+//   novo build --target=nrf54lm20-dk --hci-uart=physical examples/dk_talker.nv
+//
+// and run against an agent on the PC end of that port:
+//
+//   MicroXRCEAgent serial --dev /dev/ttyACM0 -b 115200
+//   ros2 topic echo /novo_counter std_msgs/msg/Int32
+//
+// (`micro-ros-agent serial --dev /dev/ttyACM0 -b 115200` is the same
+// agent with micro-ROS's message types built in.)  The wire carries the
+// agent's frames and nothing else, so this program prints nothing.
+//
+// The names are the ones `examples/host_talker.nv` explains: the DDS topic
+// of the ROS topic /novo_counter is `rt/novo_counter`, and the DDS type
+// of std_msgs/msg/Int32 is `std_msgs::msg::dds_::Int32_`.
+
+use rosuart
+use rostransport
+use xrceframe
+use xrcewire
+
+// The ids the four entities are created with.
+const PARTICIPANT = 0x11
+const TOPIC = 0x12
+const PUBLISHER = 0x13
+const DATAWRITER = 0x15
+
+// One create request, and whether the agent accepted it.
+@tier(embedded)
+@no_alloc
+fn created(out: rostransport.RosOutcome) -> Bool []
+    out.code == 0
+
+// Open a session and create the four entities.  Answers the session,
+// established with the writer in place, or closed.
+@tier(embedded)
+@no_alloc
+fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                            var f: Vec[u8; 1037]) -> rostransport.RosSession [e]
+    let s = rosuart.open(u, var d, var m, var f, rostransport.session(0xAABBCCDD, 512), 1000)
+    if not rostransport.session_is_ready(s)
+        return s
+    let participant = rosuart.create(u, var d, var m, var f, s, PARTICIPANT,
+                                     xrcewire.XRCE_KIND_PARTICIPANT, 0,
+                                     "<dds><participant><rtps><name>novo_dk</name></rtps></participant></dds>",
+                                     1000)
+    let topic = rosuart.create(u, var d, var m, var f, participant.session, TOPIC,
+                               xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
+                               "<dds><topic><name>rt/novo_counter</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></dds>",
+                               1000)
+    let publisher = rosuart.create(u, var d, var m, var f, topic.session, PUBLISHER,
+                                   xrcewire.XRCE_KIND_PUBLISHER, PARTICIPANT, "", 1000)
+    let writer = rosuart.create(u, var d, var m, var f, publisher.session, DATAWRITER,
+                                xrcewire.XRCE_KIND_DATAWRITER, PUBLISHER,
+                                "<dds><data_writer><topic><kind>NO_KEY</kind><name>rt/novo_counter</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></data_writer></dds>",
+                                1000)
+    if created(participant) and created(topic) and created(publisher) and created(writer)
+        return writer.session
+    rostransport.session_with_state(writer.session, rostransport.ROS_SESSION_CLOSED)
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 115200 baud, the rate the agent is told with `-b 115200`.
+    hal.uart.init(115200)
+    let u = rosuart.console_uart()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var count = 0
+    var s = rostransport.session(0xAABBCCDD, 512)
+    loop
+        // Without a session, try again once a second: whether to wait,
+        // blink or carry on is this program's decision and not the
+        // library's.
+        if not rostransport.session_is_ready(s)
+            s = bring_up(u, var d, var m, var f)
+            // A second either way: before the next try if it failed, and
+            // if it worked, long enough for the agent's writer to find
+            // a subscriber before the first sample, which a best-effort
+            // stream does not repeat.
+            hal.timer.delay_ms(1000)
+        else
+            let out = rosuart.publish_i32(u, var m, var f, s, DATAWRITER, count)
+            s = out.session
+            count = count + 1
+            hal.timer.delay_ms(1000)
+            // A restarted agent is noticed here, and nowhere else: the
+            // session becomes lost and the next turn opens a new one.
+            s = rosuart.heartbeat(u, var d, var m, var f, s, 1000, 50)

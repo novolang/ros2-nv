@@ -1,0 +1,80 @@
+// uart_stdio.nv — the device's talker, run on a PC.
+//
+// `dk_talker.nv` is what the board runs.  This program is the same code
+// with a host `main`: `ConsoleUart` is `hal.uart`, and on a host
+// `hal.uart` is the process's standard input and output (a non-blocking
+// read of file descriptor 0, a write to file descriptor 1).  Give those
+// two descriptors a serial line to an agent and the agent sees the
+// framed bytes a board's UART would send, so the whole device path, the
+// board's two register accesses aside, can be run against a real agent
+// before the board is plugged in.
+//
+// The agent's `pseudoterminal` transport makes a serial line out of a
+// pty and prints its name:
+//
+//   MicroXRCEAgent pseudoterminal -v 6        # prints "/dev/pts/<n>"
+//   novo run examples/uart_stdio.nv <> /dev/pts/<n> >&0
+//   ros2 topic echo /novo_counter std_msgs/msg/Int32
+//
+// Nothing may print to standard output, because the agent would read it
+// as bytes; this program reports on standard error, once, at the end.
+
+use rosuart
+use rostransport
+use xrceframe
+use xrcewire
+
+// The ids the four entities are created with.
+const PARTICIPANT = 0x11
+const TOPIC = 0x12
+const PUBLISHER = 0x13
+const DATAWRITER = 0x15
+
+// One create request, and whether the agent accepted it.
+fn created(out: rostransport.RosOutcome) -> Bool
+    out.code == 0
+
+// Open a session and create the four entities.  Answers the session,
+// established with the writer in place, or closed.
+fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                            var f: Vec[u8; 1037]) -> rostransport.RosSession [e]
+    let s = rosuart.open(u, var d, var m, var f, rostransport.session(0xAABBCCDD, 512), 1000)
+    if not rostransport.session_is_ready(s)
+        return s
+    let participant = rosuart.create(u, var d, var m, var f, s, PARTICIPANT,
+                                     xrcewire.XRCE_KIND_PARTICIPANT, 0,
+                                     "<dds><participant><rtps><name>novo_dk</name></rtps></participant></dds>",
+                                     1000)
+    let topic = rosuart.create(u, var d, var m, var f, participant.session, TOPIC,
+                               xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
+                               "<dds><topic><name>rt/novo_counter</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></dds>",
+                               1000)
+    let publisher = rosuart.create(u, var d, var m, var f, topic.session, PUBLISHER,
+                                   xrcewire.XRCE_KIND_PUBLISHER, PARTICIPANT, "", 1000)
+    let writer = rosuart.create(u, var d, var m, var f, publisher.session, DATAWRITER,
+                                xrcewire.XRCE_KIND_DATAWRITER, PUBLISHER,
+                                "<dds><data_writer><topic><kind>NO_KEY</kind><name>rt/novo_counter</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></data_writer></dds>",
+                                1000)
+    if created(participant) and created(topic) and created(publisher) and created(writer)
+        return writer.session
+    rostransport.session_with_state(writer.session, rostransport.ROS_SESSION_CLOSED)
+
+fn main() [hw, io]
+    let u = rosuart.console_uart()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var s = bring_up(u, var d, var m, var f)
+    if not rostransport.session_is_ready(s)
+        eprintln("no session: the agent did not answer, or refused an entity")
+        return
+    // Long enough for the agent's writer to find a subscriber before the
+    // first sample, which a best-effort stream does not repeat.
+    hal.timer.delay_ms(1000)
+    for count in 0..10
+        let out = rosuart.publish_i32(u, var m, var f, s, DATAWRITER, count)
+        s = out.session
+        hal.timer.delay_ms(1000)
+        s = rosuart.heartbeat(u, var d, var m, var f, s, 1000, 50)
+    // A silence of 0 says the agent answered the last ping.
+    eprintln("published 0 to 9, silence ${s.silent_ms} ms")

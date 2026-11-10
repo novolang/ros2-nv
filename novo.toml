@@ -1,7 +1,7 @@
 [package]
 name        = "ros2-nv"
-version     = "0.1.0"
-description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent."
+version     = "0.1.1"
+description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent over TCP or, on a device, over a UART."
 license     = "Apache-2.0"
 
 stability   = "experimental"
@@ -21,20 +21,25 @@ stability   = "experimental"
 # exchange in a test.
 #
 # `tests/embedded_probe.nv` is what makes the claim a thing the audit
-# BUILDS: `rosret`, `rosqos`, `rosgraph` and `rosexec` link for
-# `--target=nrf52-qemu`.
+# BUILDS: `rosret`, `rosqos`, `rosgraph`, `rosexec` and the serial session
+# (`xrceframe`, `xrcewire`, `rosuart`) link for `--target=nrf52-qemu`.
 layer       = "core"
 
 # `rosagent` is the one module that performs: a Micro XRCE-DDS session
 # over a TCP stream to a micro-ROS agent, through `std.net`'s byte pair.
 # `[net]`, and nothing else — no clock, because every timeout in this
 # package is a number the caller measures.
+#
+# `rosuart` is not named here, though it also performs: its functions are
+# generic over `XrceUart[e]`, so they charge a caller what the caller's
+# UART costs, and the one implementation in the package, over `hal.uart`,
+# is `[hw]`, which a device builds.
 host_modules = ["rosagent"]
 
 category    = "embedded"
 
 tags        = ["ros2", "ros", "rclc", "micro-ros", "robotics", "xrce-dds",
-               "dds", "qos", "embedded", "no-alloc"]
+               "dds", "qos", "embedded", "no-alloc", "serial", "uart"]
 repository  = "https://github.com/novolang/ros2-nv"
 maintainers = ["novo-lang"]
 novo        = ">= 0.23.0"
@@ -44,6 +49,7 @@ novo        = ">= 0.23.0"
 
 [docs.pages]
 "README.md" = "Two endpoints that never connect, and the function that says so first"
+"docs/agent-run.md" = "Running a node against a micro-ROS agent, and what each failure looks like"
 
 [dependencies]
 # NONE, and the absence that matters is a serialiser.

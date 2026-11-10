@@ -1,0 +1,316 @@
+// xrce_tests.nv — the serial framing of Micro XRCE-DDS, byte by byte.
+//
+// THE VECTORS ARE DERIVED BY HAND, NOT RECORDED FROM THIS CODE.  Each
+// one is worked out in the comment above it from the layout in
+// `src/xrceframe.nv`, with the CRC-16 computed by a bitwise loop that
+// shares nothing with the implementation (reflected polynomial 0xA001,
+// initial value 0, no final exclusive-or) and cross-checked against the
+// eProsima client's 256-entry `crc16_table` and its published check
+// value for `123456789`.
+
+use std.list
+use std.test
+use xrceframe
+
+// A payload from a list of byte values.
+fn payload_of(xs: [Int]) -> Vec[u8; 512]
+    var p: Vec[u8; 512] = Vec.new()
+    for x in xs
+        let _ = p.push(x as u8)
+    p
+
+// The bytes of a frame as a list, for comparison with a derivation.
+fn wire_of(var frame: Vec[u8; 1037]) -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for x in frame
+        let wide = x as Int
+        out = list.push(out, wide)
+    out
+
+// A frame from address 1 to address 0, as a list.
+fn framed(xs: [Int]) -> [Int]
+    var p = payload_of(xs)
+    var f: Vec[u8; 1037] = Vec.new()
+    let _ = xrceframe.encode(var f, var p, 1, 0)
+    wire_of(var f)
+
+// Feed a list to a de-framer one byte at a time and answer the last
+// result.
+fn feed_all(var d: xrceframe.XrceDeframer, xs: [Int]) -> Int
+    var r = xrceframe.XRCE_PUSH_NONE
+    for x in xs
+        r = xrceframe.push_byte(var d, x)
+    r
+
+// The payload a de-framer holds, as a list.
+fn held(var d: xrceframe.XrceDeframer) -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for x in d.payload
+        let wide = x as Int
+        out = list.push(out, wide)
+    out
+
+@test
+fn test_the_crc_is_the_clients() [io]
+    // CRC-16/ARC over the nine ASCII digits is 0xBB3D, the catalogue's
+    // check value.  The eProsima client's table gives the same number.
+    test.case("the catalogue's check value")
+    var c = 0
+    for b in [49, 50, 51, 52, 53, 54, 55, 56, 57]
+        c = xrceframe.crc16_step(c, b)
+    test.assert_eq(c, 0xBB3D)
+
+    test.case("one byte: 0x41 gives 0x30C0")
+    test.assert_eq(xrceframe.crc16_step(0, 0x41), 0x30C0)
+
+    test.case("nothing gives the initial state")
+    test.assert_eq(xrceframe.crc16_step(0, 0), 0)
+
+@test
+fn test_hand_derived_frames() [io]
+    // Frame of the single byte 0x41, from 1 to 0.
+    //   begin 7E; source 01; remote 00; length 01 00; payload 41;
+    //   CRC of 41 is 0x30C0, sent low byte first: C0 30.
+    //   No byte is 7E or 7D, so nothing is stuffed.
+    test.case("one byte, nothing to stuff")
+    test.assert_eq(framed([0x41]), [0x7E, 0x01, 0x00, 0x01, 0x00, 0x41, 0xC0, 0x30])
+
+    // The nine digits: length 9, CRC 0xBB3D sent as 3D BB.
+    test.case("the nine digits")
+    test.assert_eq(framed([49, 50, 51, 52, 53, 54, 55, 56, 57]),
+                   [0x7E, 0x01, 0x00, 0x09, 0x00, 0x31, 0x32, 0x33, 0x34, 0x35,
+                    0x36, 0x37, 0x38, 0x39, 0x3D, 0xBB])
+
+    // A begin flag inside the payload.  The payload byte 7E goes out as
+    // 7D 5E (7E ^ 20).  The CRC is over the UNSTUFFED byte: 0x2080,
+    // sent as 80 20, neither of which is a flag.
+    test.case("a begin flag in the payload")
+    test.assert_eq(framed([0x7E]),
+                   [0x7E, 0x01, 0x00, 0x01, 0x00, 0x7D, 0x5E, 0x80, 0x20])
+
+    // The escape, the begin flag and 0x20 in a row.  7D -> 7D 5D,
+    // 7E -> 7D 5E, 20 stays.  The CRC over 7D 7E 20 is 0x60B0, sent
+    // B0 60.  The length is 3: the count before stuffing.
+    test.case("an escape and a begin flag together")
+    test.assert_eq(framed([0x7D, 0x7E, 0x20]),
+                   [0x7E, 0x01, 0x00, 0x03, 0x00, 0x7D, 0x5D, 0x7D, 0x5E, 0x20,
+                    0xB0, 0x60])
+
+    // An empty payload: length 0, CRC 0 sent 00 00.
+    test.case("an empty payload")
+    test.assert_eq(framed([]), [0x7E, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+    // The CRC itself is stuffed.  The one byte 0xA9 has CRC 0x7EC0,
+    // which goes out C0 then 7E, and the 7E is stuffed to 7D 5E.
+    test.case("a CRC byte that is a flag")
+    test.assert_eq(framed([0xA9]),
+                   [0x7E, 0x01, 0x00, 0x01, 0x00, 0xA9, 0xC0, 0x7D, 0x5E])
+
+    // The header is stuffed too.  Source 7E and remote 7D, the payload
+    // 01 02 03 whose CRC is 0xA110, sent 10 A1.
+    test.case("a source address that is a flag")
+    var p = payload_of([1, 2, 3])
+    var f: Vec[u8; 1037] = Vec.new()
+    test.assert(xrceframe.encode(var f, var p, 0x7E, 0x7D))
+    test.assert_eq(wire_of(var f),
+                   [0x7E, 0x7D, 0x5E, 0x7D, 0x5D, 0x03, 0x00, 0x01, 0x02, 0x03,
+                    0x10, 0xA1])
+
+@test
+fn test_every_hand_frame_comes_back() [io]
+    // The de-framer is the inverse: each derived frame yields its
+    // payload, from the right sender.
+    test.case("the flag payload")
+    var d = xrceframe.deframer(0)
+    let r = feed_all(var d, [0x7E, 0x01, 0x00, 0x01, 0x00, 0x7D, 0x5E, 0x80, 0x20])
+    test.assert_eq(r, xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(held(var d), [0x7E])
+    test.assert_eq(d.source, 1)
+
+    test.case("the stuffed CRC")
+    let r2 = feed_all(var d, [0x7E, 0x01, 0x00, 0x01, 0x00, 0xA9, 0xC0, 0x7D, 0x5E])
+    test.assert_eq(r2, xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(held(var d), [0xA9])
+
+    test.case("the empty frame")
+    let r3 = feed_all(var d, [0x7E, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
+    test.assert_eq(r3, xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(held(var d), [])
+
+@test
+fn test_round_trip_over_many_payloads() [io]
+    // A property, not a table: a payload of every length from 0 to 40
+    // and a few long ones, bytes from a generator that keeps hitting
+    // 0x7E, 0x7D and 0x20, encoded and decoded one byte at a time, comes
+    // back equal.  Both addresses vary as well.
+    var seed = 12345
+    var failures = 0
+    var cases = 0
+    for n in 0..48
+        var xs: [Int] = []
+        for _k in 0..n
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+            let pick = (seed >>> 8) % 6
+            if pick == 0
+                xs = list.push(xs, 0x7E)
+            else if pick == 1
+                xs = list.push(xs, 0x7D)
+            else if pick == 2
+                xs = list.push(xs, 0x5E)
+            else
+                xs = list.push(xs, (seed >>> 4) & 0xFF)
+        var p = payload_of(xs)
+        var f: Vec[u8; 1037] = Vec.new()
+        let src = n % 5
+        let dst = (n + 3) % 7
+        let wrote = xrceframe.encode(var f, var p, src, dst)
+        var d = xrceframe.deframer(dst)
+        let r = feed_all(var d, wire_of(var f))
+        cases = cases + 1
+        if not wrote or r != xrceframe.XRCE_PUSH_FRAME or held(var d) != xs or d.source != src
+            failures = failures + 1
+    test.case("forty-eight payloads")
+    test.assert_eq(cases, 48)
+    test.assert_eq(failures, 0)
+
+    test.case("a full-size payload of nothing but flags")
+    var big: Vec[u8; 512] = Vec.new()
+    for _i in 0..512
+        let _ = big.push(0x7E)
+    var wire: Vec[u8; 1037] = Vec.new()
+    test.assert(xrceframe.encode(var wire, var big, 1, 0))
+    // Every byte after the begin flag is doubled except the CRC bytes
+    // that are not flags; the frame fits the declared worst case.
+    test.assert(wire.len() <= 1037)
+    var d2 = xrceframe.deframer(0)
+    test.assert_eq(xrceframe.feed(var d2, var wire, 0), xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(d2.payload.len(), 512)
+    test.assert_eq(d2.next, wire.len())
+
+@test
+fn test_a_full_buffer_is_refused_whole() [io]
+    // The escape at the end of a buffer.  One place left and a byte that
+    // needs two: nothing is written.
+    test.case("one place left for a flag byte")
+    var out: Vec[u8; 1037] = Vec.new()
+    for _i in 0..1036
+        let _ = out.push(0)
+    test.assert(not xrceframe.stuff_byte(var out, 0x7E))
+    test.assert_eq(out.len(), 1036)
+    test.assert(xrceframe.stuff_byte(var out, 0x41))
+    test.assert_eq(out.len(), 1037)
+
+    test.case("no place left for any byte")
+    test.assert(not xrceframe.stuff_byte(var out, 0x41))
+    test.assert(not xrceframe.stuff_byte(var out, 0x7D))
+
+    // The payload 0xA9 frames to nine bytes whose last two are the
+    // stuffed CRC byte 7D 5E.  With eight places free the stuffed pair
+    // is the one that does not fit, and the whole frame is taken back.
+    test.case("a frame whose last byte is the one that overflows")
+    var tight: Vec[u8; 1037] = Vec.new()
+    for _i in 0..1029
+        let _ = tight.push(9)
+    var p = payload_of([0xA9])
+    test.assert(not xrceframe.encode(var tight, var p, 1, 0))
+    test.assert_eq(tight.len(), 1029)
+
+    test.case("the same frame with nine places free")
+    var roomy: Vec[u8; 1037] = Vec.new()
+    for _i in 0..1028
+        let _ = roomy.push(9)
+    test.assert(xrceframe.encode(var roomy, var p, 1, 0))
+    test.assert_eq(roomy.len(), 1037)
+
+    test.case("no place even for the begin flag")
+    var full: Vec[u8; 1037] = Vec.new()
+    for _i in 0..1037
+        let _ = full.push(9)
+    test.assert(not xrceframe.encode(var full, var p, 1, 0))
+    test.assert_eq(full.len(), 1037)
+
+    test.case("frames queue in one buffer")
+    var two: Vec[u8; 1037] = Vec.new()
+    var q = payload_of([0x41])
+    test.assert(xrceframe.encode(var two, var q, 1, 0))
+    test.assert(xrceframe.encode(var two, var q, 1, 0))
+    test.assert_eq(two.len(), 16)
+    var d = xrceframe.deframer(0)
+    test.assert_eq(xrceframe.feed(var d, var two, 0), xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(d.next, 8)
+    test.assert_eq(xrceframe.feed(var d, var two, d.next), xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(d.next, 16)
+    test.assert_eq(xrceframe.feed(var d, var two, d.next), xrceframe.XRCE_PUSH_NONE)
+
+@test
+fn test_a_receiver_survives_what_a_line_does() [io]
+    // A wrong CRC.  The last byte of the nine-digit frame is changed.
+    test.case("a wrong CRC is reported and the next frame is read")
+    var d = xrceframe.deframer(0)
+    let bad = feed_all(var d, [0x7E, 0x01, 0x00, 0x01, 0x00, 0x41, 0xC0, 0x31])
+    test.assert_eq(bad, xrceframe.XRCE_PUSH_BAD_CRC)
+    test.assert_eq(feed_all(var d, [0x7E, 0x01, 0x00, 0x01, 0x00, 0x41, 0xC0, 0x30]),
+                   xrceframe.XRCE_PUSH_FRAME)
+
+    // A frame for another address is skipped whole, payload and all.
+    test.case("a frame for another address")
+    test.assert_eq(feed_all(var d, [0x7E, 0x01, 0x05, 0x01, 0x00, 0x41, 0xC0, 0x30]),
+                   xrceframe.XRCE_PUSH_NONE)
+    test.assert_eq(feed_all(var d, [0x7E, 0x01, 0x00, 0x01, 0x00, 0x41, 0xC0, 0x30]),
+                   xrceframe.XRCE_PUSH_FRAME)
+
+    // Garbage before the begin flag is skipped.
+    test.case("bytes before a begin flag")
+    test.assert_eq(feed_all(var d, [0x00, 0xFF, 0x41, 0x7D, 0x7E, 0x01, 0x00, 0x01, 0x00,
+                                0x41, 0xC0, 0x30]),
+                   xrceframe.XRCE_PUSH_FRAME)
+
+    // A header that announces more than the buffer holds.
+    test.case("a length over the MTU")
+    test.assert_eq(feed_all(var d, [0x7E, 0x01, 0x00, 0x01, 0x02]),
+                   xrceframe.XRCE_PUSH_TOO_LONG)
+    test.assert_eq(feed_all(var d, [0x7E, 0x01, 0x00, 0x00, 0x02]),
+                   xrceframe.XRCE_PUSH_NONE)
+    xrceframe.reset(var d)
+
+    // A frame cut short by a new begin flag: the new one is read.
+    test.case("a begin flag inside a frame restarts it")
+    test.assert_eq(feed_all(var d, [0x7E, 0x01, 0x00, 0x09, 0x00, 0x31, 0x32,
+                                0x7E, 0x01, 0x00, 0x01, 0x00, 0x41, 0xC0, 0x30]),
+                   xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(held(var d), [0x41])
+
+    // An escape followed by a begin flag is the same restart.
+    test.case("an escape then a begin flag restarts it")
+    test.assert_eq(feed_all(var d, [0x7E, 0x01, 0x7D,
+                                0x7E, 0x01, 0x00, 0x01, 0x00, 0x41, 0xC0, 0x30]),
+                   xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(held(var d), [0x41])
+
+    // The stream ends on an escape: nothing completes, and when the
+    // rest arrives the frame is whole.
+    test.case("an escape at the end of the bytes so far")
+    test.assert_eq(feed_all(var d, [0x7E, 0x01, 0x00, 0x01, 0x00, 0x7D]),
+                   xrceframe.XRCE_PUSH_NONE)
+    test.assert_eq(feed_all(var d, [0x5E, 0x80, 0x20]), xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(held(var d), [0x7E])
+
+    // A flag byte arriving while the reader waits is not a frame.
+    test.case("an escape outside a frame is skipped")
+    test.assert_eq(feed_all(var d, [0x7D, 0x5E]), xrceframe.XRCE_PUSH_NONE)
+
+@test
+fn test_slices_and_single_bytes_agree() [io]
+    // The same wire fed whole and a byte at a time gives the same
+    // payload.
+    test.case("a frame fed in one slice")
+    var p = payload_of([49, 50, 51, 52, 53, 54, 55, 56, 57])
+    var wire: Vec[u8; 1037] = Vec.new()
+    test.assert(xrceframe.encode(var wire, var p, 1, 0))
+    var a = xrceframe.deframer(0)
+    test.assert_eq(xrceframe.feed(var a, var wire, 0), xrceframe.XRCE_PUSH_FRAME)
+    var b = xrceframe.deframer(0)
+    test.assert_eq(feed_all(var b, wire_of(var wire)), xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(held(var a), held(var b))

@@ -1,0 +1,767 @@
+// rosclient_tests.nv — the Micro XRCE-DDS messages of `xrcewire`, the
+// session functions of `rostransport` over a scripted pipe, and the
+// device functions of `rosuart` over a fake UART.
+//
+// THREE KINDS OF EVIDENCE, AND WHERE EACH CAME FROM.
+//
+//  - Recorded: the frames marked "recorded" are bytes a Micro XRCE-DDS
+//    Agent 2.4.3 sent or accepted on 2026-11-10 (its log at verbose
+//    level 6 prints every message), and a ROS 2 Jazzy `ros2 topic echo`
+//    saw the values the talker built from them.  The status frames are
+//    the agent's own; the create and write frames are this package's
+//    and are those the agent logged as "participant created" and so on.
+//  - Derived: the frames marked "derived" are worked out by hand from the
+//    layout at the top of `src/xrcewire.nv`, with the derivation in the
+//    comment.
+//  - Scripted: the pipe and the UART answer a canned reply whatever they
+//    were sent, so a test chooses what the agent said.
+
+use std.list
+use std.test
+use rosret
+use rostransport
+use rosuart
+use xrceframe
+use xrcewire
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+// A message buffer from a list of bytes.
+fn vec_of(xs: [Int]) -> Vec[u8; 512]
+    var m: Vec[u8; 512] = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+// The bytes of a message buffer, as a list.
+fn list_of(var m: Vec[u8; 512]) -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for x in m
+        let wide = x as Int
+        out = list.push(out, wide)
+    out
+
+// The bytes of a list, as a `Bytes`.
+fn wire_of(xs: [Int]) -> Bytes
+    bytes.from_byte_list(xs)
+
+// The STATUS the agent answers a request with: header 81 01 00 00,
+// submessage 05 (STATUS) flags 01 length 6, then the request id and
+// object id (two bytes each, high byte first), the status and the
+// implementation status.
+fn status_message(request: Int, object: Int, status: Int) -> [Int]
+    [0x81, 0x01, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, request >>> 8, request & 0xFF,
+     object >>> 8, object & 0xFF, status, 0x00]
+
+// The STATUS_AGENT the agent answered a CREATE_CLIENT with (recorded):
+// header 81 00 00 00, submessage 04 flags 01 length 11, status, the
+// implementation status, "XRCE", version 1.0, vendor 01 0F, and a zero
+// byte for no properties.
+fn status_agent_message(status: Int) -> [Int]
+    [0x81, 0x00, 0x00, 0x00, 0x04, 0x01, 0x0B, 0x00, status, 0x00, 0x58, 0x52, 0x43, 0x45,
+     0x01, 0x00, 0x01, 0x0F, 0x00]
+
+// The INFO the agent answered a GET_INFO ping with (recorded).
+fn info_message() -> [Int]
+    [0x80, 0x00, 0x00, 0x00, 0x06, 0x01, 0x1C, 0x00, 0x00, 0x00, 0xFF, 0xFD, 0x00, 0x01,
+     0x01, 0x0D, 0x58, 0x52, 0x43, 0x45, 0x01, 0x00, 0x01, 0x0F, 0x00, 0x01, 0x0D, 0x00,
+     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+// A session that is established, with the next request identifier 1.
+fn an_open_session() -> RosSession
+    rostransport.session_established(rostransport.session(0xAABBCCDD, 512), 0x81)
+
+// A string of n letters.
+fn letters(n: Int) -> Str
+    var s = ""
+    for _i in 0..n
+        s = s + "x"
+    s
+
+// ── xrcewire: the messages ───────────────────────────────────────────
+
+@test
+fn test_the_messages_are_what_the_agent_accepted() [io]
+    // RECORDED.  CREATE_CLIENT for key 0xAABBCCDD and an MTU of 512.
+    //   header     80 00 00 00      session id 0x81 with only the top bit,
+    //                               stream 0, sequence 0
+    //   submessage 00 01 10 00      CREATE_CLIENT, little-endian, length 16
+    //   payload    "XRCE", 01 00 (version 1.0), 01 0F (vendor), AA BB CC DD
+    //              (the key, high byte first), 81 (the session id), 00
+    //              (no properties), 00 02 (512, low byte first)
+    test.case("CREATE_CLIENT")
+    var m: Vec[u8; 512] = Vec.new()
+    test.assert(xrcewire.create_client(var m, 0xAABBCCDD, 512))
+    test.assert_eq(list_of(var m),
+                   [0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10, 0x00, 0x58, 0x52, 0x43, 0x45,
+                    0x01, 0x00, 0x01, 0x0F, 0xAA, 0xBB, 0xCC, 0xDD, 0x81, 0x00, 0x00, 0x02])
+
+    // RECORDED.  The ping: GET_INFO (id 2) for the agent (0xFFFD) with the
+    // mask 3, sent out of session.
+    test.case("the ping")
+    test.assert(xrcewire.ping(var m, 7))
+    test.assert_eq(list_of(var m),
+                   [0x80, 0x00, 0x00, 0x00, 0x02, 0x01, 0x08, 0x00, 0x00, 0x07, 0xFF, 0xFD,
+                    0x03, 0x00, 0x00, 0x00])
+
+    // DERIVED.  DELETE (id 3) of the client object 0xFFFE, request 2:
+    // header 81 00 00 00, submessage 03 01 04 00, payload 00 02 FF FE.
+    test.case("DELETE of the client")
+    test.assert(xrcewire.delete_client(var m, 2))
+    test.assert_eq(list_of(var m),
+                   [0x81, 0x00, 0x00, 0x00, 0x03, 0x01, 0x04, 0x00, 0x00, 0x02, 0xFF, 0xFE])
+
+    // DERIVED.  CREATE of a topic, XML "AB", on stream 1 at sequence 1,
+    // request 2, object 0x0012 (id 1, kind 2), parent 0x0011, with the
+    // replace flag.
+    //   header     81 01 01 00
+    //   submessage 01 05 11 00     CREATE, flags 01 | 04, length 17:
+    //                              4 (ids) + 1 (kind) + 1 (format) + 2
+    //                              (padding) + 4 (string length) + 3 ("AB"
+    //                              and its zero) + 2 (parent) = 17
+    //   payload    00 02 00 12 | 02 02 00 00 | 03 00 00 00 | 41 42 00 | 00 11
+    test.case("CREATE of a topic")
+    test.assert(xrcewire.create_entity(var m, 1, 1, 2, xrcewire.object_id(1, 2),
+                                       xrcewire.XRCE_KIND_TOPIC, xrcewire.object_id(1, 1),
+                                       "AB", xrcewire.XRCE_CREATE_REPLACE))
+    test.assert_eq(list_of(var m),
+                   [0x81, 0x01, 0x01, 0x00, 0x01, 0x05, 0x11, 0x00, 0x00, 0x02, 0x00, 0x12,
+                    0x02, 0x02, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x41, 0x42, 0x00, 0x00,
+                    0x11])
+
+    // DERIVED.  A participant carries its domain id after the string, at
+    // an even offset.  "AB" and its zero end the payload at 15, so one
+    // byte of padding follows and the domain id 0x0005 sits at 16..17:
+    // length 18 = 0x12.
+    test.case("CREATE of a participant pads to the domain id")
+    test.assert(xrcewire.create_entity(var m, 1, 0, 1, xrcewire.object_id(1, 1),
+                                       xrcewire.XRCE_KIND_PARTICIPANT, 5, "AB", 0))
+    test.assert_eq(list_of(var m),
+                   [0x81, 0x01, 0x00, 0x00, 0x01, 0x01, 0x12, 0x00, 0x00, 0x01, 0x00, 0x11,
+                    0x01, 0x02, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x41, 0x42, 0x00, 0x00,
+                    0x05, 0x00])
+
+    test.case("and an even string needs no padding")
+    test.assert(xrcewire.create_entity(var m, 1, 0, 1, xrcewire.object_id(1, 1),
+                                       xrcewire.XRCE_KIND_PARTICIPANT, 0, "A", 0))
+    test.assert_eq(m.len(), 8 + 4 + 1 + 1 + 2 + 4 + 2 + 2)
+
+    // DERIVED.  WRITE_DATA to writer 0x0015, request 3, stream 1 at
+    // sequence 5, the sample 04 03 02 01 (the integer 0x01020304):
+    // header 81 01 05 00, submessage 07 01 08 00 (length 4 + 4), payload
+    // 00 03 00 15 then the sample.
+    test.case("WRITE_DATA of an integer")
+    test.assert(xrcewire.begin_write_data(var m, 1, 5, 3, 0x15))
+    test.assert(xrcewire.put_sample_i32(var m, 0x01020304))
+    test.assert_eq(xrcewire.finish_write_data(var m), 8)
+    test.assert_eq(list_of(var m),
+                   [0x81, 0x01, 0x05, 0x00, 0x07, 0x01, 0x08, 0x00, 0x00, 0x03, 0x00, 0x15,
+                    0x04, 0x03, 0x02, 0x01])
+
+    // A number after a byte starts at a multiple of four from the start
+    // of the sample, which is byte 12 of the message.
+    test.case("a four-byte number aligns to the start of the sample")
+    test.assert(xrcewire.begin_write_data(var m, 1, 0, 1, 0x15))
+    test.assert(xrcewire.put_sample_byte(var m, 7))
+    test.assert(xrcewire.put_sample_i32(var m, 0x01020304))
+    test.assert_eq(xrcewire.finish_write_data(var m), 12)
+    test.assert_eq(m.len() - xrcewire.XRCE_SAMPLE_START, 8)
+    test.assert_eq(m[xrcewire.XRCE_SAMPLE_START] as Int, 7)
+    test.assert_eq(m[xrcewire.XRCE_SAMPLE_START + 4] as Int, 4)
+
+    test.case("an object id is twelve bits of number and four of kind")
+    test.assert_eq(xrcewire.object_id(1, xrcewire.XRCE_KIND_DATAWRITER), 0x15)
+    test.assert_eq(xrcewire.object_id(0x1FFF, 3), 0xFFF3)
+
+@test
+fn test_a_message_that_does_not_fit_is_refused_whole() [io]
+    var m: Vec[u8; 512] = Vec.new()
+    test.case("a string longer than the buffer")
+    test.assert(not xrcewire.create_entity(var m, 1, 0, 1, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                           0x11, letters(600), 0))
+    test.assert_eq(m.len(), 0)
+
+    test.case("a sample that runs out of room")
+    test.assert(xrcewire.begin_write_data(var m, 1, 0, 1, 0x15))
+    for _i in 0..500
+        let _ = xrcewire.put_sample_byte(var m, 1)
+    test.assert(not xrcewire.put_sample_byte(var m, 1))
+    test.assert_eq(m.len(), 512)
+
+@test
+fn test_the_replies_are_read_where_the_agent_put_them() [io]
+    // RECORDED.  The agent's STATUS_AGENT for a session it accepted.
+    test.case("STATUS_AGENT, OK")
+    var a = vec_of(status_agent_message(0))
+    let r = xrcewire.read_reply(var a)
+    test.assert_eq(r.kind, xrcewire.XRCE_REPLY_STATUS_AGENT)
+    test.assert_eq(r.status, xrcewire.XRCE_STATUS_OK)
+
+    // The request id and the object id are two bytes each, high byte
+    // first; the agent echoes the request id as received.
+    test.case("STATUS for a request")
+    var s = vec_of(status_message(0x0107, 0x0015, 0x84))
+    let t = xrcewire.read_reply(var s)
+    test.assert_eq(t.kind, xrcewire.XRCE_REPLY_STATUS)
+    test.assert_eq(t.request, 0x0107)
+    test.assert_eq(t.object, 0x0015)
+    test.assert_eq(t.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+    test.assert_eq(t.implementation, 0)
+
+    test.case("INFO")
+    var i = vec_of(info_message())
+    test.assert_eq(xrcewire.read_reply(var i).kind, xrcewire.XRCE_REPLY_INFO)
+
+    // A HEARTBEAT (id 11, length 8) before the status is stepped over:
+    // header 81 01 00 00, 0B 01 08 00 and eight bytes, which ends at
+    // offset 16, a multiple of four, where the STATUS begins.
+    test.case("a submessage before the status is skipped")
+    var h = vec_of([0x81, 0x01, 0x00, 0x00, 0x0B, 0x01, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x05, 0x01, 0x06, 0x00, 0x00, 0x01, 0x00, 0x11, 0x01, 0x00])
+    test.assert_eq(xrcewire.read_reply(var h).status, 1)
+
+    test.case("a header with a client key is eight bytes")
+    var k = vec_of([0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD,
+                    0x05, 0x01, 0x06, 0x00, 0x00, 0x01, 0x00, 0x11, 0x83, 0x00])
+    let q = xrcewire.read_reply(var k)
+    test.assert_eq(q.kind, xrcewire.XRCE_REPLY_STATUS)
+    test.assert_eq(q.status, xrcewire.XRCE_STATUS_ERR_DENIED)
+
+    test.case("an empty message, a cut one and one with no status say none")
+    var e: Vec[u8; 512] = Vec.new()
+    test.assert_eq(xrcewire.read_reply(var e).kind, xrcewire.XRCE_REPLY_NONE)
+    var cut = vec_of([0x81, 0x01, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, 0x00, 0x01])
+    test.assert_eq(xrcewire.read_reply(var cut).kind, xrcewire.XRCE_REPLY_NONE)
+    var cut_agent = vec_of([0x81, 0x00, 0x00, 0x00, 0x04, 0x01, 0x0B, 0x00, 0x00])
+    test.assert_eq(xrcewire.read_reply(var cut_agent).kind, xrcewire.XRCE_REPLY_NONE)
+    var only_hb = vec_of([0x81, 0x01, 0x00, 0x00, 0x0B, 0x01, 0x08, 0x00, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(xrcewire.read_reply(var only_hb).kind, xrcewire.XRCE_REPLY_NONE)
+
+@test
+fn test_every_status_has_a_word_and_two_are_success() [io]
+    let all = [xrcewire.XRCE_STATUS_OK, xrcewire.XRCE_STATUS_OK_MATCHED,
+               xrcewire.XRCE_STATUS_ERR_DDS_ERROR, xrcewire.XRCE_STATUS_ERR_MISMATCH,
+               xrcewire.XRCE_STATUS_ERR_ALREADY_EXISTS, xrcewire.XRCE_STATUS_ERR_DENIED,
+               xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE, xrcewire.XRCE_STATUS_ERR_INVALID_DATA,
+               xrcewire.XRCE_STATUS_ERR_INCOMPATIBLE, xrcewire.XRCE_STATUS_ERR_RESOURCES]
+    for st in all
+        test.assert_ne(xrcewire.status_name(st), "unknown")
+    test.assert_eq(xrcewire.status_name(0x55), "unknown")
+
+    test.case("only OK and matched are success")
+    var successes = 0
+    for st in all
+        if xrcewire.status_is_ok(st)
+            successes = successes + 1
+    test.assert_eq(successes, 2)
+
+// ── rostransport: the session over a scripted pipe ───────────────────
+
+// A pipe that answers the same bytes to every receive.
+struct ClientPipe
+    reply: Bytes
+    answers: Bool
+    takes: Bool
+
+impl RosTransport[] for ClientPipe
+    fn ros_send(self, frame: Bytes) -> Bool
+        self.takes
+
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes
+        if self.answers
+            Some(bytes.clone(self.reply))
+        else
+            None
+
+    fn ros_is_open(self) -> Bool
+        self.takes
+
+    fn ros_close(self)
+        ()
+
+    fn ros_mtu(self) -> Int
+        512
+
+fn agent_says(xs: [Int]) -> ClientPipe
+    ClientPipe { reply: wire_of(xs), answers: true, takes: true }
+
+fn agent_silent() -> ClientPipe
+    ClientPipe { reply: bytes.zeros(0), answers: false, takes: true }
+
+fn cable_unplugged() -> ClientPipe
+    ClientPipe { reply: bytes.zeros(0), answers: false, takes: false }
+
+@test
+fn test_a_session_opens_only_on_an_ok_status_agent() [io]
+    let s = rostransport.session(0xAABBCCDD, 512)
+
+    test.case("the recorded STATUS_AGENT opens it")
+    let up = rostransport.open_session(agent_says(status_agent_message(0)), s, 100)
+    test.assert(rostransport.session_is_ready(up))
+    test.assert_eq(up.session_id, xrcewire.XRCE_SESSION_ID)
+
+    test.case("a refusal does not")
+    test.assert(not rostransport.session_is_ready(
+        rostransport.open_session(agent_says(status_agent_message(0x83)), s, 100)))
+
+    test.case("nor does an answer that is not a STATUS_AGENT")
+    test.assert(not rostransport.session_is_ready(
+        rostransport.open_session(agent_says(status_message(1, 0x11, 0)), s, 100)))
+
+    test.case("nor silence, nor a cable that takes nothing")
+    test.assert(not rostransport.session_is_ready(
+        rostransport.open_session(agent_silent(), s, 100)))
+    test.assert(not rostransport.session_is_ready(
+        rostransport.open_session(cable_unplugged(), s, 100)))
+
+    test.case("an MTU below 512 is what is advertised")
+    let small = rostransport.session(1, 256)
+    test.assert(rostransport.session_is_ready(
+        rostransport.open_session(agent_says(status_agent_message(0)), small, 100)))
+
+@test
+fn test_creating_an_entity_reports_what_went_wrong_in_a_code() [io]
+    let s = an_open_session()
+    let markup = "<dds><topic><name>t</name><dataType>T</dataType></topic></dds>"
+
+    // The first request of a session is 1; the agent echoes it.
+    test.case("an OK status for request 1")
+    let ok = rostransport.create_entity(agent_says(status_message(1, 0x12, 0)), s, 0x12,
+                                        xrcewire.XRCE_KIND_TOPIC, 0x11, markup, 100)
+    test.assert_eq(ok.code, rosret.ROS_RET_OK)
+    test.assert_eq(ok.status, 0)
+    test.assert_eq(ok.session.next_request, 2)
+    test.assert_eq(ok.session.output_seq, 1)
+
+    test.case("matched an entity already there is success too")
+    let matched = rostransport.create_entity(agent_says(status_message(1, 0x12, 1)), s, 0x12,
+                                             xrcewire.XRCE_KIND_TOPIC, 0x11, markup, 100)
+    test.assert_eq(matched.code, rosret.ROS_RET_OK)
+    test.assert_eq(matched.status, 1)
+
+    test.case("a refusal carries the agent's number")
+    let denied = rostransport.create_entity(agent_says(status_message(1, 0x12, 0x84)), s, 0x12,
+                                            xrcewire.XRCE_KIND_TOPIC, 0x11, markup, 100)
+    test.assert_eq(denied.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(denied.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+
+    test.case("a status for another request is not the answer")
+    let stray = rostransport.create_entity(agent_says(status_message(9, 0x12, 0)), s, 0x12,
+                                           xrcewire.XRCE_KIND_TOPIC, 0x11, markup, 100)
+    test.assert_eq(stray.code, rosret.ROS_RET_TIMEOUT)
+
+    test.case("and neither is a message with no status in it")
+    let wrong_kind = rostransport.create_entity(agent_says(info_message()), s, 0x12,
+                                                xrcewire.XRCE_KIND_TOPIC, 0x11, markup, 100)
+    test.assert_eq(wrong_kind.code, rosret.ROS_RET_TIMEOUT)
+
+    test.case("silence is a timeout, a dead cable is an unreachable agent")
+    test.assert_eq(rostransport.create_entity(agent_silent(), s, 0x12,
+                                              xrcewire.XRCE_KIND_TOPIC, 0x11, markup, 100).code,
+                   rosret.ROS_RET_TIMEOUT)
+    test.assert_eq(rostransport.create_entity(cable_unplugged(), s, 0x12,
+                                              xrcewire.XRCE_KIND_TOPIC, 0x11, markup, 100).code,
+                   rosret.ROS_RET_AGENT_UNREACHABLE)
+
+    test.case("a description that does not fit the buffer")
+    test.assert_eq(rostransport.create_entity(agent_silent(), s, 0x12,
+                                              xrcewire.XRCE_KIND_TOPIC, 0x11, letters(600),
+                                              100).code,
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+
+    test.case("and a session that was never opened")
+    test.assert_eq(rostransport.create_entity(agent_silent(), rostransport.session(1, 512),
+                                              0x12, xrcewire.XRCE_KIND_TOPIC, 0x11, markup,
+                                              100).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_writing_a_sample_reports_what_the_pipe_did() [io]
+    let s = an_open_session()
+    let four = bytes.u32_le(7)
+
+    test.case("a sample the pipe took")
+    let sent = rostransport.write_sample(agent_silent(), s, 0x15, four)
+    test.assert_eq(sent.code, rosret.ROS_RET_OK)
+    test.assert_eq(sent.session.output_seq, 1)
+    test.assert_eq(sent.session.next_request, 2)
+
+    test.case("a cable that takes nothing")
+    test.assert_eq(rostransport.write_sample(cable_unplugged(), s, 0x15, four).code,
+                   rosret.ROS_RET_AGENT_UNREACHABLE)
+
+    test.case("a sample larger than the buffer")
+    test.assert_eq(rostransport.write_sample(agent_silent(), s, 0x15, bytes.zeros(600)).code,
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+
+    test.case("a session that was never opened")
+    test.assert_eq(rostransport.write_sample(agent_silent(), rostransport.session(1, 512),
+                                             0x15, four).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_the_heartbeat_is_a_ping_and_the_answer_is_an_info() [io]
+    let s = an_open_session()
+
+    test.case("an INFO clears the silence and takes a request id")
+    let heard = rostransport.heartbeat(agent_says(info_message()), s, 200)
+    test.assert_eq(heard.silent_ms, 0)
+    test.assert_eq(heard.next_request, 2)
+
+    test.case("anything else leaves the silence standing")
+    test.assert_eq(rostransport.heartbeat(agent_says(status_agent_message(0)), s, 200).silent_ms,
+                   200)
+
+    test.case("closing sends the delete and closes whatever the pipe says")
+    test.assert_eq(rostransport.close_session(cable_unplugged(), s).state,
+                   rostransport.ROS_SESSION_CLOSED)
+
+// ── rosuart: the device functions over a fake UART ───────────────────
+
+// The fake UART's state.  A module-level variable each, because the
+// trait's methods take `self` by value and a test needs them to remember;
+// the buffers are fixed-capacity because the functions under test are
+// `@no_alloc` and the checker follows them into the UART they call.
+var g_inbox: Vec[u8; 1100]  = Vec.new()
+var g_cursor                = 0
+var g_outbox: Vec[u8; 1100] = Vec.new()
+// How many offers the transmitter refuses before it takes a byte; -1
+// refuses for ever.
+var g_refusals = 0
+var g_pauses   = 0
+
+struct FakeUart
+    id: Int
+
+impl XrceUart[mutate] for FakeUart
+    fn uart_put(self, byte: Int) -> Bool [mutate]
+        if g_refusals < 0
+            return false
+        if g_refusals > 0
+            g_refusals = g_refusals - 1
+            return false
+        match g_outbox.push(byte as u8)
+            Ok(_)  => true
+            Err(_) => false
+
+    fn uart_get(self) -> Int [mutate]
+        if g_cursor < g_inbox.len()
+            g_cursor = g_cursor + 1
+            return g_inbox[g_cursor - 1] as Int
+        0 - 1
+
+    fn uart_pause_ms(self, ms: Int) [mutate]
+        g_pauses = g_pauses + ms
+
+// Put bytes on the line for the device to read.
+fn load_inbox(xs: [Int]) [mutate]
+    g_inbox.clear()
+    g_cursor = 0
+    for x in xs
+        let _ = g_inbox.push(x as u8)
+
+// Start a test with an empty line.
+fn clear_line() [mutate]
+    g_inbox.clear()
+    g_cursor = 0
+    g_outbox.clear()
+    g_refusals = 0
+    g_pauses = 0
+
+// What the device has put on the line, as a list.
+fn on_the_line() -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for b in g_outbox
+        let wide = b as Int
+        out = list.push(out, wide)
+    out
+
+// The frame an agent sends: source address 0, remote address 1 (the
+// client), the payload and its CRC.
+fn agent_frame(payload: [Int]) -> [Int]
+    var p = vec_of(payload)
+    var f: Vec[u8; 1037] = Vec.new()
+    let _ = xrceframe.encode(var f, var p, xrceframe.XRCE_ADDR_AGENT,
+                             xrceframe.XRCE_ADDR_CLIENT)
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for b in f
+        let wide = b as Int
+        out = list.push(out, wide)
+    out
+
+// Put the agent's reply on the line.
+fn agent_replies(payload: [Int]) [mutate]
+    load_inbox(agent_frame(payload))
+
+// The message the device sent last, taken out of the frame on the
+// line: what an agent would have read.
+fn sent_payload() -> [Int]
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var r = xrceframe.XRCE_PUSH_NONE
+    for b in g_outbox
+        r = xrceframe.push_byte(var d, b as Int)
+    var out: [Int] = []
+    if r == xrceframe.XRCE_PUSH_FRAME
+        // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+        for x in d.payload
+            let wide = x as Int
+            out = list.push(out, wide)
+    out
+
+@test
+fn test_a_frame_goes_out_a_byte_at_a_time_and_waits_for_a_busy_transmitter() [io, mutate]
+    clear_line()
+    let u = FakeUart { id: 1 }
+    var m = vec_of([0x41, 0x7E, 0x42])
+    var f: Vec[u8; 1037] = Vec.new()
+
+    test.case("the frame on the line is the framed message")
+    test.assert(rosuart.send(u, var m, var f))
+    // Derived: the CRC of 41 7E 42 is 0x85F1, sent F1 85; the 7E in the
+    // payload is stuffed to 7D 5E.
+    test.assert_eq(on_the_line(), [0x7E, 0x01, 0x00, 0x03, 0x00, 0x41, 0x7D, 0x5E, 0x42, 0xF1, 0x85])
+    test.assert_eq(sent_payload(), [0x41, 0x7E, 0x42])
+
+    test.case("a transmitter busy for three offers is offered the byte again")
+    clear_line()
+    g_refusals = 3
+    test.assert(rosuart.send(u, var m, var f))
+    test.assert_eq(sent_payload(), [0x41, 0x7E, 0x42])
+
+    test.case("one that never takes a byte stops the send")
+    clear_line()
+    g_refusals = 0 - 1
+    test.assert(not rosuart.send(u, var m, var f))
+    test.assert_eq(on_the_line(), [])
+
+@test
+fn test_a_reply_is_read_from_the_line_across_calls() [io, mutate]
+    clear_line()
+    let u = FakeUart { id: 1 }
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    let reply = status_agent_message(0)
+    let wire = agent_frame(reply)
+
+    test.case("nothing on the line, the wait is spent in milliseconds")
+    test.assert_eq(rosuart.receive(u, var d, var m, 5), xrceframe.XRCE_PUSH_NONE)
+    test.assert_eq(g_pauses, 5)
+
+    test.case("a timeout of zero takes what is there and does not wait")
+    g_pauses = 0
+    test.assert_eq(rosuart.receive(u, var d, var m, 0), xrceframe.XRCE_PUSH_NONE)
+    test.assert_eq(g_pauses, 0)
+
+    test.case("half a frame now, the rest on the next call")
+    load_inbox([wire[0], wire[1], wire[2], wire[3], wire[4], wire[5]])
+    test.assert_eq(rosuart.receive(u, var d, var m, 0), xrceframe.XRCE_PUSH_NONE)
+    load_inbox(list.drop(wire, 6))
+    test.assert_eq(rosuart.receive(u, var d, var m, 0), xrceframe.XRCE_PUSH_FRAME)
+    test.assert_eq(list_of(var m), reply)
+
+    test.case("a damaged frame is reported and not delivered")
+    var broken = agent_frame(reply)
+    broken[list.len(broken) - 1] = 0x00
+    load_inbox(broken)
+    test.assert_eq(rosuart.receive(u, var d, var m, 0), xrceframe.XRCE_PUSH_BAD_CRC)
+
+@test
+fn test_a_session_opens_over_the_uart() [io, mutate]
+    let s = rostransport.session(0xAABBCCDD, 512)
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    let u = FakeUart { id: 1 }
+
+    test.case("the agent answers OK")
+    clear_line()
+    agent_replies(status_agent_message(0))
+    let up = rosuart.open(u, var d, var m, var f, s, 10)
+    test.assert(rostransport.session_is_ready(up))
+    // What went out is the recorded CREATE_CLIENT.
+    test.assert_eq(sent_payload(),
+                   [0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10, 0x00, 0x58, 0x52, 0x43, 0x45,
+                    0x01, 0x00, 0x01, 0x0F, 0xAA, 0xBB, 0xCC, 0xDD, 0x81, 0x00, 0x00, 0x02])
+
+    test.case("the agent refuses")
+    clear_line()
+    agent_replies(status_agent_message(0x83))
+    test.assert(not rostransport.session_is_ready(rosuart.open(u, var d, var m, var f, s, 10)))
+
+    test.case("the agent is not there")
+    clear_line()
+    test.assert(not rostransport.session_is_ready(rosuart.open(u, var d, var m, var f, s, 10)))
+
+    test.case("the transmitter takes nothing")
+    clear_line()
+    g_refusals = 0 - 1
+    test.assert(not rostransport.session_is_ready(rosuart.open(u, var d, var m, var f, s, 10)))
+
+    test.case("a smaller MTU is advertised as it is")
+    clear_line()
+    agent_replies(status_agent_message(0))
+    test.assert(rostransport.session_is_ready(
+        rosuart.open(u, var d, var m, var f, rostransport.session(1, 256), 10)))
+
+@test
+fn test_creating_over_the_uart_reports_in_codes() [io, mutate]
+    let s = an_open_session()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    let u = FakeUart { id: 1 }
+    let markup = "<dds><topic><name>t</name><dataType>T</dataType></topic></dds>"
+
+    test.case("an OK for request 1, and the message that went out")
+    clear_line()
+    agent_replies(status_message(1, 0x12, 0))
+    let ok = rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC, 0x11,
+                            markup, 10)
+    test.assert_eq(ok.code, rosret.ROS_RET_OK)
+    test.assert_eq(ok.session.next_request, 2)
+    var sent = vec_of(sent_payload())
+    test.assert_eq(sent[4] as Int, xrcewire.XRCE_SUB_CREATE)
+    test.assert_eq(sent[0] as Int, xrcewire.XRCE_SESSION_ID)
+
+    test.case("a refusal")
+    clear_line()
+    agent_replies(status_message(1, 0x12, 0x85))
+    let refused = rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                 0x11, markup, 10)
+    test.assert_eq(refused.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(refused.status, xrcewire.XRCE_STATUS_ERR_INVALID_DATA)
+
+    test.case("a status for another request, and a message without one")
+    clear_line()
+    agent_replies(status_message(4, 0x12, 0))
+    test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                  0x11, markup, 10).code,
+                                  rosret.ROS_RET_TIMEOUT)
+    clear_line()
+    agent_replies(info_message())
+    test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                  0x11, markup, 10).code,
+                                  rosret.ROS_RET_TIMEOUT)
+
+    test.case("nobody answers")
+    clear_line()
+    test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                  0x11, markup, 10).code,
+                                  rosret.ROS_RET_TIMEOUT)
+
+    test.case("the transmitter takes nothing")
+    clear_line()
+    g_refusals = 0 - 1
+    test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                  0x11, markup, 10).code,
+                                  rosret.ROS_RET_AGENT_UNREACHABLE)
+
+    test.case("a description that does not fit")
+    clear_line()
+    test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                  0x11, letters(600), 10).code,
+                                  rosret.ROS_RET_INVALID_ARGUMENT)
+
+    test.case("a session never opened")
+    clear_line()
+    test.assert_eq(rosuart.create(u, var d, var m, var f, rostransport.session(1, 512), 0x12,
+                                  xrcewire.XRCE_KIND_TOPIC, 0x11, markup, 10).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_publishing_an_integer_over_the_uart() [io, mutate]
+    let s = an_open_session()
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    let u = FakeUart { id: 1 }
+
+    // The message on the line is the derived WRITE_DATA: stream 1, the
+    // sequence number 0, request 1, writer 0x15 and the four bytes of 258
+    // (0x0102), low byte first.
+    test.case("the sample on the line")
+    clear_line()
+    let sent = rosuart.publish_i32(u, var m, var f, s, 0x15, 258)
+    test.assert_eq(sent.code, rosret.ROS_RET_OK)
+    test.assert_eq(sent.session.output_seq, 1)
+    test.assert_eq(sent_payload(),
+                   [0x81, 0x01, 0x00, 0x00, 0x07, 0x01, 0x08, 0x00, 0x00, 0x01, 0x00, 0x15,
+                    0x02, 0x01, 0x00, 0x00])
+
+    test.case("a negative number is its two's complement")
+    clear_line()
+    let _neg = rosuart.publish_i32(u, var m, var f, s, 0x15, 0 - 1)
+    let wire = sent_payload()
+    test.assert_eq(wire[12], 0xFF)
+    test.assert_eq(wire[15], 0xFF)
+
+    test.case("a transmitter that takes nothing")
+    clear_line()
+    g_refusals = 0 - 1
+    test.assert_eq(rosuart.publish_i32(u, var m, var f, s, 0x15, 1).code,
+                   rosret.ROS_RET_AGENT_UNREACHABLE)
+
+    test.case("a session never opened")
+    test.assert_eq(rosuart.publish_i32(u, var m, var f, rostransport.session(1, 512), 0x15,
+                                       1).code,
+                                       rosret.ROS_RET_NOT_INIT)
+
+    test.case("the board's own UART is named and not driven here")
+    let board = rosuart.console_uart()
+    test.assert_eq(board.unused, 0)
+
+@test
+fn test_the_device_heartbeat_pings_and_notices_an_agent_that_went() [io, mutate]
+    let up = an_open_session()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    let u = FakeUart { id: 1 }
+
+    test.case("an INFO clears the silence, and the ping on the line is the recorded one")
+    clear_line()
+    agent_replies(info_message())
+    let heard = rosuart.heartbeat(u, var d, var m, var f, up, 200, 10)
+    test.assert_eq(heard.silent_ms, 0)
+    test.assert_eq(heard.next_request, 2)
+    test.assert_eq(sent_payload(),
+                   [0x80, 0x00, 0x00, 0x00, 0x02, 0x01, 0x08, 0x00, 0x00, 0x01, 0xFF, 0xFD,
+                    0x03, 0x00, 0x00, 0x00])
+
+    test.case("anything else, or nothing, leaves the silence standing")
+    clear_line()
+    agent_replies(status_agent_message(0))
+    test.assert_eq(rosuart.heartbeat(u, var d, var m, var f, up, 200, 10).silent_ms, 200)
+    clear_line()
+    test.assert_eq(rosuart.heartbeat(u, var d, var m, var f, up, 200, 10).silent_ms, 200)
+
+    test.case("a transmitter that takes nothing")
+    clear_line()
+    g_refusals = 0 - 1
+    test.assert_eq(rosuart.heartbeat(u, var d, var m, var f, up, 200, 10).silent_ms, 200)
+
+    test.case("a silence shorter than the interval sends nothing")
+    clear_line()
+    test.assert_eq(rosuart.heartbeat(u, var d, var m, var f, up, 50, 10).silent_ms, 50)
+    test.assert_eq(on_the_line(), [])
+
+    test.case("an agent silent past the timeout is gone")
+    test.assert_eq(rosuart.heartbeat(u, var d, var m, var f, up, 1500, 10).state,
+                   rostransport.ROS_SESSION_LOST)
+
+    test.case("a session never opened is left alone")
+    test.assert_eq(rosuart.heartbeat(u, var d, var m, var f, rostransport.session(1, 512), 1500,
+                                     10).state,
+                                     rostransport.ROS_SESSION_CLOSED)
+
+@test
+fn test_a_session_can_be_closed_without_a_pipe() [io]
+    // Only the state changes; the counters, the key and the silence stay.
+    let up = an_open_session()
+    let down = rostransport.session_with_state(up, rostransport.ROS_SESSION_LOST)
+    test.assert_eq(down.state, rostransport.ROS_SESSION_LOST)
+    test.assert_eq(down.client_key, up.client_key)
+    test.assert_eq(down.next_request, up.next_request)
+    test.assert_eq(down.session_id, up.session_id)

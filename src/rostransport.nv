@@ -33,8 +33,10 @@
 // the heartbeat, which is why `RosSession` carries one and why
 // `session_is_stale` exists.
 
+use std.list
 use rosmsg
 use rosret
+use xrcewire
 
 // ── Stream kinds ─────────────────────────────────────────────────────
 
@@ -65,7 +67,8 @@ pub const ROS_STREAM_RELIABLE = 2
 //     println("${rostransport.stream_for(rosqos.ROS_RELIABILITY_BEST_EFFORT)}")
 //     // 1, a best-effort stream
 // ```
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn stream_for(reliability: Int) -> Int []
     // 2 is `rosqos.ROS_RELIABILITY_BEST_EFFORT`; a reliable setting
     // (1) and the middleware's own default (0) both take a reliable
@@ -76,7 +79,8 @@ fn stream_for(reliability: Int) -> Int []
         ROS_STREAM_RELIABLE
 
 // The stream kind in words.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn stream_name(kind: Int) -> Str []
     match kind
         0 => "none"   // ROS_STREAM_NONE
@@ -139,66 +143,68 @@ struct RosSession
 // fn main() [io]
 //     println("${rostransport.session(0xaabbccdd, 512).state}")   // 0
 // ```
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session(client_key: Int, mtu: Int) -> RosSession []
-    system
-        // Every counter starts at zero and the session is closed until
-        // an agent has answered.  The first request identifier is 1,
-        // because 0 is what an XRCE header carries when there is no
-        // request.
-        return RosSession {
-            state: ROS_SESSION_CLOSED,
-            client_key: client_key,
-            session_id: 0,
-            next_request: 1,
-            output_seq: 0,
-            input_seq: 0,
-            mtu: mtu,
-            silent_ms: 0 }
+    // Every counter starts at zero and the session is closed until
+    // an agent has answered.  The first request identifier is 1,
+    // because 0 is what an XRCE header carries when there is no
+    // request.
+    RosSession {
+        state: ROS_SESSION_CLOSED,
+        client_key: client_key,
+        session_id: 0,
+        next_request: 1,
+        output_seq: 0,
+        input_seq: 0,
+        mtu: mtu,
+        silent_ms: 0 }
 
 // Whether the session may carry messages.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session_is_ready(s: RosSession) -> Bool []
     s.state == ROS_SESSION_ESTABLISHED
 
 // The session with `delta_ms` more milliseconds of silence.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session_silent(s: RosSession, delta_ms: Int) -> RosSession []
-    system
-        // The caller owns the clock; this only accumulates what it is
-        // told.
-        return RosSession {
-            state: s.state,
-            client_key: s.client_key,
-            session_id: s.session_id,
-            next_request: s.next_request,
-            output_seq: s.output_seq,
-            input_seq: s.input_seq,
-            mtu: s.mtu,
-            silent_ms: s.silent_ms + delta_ms }
+    // The caller owns the clock; this only accumulates what it is
+    // told.
+    RosSession {
+        state: s.state,
+        client_key: s.client_key,
+        session_id: s.session_id,
+        next_request: s.next_request,
+        output_seq: s.output_seq,
+        input_seq: s.input_seq,
+        mtu: s.mtu,
+        silent_ms: s.silent_ms + delta_ms }
 
 // The session with the silence cleared, because the agent answered.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session_heard(s: RosSession) -> RosSession []
-    system
-        // An answer from the agent is the only thing that clears the
-        // silence.
-        return RosSession {
-            state: s.state,
-            client_key: s.client_key,
-            session_id: s.session_id,
-            next_request: s.next_request,
-            output_seq: s.output_seq,
-            input_seq: s.input_seq,
-            mtu: s.mtu,
-            silent_ms: 0 }
+    // An answer from the agent is the only thing that clears the
+    // silence.
+    RosSession {
+        state: s.state,
+        client_key: s.client_key,
+        session_id: s.session_id,
+        next_request: s.next_request,
+        output_seq: s.output_seq,
+        input_seq: s.input_seq,
+        mtu: s.mtu,
+        silent_ms: 0 }
 
 // Whether the agent has been silent longer than it should be.
 //
 // The one thing that notices an agent restart.  Until this answers
 // true, every write succeeds locally and arrives nowhere, because the
 // client still believes in entities the new agent has never heard of.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session_is_stale(s: RosSession, timeout_ms: Int) -> Bool []
     // Strictly longer: a silence exactly at the timeout has not yet
     // outlasted it.
@@ -213,59 +219,60 @@ pub const ROS_HEARTBEAT_MS = 100
 pub const ROS_SESSION_TIMEOUT_MS = 1000
 
 // The session after the agent acknowledged it.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session_established(s: RosSession, session_id: Int) -> RosSession []
-    system
-        // The agent answered, so the silence is cleared as well as the
-        // state changed.
-        return RosSession {
-            state: ROS_SESSION_ESTABLISHED,
-            client_key: s.client_key,
-            session_id: session_id,
-            next_request: s.next_request,
-            output_seq: s.output_seq,
-            input_seq: s.input_seq,
-            mtu: s.mtu,
-            silent_ms: 0 }
+    // The agent answered, so the silence is cleared as well as the
+    // state changed.
+    RosSession {
+        state: ROS_SESSION_ESTABLISHED,
+        client_key: s.client_key,
+        session_id: session_id,
+        next_request: s.next_request,
+        output_seq: s.output_seq,
+        input_seq: s.input_seq,
+        mtu: s.mtu,
+        silent_ms: 0 }
 
 // The session with its next request identifier taken.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session_next_request(s: RosSession) -> RosSession []
-    system
-        // Taken before it is used: a request carries this field's
-        // value, and the request after it carries the next one.
-        return RosSession {
-            state: s.state,
-            client_key: s.client_key,
-            session_id: s.session_id,
-            next_request: s.next_request + 1,
-            output_seq: s.output_seq,
-            input_seq: s.input_seq,
-            mtu: s.mtu,
-            silent_ms: s.silent_ms }
+    // Taken before it is used: a request carries this field's
+    // value, and the request after it carries the next one.
+    RosSession {
+        state: s.state,
+        client_key: s.client_key,
+        session_id: s.session_id,
+        next_request: s.next_request + 1,
+        output_seq: s.output_seq,
+        input_seq: s.input_seq,
+        mtu: s.mtu,
+        silent_ms: s.silent_ms }
 
 // The session after one message went out on the reliable stream.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session_wrote(s: RosSession) -> RosSession []
-    system
-        // Sixteen bits and wrap, which is the space a reliable stream's
-        // sequence numbers live in.
-        return RosSession {
-            state: s.state,
-            client_key: s.client_key,
-            session_id: s.session_id,
-            next_request: s.next_request,
-            output_seq: (s.output_seq + 1) % 65536,
-            input_seq: s.input_seq,
-            mtu: s.mtu,
-            silent_ms: s.silent_ms }
+    // Sixteen bits and wrap, which is the space a reliable stream's
+    // sequence numbers live in.
+    RosSession {
+        state: s.state,
+        client_key: s.client_key,
+        session_id: s.session_id,
+        next_request: s.next_request,
+        output_seq: (s.output_seq + 1) % 65536,
+        input_seq: s.input_seq,
+        mtu: s.mtu,
+        silent_ms: s.silent_ms }
 
 // Whether a sequence number from the agent is the next one expected.
 //
 // A number that is not is either a retransmission, which is dropped, or
 // a gap, which the client acknowledges negatively.  Getting this
 // backwards makes a link that works until the first lost byte.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn sequence_is_next(s: RosSession, seq: Int) -> Bool []
     // The number expected is the last accepted one plus one, sixteen
     // bits and wrap.
@@ -278,7 +285,8 @@ fn sequence_is_next(s: RosSession, seq: Int) -> Bool []
 // a plain comparison rejects every message for half the sequence space
 // once the counter has gone round, about an hour into a run at a
 // hundred messages a second.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn sequence_is_old(s: RosSession, seq: Int) -> Bool []
     // Sixteen bits and wrap: a number is behind the last accepted one
     // when its distance forward from it is less than half the space,
@@ -287,7 +295,8 @@ fn sequence_is_old(s: RosSession, seq: Int) -> Bool []
     ahead < 32768 and ahead != 1
 
 // The session state in words.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn session_state_name(state: Int) -> Str []
     match state
         0 => "closed"   // ROS_SESSION_CLOSED
@@ -304,7 +313,8 @@ fn session_state_name(state: Int) -> Str []
 // the transport's buffer before the payload does.  `kind` is one of
 // `ROS_STREAM_*`: a reliable stream costs two more bytes than a
 // best-effort one, for its sequence number.
-pub @tier(system)
+pub @tier(embedded)
+@no_alloc
 fn framing_overhead(kind: Int) -> Int []
     // The XRCE message header is four bytes and the submessage header
     // two, and a reliable stream adds its two-byte sequence number.
@@ -354,36 +364,77 @@ pub trait RosTransport[e]
     // without performing anything, because a driver asks it once.
     fn ros_mtu(self) -> Int
 
-// The four bytes that identify this client: the key a create request
-// carries, and the whole of what this package can send without a
-// serialiser.
-@tier(system)
-fn client_key_bytes(s: RosSession) -> Bytes
-    system
-        return bytes.u32_le(s.client_key)
+// A session and the code of the last thing done with it.
+//
+// The functions below answer the session as well as a result, because
+// each of them changes the session (a sequence number is used, a
+// request identifier is taken) and a `@value` cannot be changed through
+// a pipe's `self`.
+pub @value
+struct RosOutcome
+    // The session after the call.
+    session: RosSession
+    // One of the `rosret` codes: `ROS_RET_OK`; `ROS_RET_NOT_INIT` for
+    // a session that is not established; `ROS_RET_INVALID_ARGUMENT` for
+    // a message that does not fit; `ROS_RET_AGENT_UNREACHABLE` when the
+    // pipe refused the bytes; `ROS_RET_TIMEOUT` when no status came
+    // back in time; `ROS_RET_ERROR` when the agent answered with a
+    // status that is not OK.
+    code: Int
+    // The agent's status number when it answered, else -1.  See
+    // `xrcewire.status_name`.
+    status: Int
 
-// A session with one field changed, which is the shape a `@value`
-// struct needs: four callers change the state and would otherwise each
-// spell the same eight-field literal.
+// The bytes of a message built in a buffer, as a `Bytes`.
 @tier(system)
-fn session_with_state(s: RosSession, state: Int) -> RosSession
+fn wire_bytes(var m: Vec[u8; 512]) -> Bytes
     system
-        return RosSession {
-            state: state,
-            client_key: s.client_key,
-            session_id: s.session_id,
-            next_request: s.next_request,
-            output_seq: s.output_seq,
-            input_seq: s.input_seq,
-            mtu: s.mtu,
-            silent_ms: s.silent_ms }
+        var xs: [Int] = []
+        // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+        for x in m
+            let wide = x as Int
+            xs = list.push(xs, wide)
+        return bytes.from_byte_list(xs)
+
+// A received `Bytes`, copied into a buffer.  A message longer than the
+// buffer is cut at its end; the reply reader then finds no status.
+@tier(system)
+fn wire_read(var m: Vec[u8; 512], b: Bytes)
+    system
+        m.clear()
+        for i in 0..bytes.len(b)
+            let _ = m.push((bytes.byte_at(b, i) ?? 0) as u8)
+
+// The session with its state replaced and every other field kept.
+//
+// The shape a `@value` struct needs: callers that change the state
+// would otherwise each spell the same eight-field literal.
+pub @tier(embedded)
+@no_alloc
+fn session_with_state(s: RosSession, state: Int) -> RosSession
+    RosSession {
+        state: state,
+        client_key: s.client_key,
+        session_id: s.session_id,
+        next_request: s.next_request,
+        output_seq: s.output_seq,
+        input_seq: s.input_seq,
+        mtu: s.mtu,
+        silent_ms: s.silent_ms }
+
+// An outcome from its three parts.
+@tier(embedded)
+@no_alloc
+fn outcome(s: RosSession, code: Int, status: Int) -> RosOutcome
+    RosOutcome { session: s, code: code, status: status }
 
 // Open a session with the agent.
 //
-// `[e]`, so the cost is the pipe's.  Sends the create request and takes
-// the agent's status; answers the session with its state set to
-// established, or to closed when no status came back within
-// `timeout_ms`.
+// `[e]`, so the cost is the pipe's.  Sends the CREATE_CLIENT message
+// that carries the session's client key, takes the agent's STATUS_AGENT
+// and answers the session with its state set to established, or to
+// closed when no status came back within `timeout_ms`, the pipe
+// refused the bytes, or the agent answered with a status that is not OK.
 //
 // ONE EXCHANGE, NOT A RETRY LOOP.  A node that cannot reach its agent
 // has to decide what to do about it — wait, blink a light, carry on
@@ -392,28 +443,99 @@ fn session_with_state(s: RosSession, state: Int) -> RosSession
 pub @tier(system)
 fn open_session<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> RosSession [e]
     system
-        // One create request and one status, not a retry loop: a node
-        // that cannot reach its agent decides for itself what to do
-        // about it.
-        if not t.ros_send(client_key_bytes(s))
+        // The advertised size is what this side can read back: a reply
+        // longer than the 512-byte buffer is cut.
+        var m: Vec[u8; 512] = Vec.new()
+        let mtu = if s.mtu < 512
+            s.mtu
+        else
+            512
+        let _built = xrcewire.create_client(var m, s.client_key, mtu)
+        if not t.ros_send(wire_bytes(var m))
             return session_with_state(s, ROS_SESSION_CLOSED)
         let status = t.ros_recv(timeout_ms)
         if status == None
             return session_with_state(s, ROS_SESSION_CLOSED)
-        // The session identifier is in the status, which is a
-        // serialiser's to read; what this records is that an agent
-        // answered.
-        return session_established(s, 0)
+        wire_read(var m, status ?? bytes.zeros(0))
+        let reply = xrcewire.read_reply(var m)
+        if reply.kind == xrcewire.XRCE_REPLY_STATUS_AGENT
+            and xrcewire.status_is_ok(reply.status)
+            return session_established(s, xrcewire.XRCE_SESSION_ID)
+        return session_with_state(s, ROS_SESSION_CLOSED)
 
 // Tell the agent the session is over.
 pub @tier(system)
 fn close_session<T: RosTransport[e]>(t: T, s: RosSession) -> RosSession [e]
     system
-        // The delete request carries the same four bytes the create
-        // did.  The client's state is closed whatever the pipe says,
-        // because the decision to end the session is the client's.
-        t.ros_send(client_key_bytes(s))
+        // The delete request carries the session's own identifier.  The
+        // client's state is closed whatever the pipe says, because the
+        // decision to end the session is the client's.
+        var m: Vec[u8; 512] = Vec.new()
+        let _built = xrcewire.delete_client(var m, s.next_request)
+        t.ros_send(wire_bytes(var m))
         return session_with_state(s, ROS_SESSION_CLOSED)
+
+// Create one entity on the agent from an XML description, and wait for
+// its status.
+//
+// `object` is the new entity's id (`xrcewire.object_id`), `kind` its
+// kind (`xrcewire.XRCE_KIND_*`), `parent` the id of the entity it
+// belongs to, or for a participant its DDS domain id.  The message goes
+// out on the best-effort stream and replaces an entity of the same id,
+// so a program that restarts does not meet its own leftovers.  The
+// outcome's `code` is `ROS_RET_OK` when the agent answered OK or
+// matched, and its `status` is the agent's number either way.
+pub @tier(system)
+fn create_entity<T: RosTransport[e]>(t: T, s: RosSession, object: Int, kind: Int, parent: Int,
+                                     xml: Str, timeout_ms: Int) -> RosOutcome [e]
+    system
+        if not session_is_ready(s)
+            return outcome(s, rosret.ROS_RET_NOT_INIT, 0 - 1)
+        var m: Vec[u8; 512] = Vec.new()
+        let request = s.next_request
+        let sent = session_wrote(session_next_request(s))
+        if not xrcewire.create_entity(var m, xrcewire.XRCE_STREAM_BEST_EFFORT, s.output_seq,
+                                      request, object, kind, parent, xml,
+                                      xrcewire.XRCE_CREATE_REPLACE)
+            return outcome(s, rosret.ROS_RET_INVALID_ARGUMENT, 0 - 1)
+        if not t.ros_send(wire_bytes(var m))
+            return outcome(s, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+        let answer = t.ros_recv(timeout_ms)
+        if answer == None
+            return outcome(sent, rosret.ROS_RET_TIMEOUT, 0 - 1)
+        wire_read(var m, answer ?? bytes.zeros(0))
+        let reply = xrcewire.read_reply(var m)
+        if reply.kind != xrcewire.XRCE_REPLY_STATUS or reply.request != request
+            return outcome(sent, rosret.ROS_RET_TIMEOUT, 0 - 1)
+        if xrcewire.status_is_ok(reply.status)
+            return outcome(session_heard(sent), rosret.ROS_RET_OK, reply.status)
+        return outcome(session_heard(sent), rosret.ROS_RET_ERROR, reply.status)
+
+// Write one sample to a data writer.
+//
+// `sample` is the CDR body WITHOUT the four-byte representation header:
+// the agent writes that itself (see `xrcewire`).  Sent on the
+// best-effort stream, which has no status to wait for; the outcome's
+// `code` says whether the pipe took the bytes.
+pub @tier(system)
+fn write_sample<T: RosTransport[e]>(t: T, s: RosSession, writer: Int,
+                                    sample: Bytes) -> RosOutcome [e]
+    system
+        if not session_is_ready(s)
+            return outcome(s, rosret.ROS_RET_NOT_INIT, 0 - 1)
+        var m: Vec[u8; 512] = Vec.new()
+        let request = s.next_request
+        let sent = session_wrote(session_next_request(s))
+        var ok = xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_BEST_EFFORT,
+                                           s.output_seq, request, writer)
+        for i in 0..bytes.len(sample)
+            ok = ok and xrcewire.put_sample_byte(var m, bytes.byte_at(sample, i) ?? 0)
+        if not ok
+            return outcome(s, rosret.ROS_RET_INVALID_ARGUMENT, 0 - 1)
+        let _len = xrcewire.finish_write_data(var m)
+        if not t.ros_send(wire_bytes(var m))
+            return outcome(s, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+        return outcome(sent, rosret.ROS_RET_OK, 0 - 1)
 
 // Send one message on a stream.
 //
@@ -421,6 +543,11 @@ fn close_session<T: RosTransport[e]>(t: T, s: RosSession) -> RosSession [e]
 // session that is not established, `ROS_RET_INVALID_ARGUMENT` for a
 // message larger than the transport, and `ROS_RET_AGENT_UNREACHABLE`
 // when the pipe refused it.
+//
+// WHAT GOES OUT IS THE MESSAGE'S ENVELOPE AND NOTHING ELSE: its
+// four-byte header and its payload, with no XRCE message header around
+// them, so an agent does not read it as a sample.  A program that
+// publishes to a real agent calls `write_sample`.
 pub @tier(system)
 fn send_message<T: RosTransport[e]>(t: T, s: RosSession, m: RosMessage, kind: Int) -> Int [e]
     system
@@ -452,6 +579,11 @@ fn take_message<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> ?By
 // `elapsed_ms` is how long since this was last called.  The one
 // periodic obligation a micro-ROS client has, and the only thing that
 // notices an agent that went away.
+//
+// THE HEARTBEAT IS A PING.  A best-effort stream has no heartbeat of its
+// own in XRCE, so what goes out is the GET_INFO the eProsima client
+// uses to ask whether an agent is there; any INFO that comes back clears
+// the silence.
 pub @tier(system)
 fn heartbeat<T: RosTransport[e]>(t: T, s: RosSession, elapsed_ms: Int) -> RosSession [e]
     system
@@ -465,12 +597,18 @@ fn heartbeat<T: RosTransport[e]>(t: T, s: RosSession, elapsed_ms: Int) -> RosSes
             return session_with_state(waited, ROS_SESSION_LOST)
         if waited.silent_ms < ROS_HEARTBEAT_MS
             return waited
-        if not t.ros_send(client_key_bytes(waited))
+        var m: Vec[u8; 512] = Vec.new()
+        let _built = xrcewire.ping(var m, waited.next_request)
+        if not t.ros_send(wire_bytes(var m))
             return waited
         let answer = t.ros_recv(0)
         if answer == None
             return waited
-        return session_heard(waited)
+        wire_read(var m, answer ?? bytes.zeros(0))
+        let reply = xrcewire.read_reply(var m)
+        if reply.kind == xrcewire.XRCE_REPLY_INFO
+            return session_heard(session_next_request(waited))
+        return waited
 
 // Whether the pipe reports itself open and the session established.
 pub @tier(system)

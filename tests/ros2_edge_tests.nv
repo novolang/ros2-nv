@@ -592,9 +592,17 @@ impl RosTransport[] for RosEdgePipe
     fn ros_mtu(self) -> Int
         512
 
-// A pipe that answers one message.
+// A pipe that answers one message, with the STATUS_AGENT a Micro
+// XRCE-DDS Agent 2.4.3 sent to a CREATE_CLIENT on 2026-11-10: message
+// header 81 00 00 00, submessage 04 (STATUS_AGENT) flags 01 length 11,
+// status 00 (OK) and implementation status 00, then the agent's cookie
+// "XRCE", version 1.0, vendor 01 0F and no properties.
 fn an_answering_pipe() -> RosEdgePipe
-    RosEdgePipe { canned: bytes.zeros(4), answers: true, sent_ok: true, open: true }
+    RosEdgePipe {
+        canned: bytes.from_byte_list([0x81, 0x00, 0x00, 0x00, 0x04, 0x01, 0x0B, 0x00,
+                                      0x00, 0x00, 0x58, 0x52, 0x43, 0x45, 0x01, 0x00,
+                                      0x01, 0x0F, 0x00]),
+        answers: true, sent_ok: true, open: true }
 
 // A pipe that sends and never answers.
 fn a_mute_pipe() -> RosEdgePipe

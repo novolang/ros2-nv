@@ -1,0 +1,345 @@
+// xrceframe.nv — the serial framing of Micro XRCE-DDS, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A framer writes
+// into a buffer the caller owns and a de-framer keeps its state in a
+// `@value` the caller holds, so a UART interrupt, a task or a test can
+// run either without a heap.
+//
+// WHAT IS ON THE WIRE.  A serial link has no frames of its own, so
+// Micro XRCE-DDS puts each message in one.  This is the layout the
+// eProsima client writes (Micro-XRCE-DDS-Client,
+// `src/c/profile/transport/stream_framing/stream_framing_protocol.c`,
+// functions `uxr_write_framed_msg` and `uxr_read_framed_msg`), and the
+// one the Micro XRCE-DDS Agent reads:
+//
+//   0x7E                 begin flag, never stuffed
+//   source address       1 byte, stuffed
+//   remote address       1 byte, stuffed
+//   length               2 bytes, least significant first, stuffed;
+//                        the length of the payload BEFORE stuffing
+//   payload              stuffed
+//   CRC-16               2 bytes, least significant first, stuffed;
+//                        over the payload BEFORE stuffing
+//
+// STUFFING is applied to every byte after the begin flag.  A byte equal
+// to the begin flag 0x7E or to the escape 0x7D goes out as the escape
+// 0x7D followed by the byte exclusive-ored with 0x20, so 0x7E becomes
+// 0x7D 0x5E and 0x7D becomes 0x7D 0x5D.  The receiver reverses it: after
+// an escape, the next byte exclusive-ored with 0x20 is the data byte.
+// An unstuffed begin flag inside a frame, or an escape followed by one,
+// is a new frame starting, and the receiver restarts from the address.
+//
+// THE CRC is the client's `crc16_table` ("POLY 0x8005",
+// x^16 + x^15 + x^2 + 1), updated as `crc = (crc >> 8) ^
+// table[(crc ^ byte) & 0xFF]` from an initial value of 0 with no final
+// exclusive-or.  The first table entries are 0x0000, 0xC0C1, 0xC181,
+// 0x0140, which are the entries of the reflected polynomial 0xA001.  In
+// the catalogue of parametrised CRC algorithms that is CRC-16/ARC, whose
+// check value over the nine bytes `123456789` is 0xBB3D.  crc-nv's
+// `crc16_modbus` is the same polynomial and reflection with an initial
+// value of 0xFFFF, so it does not give this checksum; its constructor is
+// also `@tier(app)` and builds a list, so a device program cannot call
+// it.  The loop below is therefore the one place this package computes
+// a CRC, and `tests/xrce_tests.nv` holds it to the catalogue's check
+// value.
+//
+// THE ADDRESSES.  The client's default is local address 1 and remote
+// address 0, and the agent's is the reverse ("By default, the Agent
+// address in a serial transport is 0", `serial_transport.h`).  A frame
+// whose remote address is not the receiver's own is dropped.
+
+// The byte that begins a frame: 0x7E.
+pub const XRCE_FRAME_BEGIN = 0x7E
+// The byte that escapes the next one: 0x7D.
+pub const XRCE_FRAME_ESC = 0x7D
+// What a stuffed byte is exclusive-ored with: 0x20.
+pub const XRCE_FRAME_XOR = 0x20
+// The largest payload a serial frame carries, in bytes: 512.
+//
+// The client's serial transport buffer is 512 bytes
+// (`UXR_CONFIG_SERIAL_TRANSPORT_MTU`), and a payload longer than the
+// reader's buffer is refused by it.
+pub const XRCE_MTU = 512
+// The largest frame, in bytes, once every byte after the begin flag has
+// been stuffed to two: 1037.
+//
+// The begin flag, then two addresses, two length bytes, the payload and
+// two CRC bytes, each of them at worst doubled.
+pub const XRCE_FRAME_MAX = 1 + 2 * (XRCE_MTU + 6)
+// The client's default address on a serial link: 1.
+pub const XRCE_ADDR_CLIENT = 1
+// The agent's default address on a serial link: 0.
+pub const XRCE_ADDR_AGENT = 0
+
+// A byte went in and no frame has completed.
+pub const XRCE_PUSH_NONE = 0
+// A whole frame with a good CRC is in `XrceDeframer.payload`.
+pub const XRCE_PUSH_FRAME = 1
+// A frame arrived whole and its CRC was wrong; the payload is dropped.
+pub const XRCE_PUSH_BAD_CRC = 2
+// A frame announced a payload longer than `XRCE_MTU`; it is dropped.
+pub const XRCE_PUSH_TOO_LONG = 3
+
+// The states of the reader, in the order a frame passes through them.
+const ST_WAIT = 0
+const ST_SRC = 1
+const ST_DST = 2
+const ST_LEN_LO = 3
+const ST_LEN_HI = 4
+const ST_PAYLOAD = 5
+const ST_CRC_LO = 6
+const ST_CRC_HI = 7
+
+// Fold one byte into a CRC-16 state and answer the new state.
+//
+// CRC-16/ARC: polynomial 0x8005 reflected (0xA001), fed least
+// significant bit first.  Start from 0; there is no final exclusive-or,
+// so the state after the last byte is the checksum.
+//
+// ```novo
+// use xrceframe
+//
+// fn main() [io]
+//     var c = 0
+//     for b in [49, 50, 51, 52, 53, 54, 55, 56, 57]
+//         c = xrceframe.crc16_step(c, b)
+//     println("${c}")   // 47933, which is 0xBB3D, the catalogue's check value
+// ```
+pub @tier(embedded)
+@no_alloc
+fn crc16_step(state: Int, byte: Int) -> Int []
+    var c = (state ^ byte) & 0xFFFF
+    for _bit in 0..8
+        if (c & 1) == 1
+            c = (c >>> 1) ^ 0xA001
+        else
+            c = c >>> 1
+    c
+
+// Append one byte to a frame, stuffed.  Answers whether it fitted.
+//
+// A byte that needs the escape needs two places, and with one place
+// left nothing is written: the buffer never ends on a lone escape.
+//
+// ```novo
+// use xrceframe
+//
+// fn main() [io]
+//     var out: Vec[u8; 1037] = Vec.new()
+//     let _ = xrceframe.stuff_byte(var out, 0x7D)
+//     println("${out.len()}")   // 2, the escape and 0x5D
+// ```
+pub @tier(embedded)
+@no_alloc
+fn stuff_byte(var out: Vec[u8; XRCE_FRAME_MAX], byte: Int) -> Bool []
+    let b = byte & 0xFF
+    if b == XRCE_FRAME_BEGIN or b == XRCE_FRAME_ESC
+        if out.capacity() - out.len() < 2
+            return false
+        let _a = out.push(XRCE_FRAME_ESC as u8)
+        let _b = out.push((b ^ XRCE_FRAME_XOR) as u8)
+        return true
+    match out.push(b as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append one frame to `out`.
+//
+// `payload` is the message to carry, `src` is the sender's address and
+// `dst` the receiver's.  Answers whether the whole frame fitted.  On a
+// refusal `out` is back at the length it had on entry, so a half-written
+// frame is never sent.  A caller that wants one frame clears `out`
+// first; one that wants several in a row leaves them in.  Allocates
+// nothing.
+//
+// ```novo
+// use xrceframe
+//
+// fn main() [io]
+//     var payload: Vec[u8; 512] = Vec.new()
+//     let _p = payload.push(0x7E)
+//     var frame: Vec[u8; 1037] = Vec.new()
+//     println("${xrceframe.encode(frame, payload, 1, 0)}")   // true
+//     println("${frame.len()}")                              // 9
+// ```
+pub @tier(embedded)
+@no_alloc
+fn encode(var out: Vec[u8; XRCE_FRAME_MAX], var payload: Vec[u8; XRCE_MTU], src: Int,
+          dst: Int) -> Bool []
+    let start = out.len()
+    let n = payload.len()
+    var ok = true
+    match out.push(XRCE_FRAME_BEGIN as u8)
+        Ok(_)  =>
+            ok = true
+        Err(_) =>
+            ok = false
+    ok = ok and stuff_byte(var out, src) and stuff_byte(var out, dst)
+    ok = ok and stuff_byte(var out, n & 0xFF) and stuff_byte(var out, n >>> 8)
+    var crc = 0
+    for i in 0..n
+        let b = payload[i] as Int
+        ok = ok and stuff_byte(var out, b)
+        crc = crc16_step(crc, b)
+    ok = ok and stuff_byte(var out, crc & 0xFF) and stuff_byte(var out, crc >>> 8)
+    if not ok
+        for _k in 0..XRCE_FRAME_MAX
+            if out.len() > start
+                let _ = out.pop()
+    ok
+
+// A de-framer's state: where in a frame the reader is, and the payload
+// it has collected so far.
+//
+// A `@value`, so the caller holds it in a `var` beside its UART and
+// feeds it from wherever the bytes arrive.  `payload` is valid after
+// `push_byte` answers `XRCE_PUSH_FRAME` and until the next byte that starts
+// a payload goes in.
+pub @value
+struct XrceDeframer
+    // Which field of the frame the next byte is.
+    state: Int
+    // Whether the previous byte was the escape.
+    escaped: Bool
+    // The address this end answers to; frames for another are dropped.
+    local: Int
+    // The sender's address in the last frame that was addressed here.
+    source: Int
+    // The payload length the frame announced.
+    announced: Int
+    // The CRC over the payload bytes received so far.
+    crc: Int
+    // The CRC's first byte, held until its second arrives.
+    crc_low: Int
+    // Where `feed` stopped in the buffer it was given.
+    next: Int
+    // The collected payload.
+    payload: Vec[u8; XRCE_MTU]
+
+// A de-framer for an end of the link that answers to `local`.
+//
+// `XRCE_ADDR_CLIENT` for a device and `XRCE_ADDR_AGENT` for a program
+// standing in for the agent.
+pub @tier(embedded)
+@no_alloc
+fn deframer(local: Int) -> XrceDeframer []
+    XrceDeframer {
+        state: ST_WAIT,
+        escaped: false,
+        local: local,
+        source: 0,
+        announced: 0,
+        crc: 0,
+        crc_low: 0,
+        next: 0,
+        payload: Vec.new() }
+
+// Give up the frame in progress and wait for the next begin flag.
+pub @tier(embedded)
+@no_alloc
+fn reset(var d: XrceDeframer) []
+    d.state = ST_WAIT
+    d.escaped = false
+
+// Take one decoded byte into the state machine.
+@tier(embedded)
+@no_alloc
+fn take(var d: XrceDeframer, v: Int) -> Int []
+    if d.state == ST_SRC
+        d.source = v
+        d.state = ST_DST
+    else if d.state == ST_DST
+        if v == d.local
+            d.state = ST_LEN_LO
+        else
+            d.state = ST_WAIT
+    else if d.state == ST_LEN_LO
+        d.announced = v
+        d.state = ST_LEN_HI
+    else if d.state == ST_LEN_HI
+        d.announced = d.announced + v * 256
+        d.payload.clear()
+        d.crc = 0
+        if d.announced > XRCE_MTU
+            d.state = ST_WAIT
+            return XRCE_PUSH_TOO_LONG
+        if d.announced == 0
+            d.state = ST_CRC_LO
+        else
+            d.state = ST_PAYLOAD
+    else if d.state == ST_PAYLOAD
+        let _p = d.payload.push(v as u8)
+        d.crc = crc16_step(d.crc, v)
+        if d.payload.len() == d.announced
+            d.state = ST_CRC_LO
+    else if d.state == ST_CRC_LO
+        d.crc_low = v
+        d.state = ST_CRC_HI
+    else
+        d.state = ST_WAIT
+        if d.crc_low + v * 256 == d.crc
+            return XRCE_PUSH_FRAME
+        return XRCE_PUSH_BAD_CRC
+    XRCE_PUSH_NONE
+
+// Give the de-framer one byte off the wire.
+//
+// Answers `XRCE_PUSH_NONE` while a frame is incomplete,
+// `XRCE_PUSH_FRAME` when the byte finished one with a good CRC (its
+// payload is in `d.payload` and its sender in `d.source`),
+// `XRCE_PUSH_BAD_CRC` when it finished one with a wrong CRC and
+// `XRCE_PUSH_TOO_LONG` when a header announced more than `XRCE_MTU`.
+// Bytes outside a frame are skipped until a begin flag, as the client
+// skips them.
+//
+// ```novo
+// use xrceframe
+//
+// fn main() [io]
+//     var d = xrceframe.deframer(0)
+//     // A frame of one payload byte, 0x41, from address 1 to address 0.
+//     let wire = [0x7E, 1, 0, 1, 0, 0x41, 0xC0, 0x30]
+//     var r = 0
+//     for b in wire
+//         r = xrceframe.push_byte(d, b)
+//     println("${r}")   // 1, a whole frame
+// ```
+pub @tier(embedded)
+@no_alloc
+fn push_byte(var d: XrceDeframer, byte: Int) -> Int []
+    let b = byte & 0xFF
+    if d.state == ST_WAIT
+        if b == XRCE_FRAME_BEGIN
+            d.state = ST_SRC
+            d.escaped = false
+        return XRCE_PUSH_NONE
+    if b == XRCE_FRAME_BEGIN
+        // An unstuffed begin flag inside a frame starts a new one.
+        d.state = ST_SRC
+        d.escaped = false
+        return XRCE_PUSH_NONE
+    if d.escaped
+        d.escaped = false
+        return take(var d, b ^ XRCE_FRAME_XOR)
+    if b == XRCE_FRAME_ESC
+        d.escaped = true
+        return XRCE_PUSH_NONE
+    take(var d, b)
+
+// Feed bytes from `buf`, starting at index `from`, until a frame
+// completes or an error is found or the buffer ends.
+//
+// Answers what `push_byte` answered for the last byte consumed, and leaves
+// the index of the first unconsumed byte in `d.next`, so a caller that
+// received a slice off a UART calls this again from `d.next` for the
+// next frame in it.
+pub @tier(embedded)
+@no_alloc
+fn feed(var d: XrceDeframer, var buf: Vec[u8; XRCE_FRAME_MAX], from: Int) -> Int []
+    var r = XRCE_PUSH_NONE
+    d.next = from
+    for i in from..buf.len()
+        if r == XRCE_PUSH_NONE
+            r = push_byte(var d, buf[i] as Int)
+            d.next = i + 1
+    r
