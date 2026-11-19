@@ -343,6 +343,30 @@ fn is_ready(ready: Int, index: Int) -> Bool []
     // C, so the brackets say which reading is meant.
     (ready & ready_bit(index)) != 0
 
+// The ready set a take contributes: the bit of handle `index` when the
+// take answered `ROS_RET_OK`, which is to say it found a sample, and no bit
+// for any other code.
+//
+// A subscription is ready when a take found something, and
+// `ROS_RET_SUBSCRIPTION_TAKE_FAILED`, the code of a take that found
+// nothing, is not an error and contributes nothing. `rostransport.poll`
+// and `rosuart.poll` answer such a code; a caller ORs the sets of its
+// handles and hands the result to `spin_step`.
+//
+// ```novo
+// use rosexec
+// use rosret
+//
+// fn main() [io]
+//     println("${rosexec.ready_from_take(2, rosret.ROS_RET_OK)}")   // 4
+//     println("${rosexec.ready_from_take(2, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)}")   // 0
+// ```
+pub @tier(embedded)
+fn ready_from_take(index: Int, ret: Int) -> Int []
+    if ret == rosret.ROS_RET_OK
+        return ready_bit(index)
+    0
+
 // How many handles are ready.
 pub @tier(embedded)
 fn ready_count(ready: Int) -> Int []

@@ -28,7 +28,9 @@ use rosgraph
 use rosqos
 use rosret
 use rostransport
+use rosuart
 use xrceframe
+use xrcestream
 use xrcewire
 
 // The pair a real ROS 2 system produces most often: a camera that
@@ -83,6 +85,97 @@ fn wire_score() -> Int
     if reply.kind == xrcewire.XRCE_REPLY_STATUS and reply.request == r.next_request
         n = n + 1
     n
+
+// A UART with nothing on its line that takes every byte, so that the
+// device functions of `rosuart` run in the probe with no board behind
+// them.
+@value
+struct EmptyUart
+    id: Int
+
+impl XrceUart[] for EmptyUart
+    fn uart_put(self, byte: Int) -> Bool []
+        true
+
+    fn uart_get(self) -> Int []
+        0 - 1
+
+    fn uart_pause_ms(self, ms: Int) []
+        ()
+
+// The reliable stream and the subscription path, in buffers on the stack:
+// the history, the state machine, the sample reader and the device
+// functions of `rosuart` over a UART that is not there.  Twelve checks.
+@tier(embedded)
+@no_alloc
+fn stream_score() -> Int
+    var n = 0
+    var r = xrcestream.rel_stream()
+    if xrcestream.out_idle(r)
+        n = n + 1
+    r = xrcestream.out_wrote(xrcestream.out_wrote(r))
+    if xrcestream.out_in_flight(r) == 2
+        n = n + 1
+    if xrcestream.out_in_flight(xrcestream.out_ack(r, 1)) == 1
+        n = n + 1
+
+    // A message kept in the history comes back from the same slot.
+    var h = xrcestream.history()
+    var kept: Vec[u8; 512] = Vec.new()
+    let _a = kept.push(0x81)
+    let _b = kept.push(0x80)
+    let _c = kept.push(0x07)
+    if xrcestream.history_store(var h, 1, var kept)
+        n = n + 1
+    var back: Vec[u8; 512] = Vec.new()
+    if xrcestream.history_load(var h, 1, var back) == 3 and back[2] == 0x07
+        n = n + 1
+
+    // Two messages in order, then one after a gap: the ACKNACK names the
+    // three that are missing.
+    var i = xrcestream.rel_stream()
+    if xrcestream.in_verdict(i, 0) == xrcestream.REL_DELIVER
+        n = n + 1
+    i = xrcestream.in_receive(i, 2)
+    if xrcestream.in_bitmap(i) == 7
+        n = n + 1
+
+    // A recorded DATA, read, and the requests built.
+    var data: Vec[u8; 512] = Vec.new()
+    for k in 0..16
+        let _d = data.push(A_DATA[k] as u8)
+    let sample = xrcewire.read_sample(var data)
+    if sample.found and xrcewire.sample_i32(var data, sample) == 7
+        n = n + 1
+    var rd: Vec[u8; 512] = Vec.new()
+    if xrcewire.read_data(var rd, 1, 0, 1, 0x16, xrcewire.XRCE_STREAM_RELIABLE,
+                          xrcewire.XRCE_SAMPLES_UNLIMITED) and rd.len() == 24
+        n = n + 1
+    var ak: Vec[u8; 512] = Vec.new()
+    if xrcewire.acknack(var ak, 1, 0, xrcewire.XRCE_STREAM_RELIABLE) and ak.len() == 13
+        n = n + 1
+
+    // The device functions over a line with nothing on it: a write goes
+    // out and takes a slot, and a poll finds nothing, which is not an
+    // error.
+    let u = EmptyUart { id: 1 }
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    let up = rostransport.session_established(rostransport.session(1, 512),
+                                              xrcewire.XRCE_SESSION_ID)
+    let w = rosuart.publish_i32_reliable(u, var m, var f, var h, up, xrcestream.rel_stream(),
+                                         0x15, 5)
+    if w.code == rosret.ROS_RET_OK and xrcestream.out_in_flight(w.stream) == 1
+        n = n + 1
+    let got = rosuart.poll(u, var d, var m, var f, var h, up, w.stream, 2)
+    if got.code == rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED
+        n = n + 1
+    n
+
+// The agent's DATA carrying the integer 7, as recorded.
+const A_DATA = [0x81, 0x01, 0x04, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
+                0x07, 0x00, 0x00, 0x00]
 
 // Every answer this probe checks, folded into one number so a single
 // comparison decides the run.
@@ -342,16 +435,16 @@ fn score() -> Int
     if rosexec.spin_wait_ms(rosexec.set_timeout(e, 100), early) == 60
         n = n + 1
 
-    n + wire_score()
+    n + wire_score() + stream_score()
 
 @tier(rt)
 fn main() [hw]
     bsp.board.init()
-    // 101 is the number of checks in `score` and `wire_score`.  The count is printed on a
+    // 113 is the number of checks in `score` and `wire_score`.  The count is printed on a
     // failure rather than only compared, so a device that disagrees with
     // the host says HOW MANY it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 101
+    if n == 113
         hal.uart.write("PASS: ros2-embedded\n")
     else
         hal.uart.write("FAIL: ros2-embedded score=")

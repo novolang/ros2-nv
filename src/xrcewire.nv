@@ -45,6 +45,29 @@
 //                    an information mask (4).  Sent outside a session,
 //                    with session id 0x80, it is a ping: the agent
 //                    answers INFO (6) to whoever asked, session or not.
+//   READ_DATA (8)    request id (2), the data reader's object id (2), the
+//                    stream the samples are to come back on (1), the data
+//                    format (1: 0 means DATA, the sample's bytes as they
+//                    are), two booleans (1 each: a content filter, absent,
+//                    and a delivery control, present), and the delivery
+//                    control: the most samples (2), the longest time in
+//                    seconds (2), the most bytes a second (2) and the
+//                    shortest pace (2).  16 bytes.  The agent reads that
+//                    many samples from DDS and answers each with a DATA;
+//                    it answers a STATUS only when it refuses.
+//   DATA (9)         request id (2) and object id (2) of the READ_DATA
+//                    that asked, then the sample.  The format rides in the
+//                    flags byte, bits 1 to 3, and 0 means the sample is the
+//                    rest of the payload with no length in front of it.
+//   HEARTBEAT (11)   first unacknowledged sequence number (2), last one
+//                    sent (2), stream id (1).  A reliable stream's sender
+//                    says what it has sent, so a receiver that lost the
+//                    last message learns there was one.
+//   ACKNACK (10)     first sequence number not yet received (2), a bitmap
+//                    of 16 bits (2, most significant byte first) whose
+//                    bit j says the message first + j is missing, stream
+//                    id (1).  A reliable stream's receiver says what it
+//                    has and asks for the rest.
 //
 // AN OBJECT ID IS TWELVE BITS OF NUMBER AND FOUR OF KIND, written most
 // significant byte first: id 1 of kind 5 is 0x00 0x15.
@@ -59,6 +82,16 @@
 // subscriber with eight bytes of header and the number read from the
 // wrong place.  `rosmsg.encode_envelope` is for a message that travels
 // with its header, and is not what a WRITE_DATA carries.
+//
+// THE SAMPLE A DATA CARRIES HAS NONE EITHER.  The agent takes the header
+// off a sample on its way to the client (`TopicPubSubType.cpp`,
+// `deserialize`: the payload from byte 4), so the bytes after a DATA's
+// payload header are the CDR body alone, and for std_msgs/msg/Int32 the
+// four bytes of the number.  The header's byte order is lost with it: the
+// agent writes plain little-endian CDR on the way out and does not look at
+// what arrives, so a sample published by a big-endian node reaches this
+// package unmarked.  Every ROS 2 node on an ordinary processor is
+// little-endian.
 
 use std.str
 
@@ -88,6 +121,14 @@ pub const XRCE_SUB_STATUS = 5
 pub const XRCE_SUB_INFO = 6
 // Submessage id of WRITE_DATA: 7.
 pub const XRCE_SUB_WRITE_DATA = 7
+// Submessage id of READ_DATA: 8.
+pub const XRCE_SUB_READ_DATA = 8
+// Submessage id of DATA, the agent's carrier of a sample: 9.
+pub const XRCE_SUB_DATA = 9
+// Submessage id of ACKNACK: 10.
+pub const XRCE_SUB_ACKNACK = 10
+// Submessage id of HEARTBEAT: 11.
+pub const XRCE_SUB_HEARTBEAT = 11
 
 // Object kinds, from the client's `DDS_XRCE_OBJK_*`.
 pub const XRCE_KIND_PARTICIPANT = 1
@@ -97,6 +138,23 @@ pub const XRCE_KIND_TOPIC = 2
 pub const XRCE_KIND_PUBLISHER = 3
 // Object kind of a data writer: 5.
 pub const XRCE_KIND_DATAWRITER = 5
+// Object kind of a subscriber: 4.
+pub const XRCE_KIND_SUBSCRIBER = 4
+// Object kind of a data reader: 6.
+pub const XRCE_KIND_DATAREADER = 6
+
+// The first reliable stream: 0x80.  A stream id of 0x80 or more is
+// reliable, and the index is the id less 0x80.
+pub const XRCE_STREAM_RELIABLE = 0x80
+
+// The data format DATA: 0.  A DATA submessage with this format carries
+// the sample's bytes as they are, with no length in front.
+pub const XRCE_FORMAT_DATA = 0
+// The mask of the format in a submessage's flags byte: 0x0E.
+pub const XRCE_FORMAT_MASK = 0x0E
+
+// A delivery control that asks for samples without end: 0xFFFF.
+pub const XRCE_SAMPLES_UNLIMITED = 0xFFFF
 
 // What the agent answers, from the client's `UXR_STATUS_*`.
 pub const XRCE_STATUS_OK = 0
@@ -458,3 +516,244 @@ fn status_name(status: Int) -> Str []
         XRCE_STATUS_ERR_INCOMPATIBLE      => "incompatible"
         XRCE_STATUS_ERR_RESOURCES         => "out of resources"
         _                                 => "unknown"
+
+// Build a message that asks the agent for samples from a data reader,
+// replacing what `m` held.
+//
+// `stream` and `seq` are the stream this request goes out on and its next
+// sequence number, `request` identifies it, `reader` is the data reader's
+// id (see `object_id`), `data_stream` is the stream the samples are to
+// come back on (`XRCE_STREAM_BEST_EFFORT` or `XRCE_STREAM_RELIABLE`) and
+// `max_samples` how many the agent is to deliver: 1 for one sample,
+// `XRCE_SAMPLES_UNLIMITED` for every sample until the request is replaced,
+// 0 to stop.  The message is 24 bytes and always fits, and the answer is
+// true.
+//
+// ```novo
+// use xrcewire
+//
+// fn main() [io]
+//     var m: Vec[u8; 512] = Vec.new()
+//     let reader = xrcewire.object_id(1, xrcewire.XRCE_KIND_DATAREADER)
+//     let ok = xrcewire.read_data(var m, 1, 0, 5, reader, xrcewire.XRCE_STREAM_BEST_EFFORT, 1)
+//     println("${ok} ${m.len()}")   // true 24
+// ```
+pub @tier(embedded)
+@no_alloc
+fn read_data(var m: Vec[u8; 512], stream: Int, seq: Int, request: Int, reader: Int,
+             data_stream: Int, max_samples: Int) -> Bool []
+    m.clear()
+    var ok = put_message_header(var m, XRCE_SESSION_ID, stream, seq)
+    ok = ok and put_submessage_header(var m, XRCE_SUB_READ_DATA, 0, 16)
+    ok = ok and put_object(var m, request) and put_object(var m, reader)
+    // The stream, the format, no content filter, a delivery control.
+    ok = ok and put_u8(var m, data_stream) and put_u8(var m, XRCE_FORMAT_DATA)
+        and put_u8(var m, 0) and put_u8(var m, 1)
+    // The most samples, and no limit on time, rate or pace.
+    ok = ok and put_u16(var m, max_samples) and put_u16(var m, 0) and put_u16(var m, 0)
+        and put_u16(var m, 0)
+    ok
+
+// Build a HEARTBEAT, replacing what `m` held.
+//
+// `first` and `last` are the first sequence number the sender still holds
+// unacknowledged and the last one it sent, on the reliable stream
+// `stream`.  Goes out on stream 0, sequence 0, like every submessage that
+// is about a stream and not on one.  The message is 13 bytes and always
+// fits, and the answer is true.
+pub @tier(embedded)
+@no_alloc
+fn heartbeat(var m: Vec[u8; 512], first: Int, last: Int, stream: Int) -> Bool []
+    m.clear()
+    var ok = put_message_header(var m, XRCE_SESSION_ID, XRCE_STREAM_NONE, 0)
+    ok = ok and put_submessage_header(var m, XRCE_SUB_HEARTBEAT, 0, 5)
+    ok = ok and put_u16(var m, first) and put_u16(var m, last) and put_u8(var m, stream)
+    ok
+
+// Build an ACKNACK, replacing what `m` held.
+//
+// `first` is the first sequence number the receiver has not got, `bitmap`
+// has bit j set when the message `first + j` is missing although a later
+// one is known to exist, and `stream` is the reliable stream the answer is
+// about.  Goes out on stream 0, sequence 0.  The message is 13 bytes and
+// always fits, and the answer is true.
+pub @tier(embedded)
+@no_alloc
+fn acknack(var m: Vec[u8; 512], first: Int, bitmap: Int, stream: Int) -> Bool []
+    m.clear()
+    var ok = put_message_header(var m, XRCE_SESSION_ID, XRCE_STREAM_NONE, 0)
+    ok = ok and put_submessage_header(var m, XRCE_SUB_ACKNACK, 0, 5)
+    // The bitmap is two bytes, the high byte first.
+    ok = ok and put_u16(var m, first) and put_u8(var m, bitmap >>> 8) and put_u8(var m, bitmap)
+        and put_u8(var m, stream)
+    ok
+
+// One submessage found in a received message.
+pub @value
+struct XrceSub
+    // The submessage id, or -1 when the message holds none of that id.
+    id: Int
+    // The flags byte.
+    flags: Int
+    // The offset of the first payload byte in the message.
+    body: Int
+    // The payload's length in bytes.
+    length: Int
+
+// The stream a received message arrived on: byte 1 of its header, or -1
+// for a message shorter than a header.
+pub @tier(embedded)
+@no_alloc
+fn message_stream(var m: Vec[u8; 512]) -> Int []
+    if m.len() < 4
+        return -1
+    m[1] as Int
+
+// The sequence number of a received message: bytes 2 and 3 of its header,
+// or -1 for a message shorter than a header.
+pub @tier(embedded)
+@no_alloc
+fn message_seq(var m: Vec[u8; 512]) -> Int []
+    if m.len() < 4
+        return -1
+    m[2] as Int + m[3] as Int * 256
+
+// The first submessage of an id in a received message.
+//
+// Walks the submessages of `m` and answers the first with this id whose
+// payload lies wholly inside the message; any other is stepped over by its
+// length. A message without one, or one cut short, answers `id = -1`.
+pub @tier(embedded)
+@no_alloc
+fn find_submessage(var m: Vec[u8; 512], id: Int) -> XrceSub []
+    var out = XrceSub { id: -1, flags: 0, body: 0, length: 0 }
+    let header = if m.len() > 0 and (m[0] as Int) < 128
+        8
+    else
+        4
+    var at = header
+    var done = false
+    for _i in 0..16
+        // A submessage starts at a multiple of four.
+        at = (at + 3) / 4 * 4
+        if not done and at + 4 <= m.len()
+            let length = m[at + 2] as Int + m[at + 3] as Int * 256
+            if m[at] as Int == id and at + 4 + length <= m.len()
+                out = XrceSub { id: id, flags: m[at + 1] as Int, body: at + 4, length: length }
+                done = true
+            else
+                at = at + 4 + length
+    out
+
+// A sample the agent delivered, and where its bytes are in the message.
+pub @value
+struct XrceSample
+    // Whether the message held a DATA with a sample in the DATA format.
+    found: Bool
+    // The request id of the READ_DATA that asked for it.
+    request: Int
+    // The data reader's object id.
+    object: Int
+    // The offset of the sample's first byte in the message.
+    start: Int
+    // The sample's length in bytes.
+    length: Int
+
+// Read the sample out of a received message.
+//
+// Answers `found = false` for a message with no DATA, a DATA shorter than
+// its two ids, or a DATA in a format other than `XRCE_FORMAT_DATA`, which
+// is the only one `read_data` asks for. The sample's bytes are
+// `m[start]` to `m[start + length - 1]`, and `copy_sample` moves them.
+pub @tier(embedded)
+@no_alloc
+fn read_sample(var m: Vec[u8; 512]) -> XrceSample []
+    let none = XrceSample { found: false, request: 0, object: 0, start: 0, length: 0 }
+    let sub = find_submessage(var m, XRCE_SUB_DATA)
+    if sub.id < 0 or sub.length < 4 or (sub.flags & XRCE_FORMAT_MASK) != XRCE_FORMAT_DATA
+        return none
+    XrceSample {
+        found: true,
+        request: m[sub.body] as Int * 256 + m[sub.body + 1] as Int,
+        object: m[sub.body + 2] as Int * 256 + m[sub.body + 3] as Int,
+        start: sub.body + 4,
+        length: sub.length - 4 }
+
+// Copy a sample's bytes out of the message into `out`, replacing what it
+// held. Answers false, with `out` empty, for a sample that was not found.
+pub @tier(embedded)
+@no_alloc
+fn copy_sample(var m: Vec[u8; 512], sample: XrceSample, var out: Vec[u8; 512]) -> Bool []
+    out.clear()
+    if not sample.found
+        return false
+    for i in 0..sample.length
+        let _ = out.push(m[sample.start + i])
+    true
+
+// A HEARTBEAT read out of a received message.
+pub @value
+struct XrceHeartbeat
+    // Whether the message held one.
+    found: Bool
+    // The reliable stream it is about.
+    stream: Int
+    // The first sequence number the sender still holds unacknowledged.
+    first: Int
+    // The last sequence number the sender sent.
+    last: Int
+
+// Read a HEARTBEAT out of a received message; `found = false` when there
+// is none.
+pub @tier(embedded)
+@no_alloc
+fn read_heartbeat(var m: Vec[u8; 512]) -> XrceHeartbeat []
+    let sub = find_submessage(var m, XRCE_SUB_HEARTBEAT)
+    if sub.id < 0 or sub.length < 5
+        return XrceHeartbeat { found: false, stream: 0, first: 0, last: 0 }
+    XrceHeartbeat {
+        found: true,
+        stream: m[sub.body + 4] as Int,
+        first: m[sub.body] as Int + m[sub.body + 1] as Int * 256,
+        last: m[sub.body + 2] as Int + m[sub.body + 3] as Int * 256 }
+
+// An ACKNACK read out of a received message.
+pub @value
+struct XrceAckNack
+    // Whether the message held one.
+    found: Bool
+    // The reliable stream it is about.
+    stream: Int
+    // The first sequence number the receiver has not got.
+    first: Int
+    // Bit j set: the message `first + j` is missing.
+    bitmap: Int
+
+// Read an ACKNACK out of a received message; `found = false` when there is
+// none.
+pub @tier(embedded)
+@no_alloc
+fn read_acknack(var m: Vec[u8; 512]) -> XrceAckNack []
+    let sub = find_submessage(var m, XRCE_SUB_ACKNACK)
+    if sub.id < 0 or sub.length < 5
+        return XrceAckNack { found: false, stream: 0, first: 0, bitmap: 0 }
+    XrceAckNack {
+        found: true,
+        stream: m[sub.body + 4] as Int,
+        first: m[sub.body] as Int + m[sub.body + 1] as Int * 256,
+        bitmap: m[sub.body + 2] as Int * 256 + m[sub.body + 3] as Int }
+
+// The 32-bit integer a sample holds in its first four bytes, least
+// significant first, as a signed number. The sample of a
+// std_msgs/msg/Int32. Answers 0 for a sample shorter than four bytes or
+// one that was not found, which a caller tells apart by `length`.
+pub @tier(embedded)
+@no_alloc
+fn sample_i32(var m: Vec[u8; 512], sample: XrceSample) -> Int []
+    if not sample.found or sample.length < 4
+        return 0
+    let v = m[sample.start] as Int + m[sample.start + 1] as Int * 256
+        + m[sample.start + 2] as Int * 65536 + m[sample.start + 3] as Int * 16777216
+    if v >= 2147483648
+        return v - 4294967296
+    v

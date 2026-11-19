@@ -1,0 +1,108 @@
+// uart_stdio_listener.nv — the device's listener, run on a PC.
+//
+// The subscribing counterpart of `uart_stdio.nv`: the same device code
+// (`ConsoleUart`, the serial framing, `rosuart`), with a host `main`.  On a
+// host `hal.uart` is the process's standard input and output, so give those
+// two descriptors a serial line to an agent and the agent sees the framed
+// bytes a board's UART would send:
+//
+//   socat pty,raw,echo=0,link=ttyAGENT pty,raw,echo=0,link=ttyBOARD
+//   MicroXRCEAgent serial --dev ttyAGENT -b 115200 -v 6
+//   novo build examples/uart_stdio_listener.nv -o uart_stdio_listener
+//   ./uart_stdio_listener <>ttyBOARD >&0
+//   ros2 topic pub --once /novo_cmd std_msgs/msg/Int32 "{data: 7}"
+//
+// The first argument is the stream the samples come back on, `best_effort`
+// (the default) or `reliable`, and the second is how many seconds to
+// listen, 30 by default.
+//
+// Nothing may print to standard output, because the agent would read it as
+// bytes; the program reports on standard error.
+//
+// The names are those of `examples/host_listener.nv`: the DDS topic of the
+// ROS topic /novo_cmd is `rt/novo_cmd`, and the DDS type of
+// std_msgs/msg/Int32 is `std_msgs::msg::dds_::Int32_`.
+
+use std.env
+use std.str
+use std.time
+use rosret
+use rosuart
+use rostransport
+use xrceframe
+use xrcestream
+use xrcewire
+
+// The ids the four entities are created with.
+const PARTICIPANT = 0x11
+const TOPIC = 0x12
+const SUBSCRIBER = 0x14
+const DATAREADER = 0x16
+
+// One create request, and whether the agent accepted it.
+fn created(out: rostransport.RosOutcome) -> Bool
+    out.code == 0
+
+// Open a session and create the four entities.  Answers the session,
+// established with the reader in place, or closed.
+fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                            var f: Vec[u8; 1037]) -> rostransport.RosSession [e]
+    let s = rosuart.open(u, var d, var m, var f, rostransport.session(0xAABBCCDD, 512), 1000)
+    if not rostransport.session_is_ready(s)
+        return s
+    let participant = rosuart.create(u, var d, var m, var f, s, PARTICIPANT,
+                                     xrcewire.XRCE_KIND_PARTICIPANT, 0,
+                                     "<dds><participant><rtps><name>novo_dk</name></rtps></participant></dds>",
+                                     1000)
+    let topic = rosuart.create(u, var d, var m, var f, participant.session, TOPIC,
+                               xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
+                               "<dds><topic><name>rt/novo_cmd</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></dds>",
+                               1000)
+    let subscriber = rosuart.create(u, var d, var m, var f, topic.session, SUBSCRIBER,
+                                    xrcewire.XRCE_KIND_SUBSCRIBER, PARTICIPANT, "", 1000)
+    let reader = rosuart.create(u, var d, var m, var f, subscriber.session, DATAREADER,
+                                xrcewire.XRCE_KIND_DATAREADER, SUBSCRIBER,
+                                "<dds><data_reader><topic><kind>NO_KEY</kind><name>rt/novo_cmd</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></data_reader></dds>",
+                                1000)
+    if created(participant) and created(topic) and created(subscriber) and created(reader)
+        return reader.session
+    rostransport.session_with_state(reader.session, rostransport.ROS_SESSION_CLOSED)
+
+fn main() [hw, io, time]
+    let args = env.args()
+    var stream = xrcewire.XRCE_STREAM_BEST_EFFORT
+    var seconds = 30
+    // args[0] is the program itself.
+    if list.len(args) > 1 and args[1] == "reliable"
+        stream = xrcewire.XRCE_STREAM_RELIABLE
+    if list.len(args) > 2
+        seconds = str.to_int(args[2]) ?? 30
+    let u = rosuart.console_uart()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    var rel = xrcestream.rel_stream()
+    var s = bring_up(u, var d, var m, var f)
+    if not rostransport.session_is_ready(s)
+        eprintln("no session: the agent did not answer, or refused an entity")
+        return
+    let asked = rosuart.request_data(u, var m, var f, s, DATAREADER, stream,
+                                     xrcewire.XRCE_SAMPLES_UNLIMITED)
+    s = asked.session
+    var count = 0
+    var last = time.now()
+    let end = last + seconds
+    while time.now() < end
+        let got = rosuart.poll(u, var d, var m, var f, var h, s, rel, 200)
+        s = got.session
+        rel = got.stream
+        if got.code == rosret.ROS_RET_OK
+            eprintln("sample ${count}: data ${xrcewire.sample_i32(var m, got.sample)}")
+            count = count + 1
+        // The silence is counted in the time that passed, which is less
+        // than the wait when a frame came early.
+        let now = time.now()
+        s = rosuart.keepalive(u, var m, var f, s, ((now - last) * 1000.0) as Int)
+        last = now
+    eprintln("received ${count} sample(s), silence ${s.silent_ms} ms")

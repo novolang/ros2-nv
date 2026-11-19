@@ -1,0 +1,148 @@
+// host_listener.nv — a micro-ROS node on a workstation that subscribes: it
+// opens a session with a Micro XRCE-DDS Agent over TCP, creates a
+// participant, the topic /novo_cmd of type std_msgs/msg/Int32, a subscriber
+// and a data reader, asks the agent for samples, and prints each one.
+//
+// Run it with an agent listening, then publish to it from ROS 2:
+//
+//   MicroXRCEAgent tcp4 --port 2018
+//   novo run examples/host_listener.nv
+//   ros2 topic pub --once /novo_cmd std_msgs/msg/Int32 "{data: 7}"
+//
+// It takes the agent's host and port, the stream the samples come back
+// on and how many seconds to listen, from its arguments:
+//
+//   novo run examples/host_listener.nv 127.0.0.1 2018 reliable 30
+//
+// The stream is `best_effort`, the default, or `reliable`.  On a reliable
+// stream the agent numbers what it sends and this program acknowledges it
+// and asks for what it missed; on a best-effort stream a sample lost on the
+// way is lost.
+//
+// The names are the ones `examples/host_talker.nv` explains: the DDS topic
+// of the ROS topic /novo_cmd is `rt/novo_cmd`, and the DDS type of
+// std_msgs/msg/Int32 is `std_msgs::msg::dds_::Int32_`.  The sample is the
+// four bytes of the number, as the agent hands it over without the CDR
+// representation header.
+//
+// THE LOOP IS THE EXECUTOR'S SHAPE.  `poll` takes one message and says
+// whether it was a sample; `rosexec.ready_from_take` turns that into the
+// handle's bit, and `spin_step` says which handle to run.  With one handle
+// that is a formality, and with several subscriptions it is the order the
+// handles were added in.
+
+use std.env
+use std.str
+use std.time
+use rosagent
+use rosexec
+use rosmsg
+use rosname
+use rosret
+use rostransport
+use xrcestream
+use xrcewire
+
+// The DDS domain id the participant joins: ROS_DOMAIN_ID, 0 by default.
+const DOMAIN = 0
+
+// The four entities and the ids they are created with.
+const PARTICIPANT = 0x11
+const TOPIC = 0x12
+const SUBSCRIBER = 0x14
+const DATAREADER = 0x16
+
+const TOPIC_NAME = "rt/novo_cmd"
+const TYPE_NAME = "std_msgs::msg::dds_::Int32_"
+
+fn say_status(what: Str, out: RosOutcome) [io]
+    println("${what}: code ${out.code}, agent status ${out.status} (${xrcewire.status_name(out.status)})")
+
+fn main() [net, io, time]
+    let args = env.args()
+    var host = "127.0.0.1"
+    var port = 2018
+    var stream = xrcewire.XRCE_STREAM_BEST_EFFORT
+    var seconds = 30
+    // args[0] is the program itself.
+    if list.len(args) > 1
+        host = args[1]
+    if list.len(args) > 2
+        port = str.to_int(args[2]) ?? 2018
+    if list.len(args) > 3 and args[3] == "reliable"
+        stream = xrcewire.XRCE_STREAM_RELIABLE
+    if list.len(args) > 4
+        seconds = str.to_int(args[4]) ?? 30
+    match rosagent.connect(host, port)
+        None       => println("no agent at ${host}:${port}")
+        Some(link) =>
+            listen(link, stream, seconds)
+            rosagent.disconnect(link)
+
+// Little-endian signed 32-bit integer at the start of a payload.
+fn int32_of(payload: Bytes) -> Int
+    let v = bytes.u32_le_at(payload, 0) ?? 0
+    if v >= 2147483648
+        return v - 4294967296
+    v
+
+fn listen(link: RosAgentLink, stream: Int, seconds: Int) [net, io, time]
+    var s = rostransport.session(0xAABBCCDD, rosagent.ROS_AGENT_MTU)
+    s = rostransport.open_session(link, s, 2000)
+    println("session: ${rostransport.session_state_name(s.state)}")
+    if not rostransport.session_is_ready(s)
+        return
+
+    let participant = rostransport.create_entity(link, s, PARTICIPANT,
+        xrcewire.XRCE_KIND_PARTICIPANT, DOMAIN,
+        "<dds><participant><rtps><name>novo_listener</name></rtps></participant></dds>", 2000)
+    say_status("participant", participant)
+    let topic = rostransport.create_entity(link, participant.session, TOPIC,
+        xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
+        "<dds><topic><name>${TOPIC_NAME}</name><dataType>${TYPE_NAME}</dataType></topic></dds>", 2000)
+    say_status("topic", topic)
+    let subscriber = rostransport.create_entity(link, topic.session, SUBSCRIBER,
+        xrcewire.XRCE_KIND_SUBSCRIBER, PARTICIPANT, "", 2000)
+    say_status("subscriber", subscriber)
+    let reader = rostransport.create_entity(link, subscriber.session, DATAREADER,
+        xrcewire.XRCE_KIND_DATAREADER, SUBSCRIBER,
+        "<dds><data_reader><topic><kind>NO_KEY</kind><name>${TOPIC_NAME}</name><dataType>${TYPE_NAME}</dataType></topic></data_reader></dds>", 2000)
+    say_status("datareader", reader)
+    if reader.code != 0
+        return
+
+    s = reader.session
+    let asked = rostransport.request_data(link, s, DATAREADER, stream,
+                                          xrcewire.XRCE_SAMPLES_UNLIMITED)
+    s = asked.session
+    println("request: code ${asked.code}")
+
+    let type_id = rosname.type_id("std_msgs/msg/Int32")
+    var ex = rosexec.add_handle(rosexec.executor(1))
+    var rel = xrcestream.rel_stream()
+    var hist = xrcestream.history()
+    var count = 0
+    var last = time.now()
+    let end = last + seconds
+    while time.now() < end
+        let taken = rostransport.poll(link, s, rel, var hist, type_id, 200)
+        s = taken.session
+        rel = taken.stream
+        if taken.code == rosret.ROS_RET_ERROR
+            println("agent refused the request: status ${taken.status} (${xrcewire.status_name(taken.status)})")
+            return
+        let ready = rosexec.ready_from_take(0, taken.code)
+        let step = rosexec.spin_step(rosexec.spin_begin(ex), ready)
+        if step.dispatch
+            let value = int32_of(rosmsg.payload(taken.message))
+            println("sample ${count}: data ${value}, ${rosmsg.payload_length(taken.message)} bytes")
+            count = count + 1
+        let now = time.now()
+        s = rostransport.keepalive(link, s, ((now - last) * 1000.0) as Int)
+        last = now
+        if not rostransport.session_is_ready(s)
+            println("session: ${rostransport.session_state_name(s.state)}")
+            return
+    let stopped = rostransport.request_data(link, s, DATAREADER, stream, 0)
+    s = rostransport.close_session(link, stopped.session)
+    println("received ${count} sample(s)")

@@ -11,6 +11,16 @@
 //
 // The agent's TCP port is 2018 by convention; this program takes the host
 // and the port from its arguments, and its defaults are 127.0.0.1 and 2018.
+// A third argument, `reliable`, writes the counter on the reliable stream
+// instead of the best-effort one:
+//
+//   novo run examples/host_talker.nv 127.0.0.1 2018 reliable
+//
+// A sample on the reliable stream is kept until the agent acknowledges it
+// and is sent again if the agent says it never came, so a sample written
+// while the agent could not be reached arrives once it can.  The program
+// spends the second between samples in `poll` and `reliable_tick`, which is
+// where the acknowledgements are read and the retransmissions are sent.
 //
 // WHAT MAKES A ROS 2 PARTICIPANT SEE IT.  The names are the ones
 // micro-ROS's rmw layer gives: the DDS topic of the ROS topic
@@ -26,6 +36,7 @@ use std.str
 use std.time
 use rosagent
 use rostransport
+use xrcestream
 use xrcewire
 
 // The DDS domain id the participant joins: ROS_DOMAIN_ID, 0 by default.
@@ -52,13 +63,14 @@ fn main() [net, io, time]
         host = args[1]
     if list.len(args) > 2
         port = str.to_int(args[2]) ?? 2018
+    let reliable = list.len(args) > 3 and args[3] == "reliable"
     match rosagent.connect(host, port)
         None       => println("no agent at ${host}:${port}")
         Some(link) =>
-            talk(link)
+            talk(link, reliable)
             rosagent.disconnect(link)
 
-fn talk(link: RosAgentLink) [net, io, time]
+fn talk(link: RosAgentLink, reliable: Bool) [net, io, time]
     var s = rostransport.session(0xAABBCCDD, rosagent.ROS_AGENT_MTU)
     s = rostransport.open_session(link, s, 2000)
     println("session: ${rostransport.session_state_name(s.state)}")
@@ -84,15 +96,36 @@ fn talk(link: RosAgentLink) [net, io, time]
         return
 
     s = writer.session
+    var rel = xrcestream.rel_stream()
+    var hist = xrcestream.history()
     // Long enough for the agent's writer to find a subscriber before the
     // first sample, which a best-effort stream does not repeat.
     time.sleep(1.0)
     var n = 0
     let limit = 10
     while n < limit
-        let out = rostransport.write_sample(link, s, DATAWRITER, bytes.u32_le(n))
-        s = out.session
-        println("published ${n}: code ${out.code}")
+        if reliable
+            let out = rostransport.write_sample_reliable(link, s, rel, var hist, DATAWRITER,
+                                                         bytes.u32_le(n))
+            s = out.session
+            rel = out.stream
+            println("published ${n}: code ${out.code}")
+            // A second of polling: the agent's ACKNACKs are read here, and
+            // a message it did not get is sent again.
+            var last = time.now()
+            let until = last + 1.0
+            while time.now() < until
+                let taken = rostransport.poll(link, s, rel, var hist, 0, 100)
+                s = taken.session
+                let now = time.now()
+                rel = rostransport.reliable_tick(link, s, taken.stream,
+                                                 ((now - last) * 1000.0) as Int)
+                last = now
+            println("  after a second: ${xrcestream.out_in_flight(rel)} unacknowledged")
+        else
+            let out = rostransport.write_sample(link, s, DATAWRITER, bytes.u32_le(n))
+            s = out.session
+            println("published ${n}: code ${out.code}")
+            time.sleep(1.0)
         n = n + 1
-        time.sleep(1.0)
     s = rostransport.close_session(link, s)

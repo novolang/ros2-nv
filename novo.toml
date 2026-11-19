@@ -1,6 +1,6 @@
 [package]
 name        = "ros2-nv"
-version     = "0.1.1"
+version     = "0.1.2"
 description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent over TCP or, on a device, over a UART."
 license     = "Apache-2.0"
 
@@ -22,7 +22,7 @@ stability   = "experimental"
 #
 # `tests/embedded_probe.nv` is what makes the claim a thing the audit
 # BUILDS: `rosret`, `rosqos`, `rosgraph`, `rosexec` and the serial session
-# (`xrceframe`, `xrcewire`, `rosuart`) link for `--target=nrf52-qemu`.
+# (`xrceframe`, `xrcewire`, `xrcestream`, `rosuart`) link for `--target=nrf52-qemu`.
 layer       = "core"
 
 # `rosagent` is the one module that performs: a Micro XRCE-DDS session

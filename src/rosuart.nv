@@ -33,6 +33,7 @@
 use rostransport
 use rosret
 use xrceframe
+use xrcestream
 use xrcewire
 
 // What a UART supplies to this package: a byte out, a byte in, and a
@@ -258,3 +259,175 @@ fn heartbeat<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8;
     if xrcewire.read_reply(var m).kind == xrcewire.XRCE_REPLY_INFO
         return rostransport.session_heard(rostransport.session_next_request(waited))
     waited
+
+// ── Subscriptions and the reliable stream ────────────────────────────
+
+// What `poll` took from the UART.
+pub @value
+struct RosPoll
+    // The session after the call. Any message from the agent clears its
+    // silence.
+    session: rostransport.RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // `ROS_RET_OK` when `sample` was found; `ROS_RET_SUBSCRIPTION_TAKE_FAILED`
+    // when no whole frame came in time or what came held no sample, which
+    // is not an error; `ROS_RET_NOT_INIT` for a session that is not
+    // established; `ROS_RET_ERROR` when the agent answered a request with
+    // a status that is not OK, and `status` has the number.
+    code: Int
+    // The agent's status number when `code` is `ROS_RET_ERROR`, else -1.
+    status: Int
+    // The sample and where its bytes are in the caller's message buffer.
+    sample: xrcewire.XrceSample
+
+// A `RosPoll` that took no sample.
+@tier(embedded)
+@no_alloc
+fn poll_none(s: rostransport.RosSession, r: xrcestream.RelStream, code: Int,
+             status: Int) -> RosPoll []
+    RosPoll { session: s, stream: r, code: code, status: status,
+              sample: xrcewire.XrceSample { found: false, request: 0, object: 0, start: 0,
+                                            length: 0 } }
+
+// A `RosRelOutcome` from its parts.
+@tier(embedded)
+@no_alloc
+fn rel_outcome(s: rostransport.RosSession, r: xrcestream.RelStream, code: Int,
+               status: Int) -> rostransport.RosRelOutcome []
+    rostransport.RosRelOutcome { session: s, stream: r, code: code, status: status }
+
+// Ask the agent for samples from a data reader.
+//
+// The arguments are those of `rostransport.request_data`, and so is the
+// outcome. Goes out on the best-effort stream and is not waited for.
+pub @tier(embedded)
+@no_alloc
+fn request_data<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                                s: rostransport.RosSession, reader: Int, data_stream: Int,
+                                max_samples: Int) -> rostransport.RosOutcome [e]
+    if not rostransport.session_is_ready(s)
+        return outcome(s, rosret.ROS_RET_NOT_INIT, 0 - 1)
+    let request = s.next_request
+    let sent = rostransport.session_wrote(rostransport.session_next_request(s))
+    let _built = xrcewire.read_data(var m, xrcewire.XRCE_STREAM_BEST_EFFORT, s.output_seq,
+                                    request, reader, data_stream, max_samples)
+    if not send(u, var m, var f)
+        return outcome(s, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+    outcome(sent, rosret.ROS_RET_OK, 0 - 1)
+
+// Publish one 32-bit integer to a data writer on the reliable stream.
+//
+// The sample is the four bytes of the number, as for `publish_i32`. The
+// message takes the next sequence number of the stream and a slot of the
+// history `h`, which `xrcestream.history` makes, and stays there until the
+// agent acknowledges it. The outcome's code is `ROS_RET_OK` when every byte
+// of the frame went out, `ROS_RET_NOT_INIT` for a session not established,
+// `ROS_RET_BAD_ALLOC` when `xrcestream.XRCE_HISTORY` messages are already
+// unacknowledged, and `ROS_RET_AGENT_UNREACHABLE` when the transmitter
+// refused; the sample is kept in that last case and goes out again when the
+// agent asks for it.
+pub @tier(embedded)
+@no_alloc
+fn publish_i32_reliable<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                                        var h: Vec[u8; 2056], s: rostransport.RosSession,
+                                        r: xrcestream.RelStream, writer: Int,
+                                        value: Int) -> rostransport.RosRelOutcome [e]
+    if not rostransport.session_is_ready(s)
+        return rel_outcome(s, r, rosret.ROS_RET_NOT_INIT, 0 - 1)
+    if not xrcestream.out_can_write(r)
+        return rel_outcome(s, r, rosret.ROS_RET_BAD_ALLOC, 0 - 1)
+    let request = s.next_request
+    let sent = rostransport.session_next_request(s)
+    let _begun = xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_RELIABLE, r.out_next,
+                                           request, writer)
+    let _put = xrcewire.put_sample_i32(var m, value)
+    let _len = xrcewire.finish_write_data(var m)
+    let _kept = xrcestream.history_store(var h, r.out_next, var m)
+    let after = xrcestream.out_wrote(r)
+    if not send(u, var m, var f)
+        return rel_outcome(sent, after, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+    rel_outcome(sent, after, rosret.ROS_RET_OK, 0 - 1)
+
+// Count `elapsed_ms` of quiet on the reliable stream, and send a HEARTBEAT
+// if one is due.
+//
+// The arguments and the rule are those of `rostransport.reliable_tick`.
+pub @tier(embedded)
+@no_alloc
+fn reliable_tick<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                                 s: rostransport.RosSession, r: xrcestream.RelStream,
+                                 elapsed_ms: Int) -> xrcestream.RelStream [e]
+    let q = xrcestream.out_quiet(r, elapsed_ms)
+    if not rostransport.session_is_ready(s) or not xrcestream.out_heartbeat_due(q)
+        return q
+    let _built = xrcewire.heartbeat(var m, q.out_first, xrcestream.out_last(q),
+                                    xrcewire.XRCE_STREAM_RELIABLE)
+    let _sent = send(u, var m, var f)
+    xrcestream.out_heartbeat_sent(q)
+
+// Count `elapsed_ms` of silence, and send a ping if the agent has been
+// quiet long enough to be asked.
+//
+// The send-only half of `heartbeat`, for a program that calls `poll`; the
+// rule is that of `rostransport.keepalive`.
+pub @tier(embedded)
+@no_alloc
+fn keepalive<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                             s: rostransport.RosSession, elapsed_ms: Int)
+                             -> rostransport.RosSession [e]
+    let waited = rostransport.session_silent(s, elapsed_ms)
+    if not rostransport.session_is_ready(waited)
+        return waited
+    if rostransport.session_is_stale(waited, rostransport.ROS_SESSION_TIMEOUT_MS)
+        return rostransport.session_with_state(waited, rostransport.ROS_SESSION_LOST)
+    if waited.silent_ms < rostransport.ROS_HEARTBEAT_MS
+        return waited
+    let _built = xrcewire.ping(var m, waited.next_request)
+    let _sent = send(u, var m, var f)
+    rostransport.session_next_request(waited)
+
+// Take the next frame from the agent and act on it.
+//
+// Waits up to `timeout_ms` for one frame, as `receive` does, leaves its
+// message in `m` and runs it through `xrcestream.receive`. A sample
+// delivered in order is `sample` in the result, its bytes at
+// `m[sample.start]` for `sample.length` bytes; `xrcewire.sample_i32` reads
+// a number out of them. A message on the reliable stream is acknowledged,
+// whatever it held, a HEARTBEAT is answered with an ACKNACK, and an ACKNACK
+// acknowledges what the node wrote and sends again the messages from the
+// history `h` that its bitmap names. The replies are built in a scratch
+// message on the stack, so `m` still holds the sample when the call
+// returns. One frame per call.
+pub @tier(embedded)
+@no_alloc
+fn poll<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                        var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                        s: rostransport.RosSession, r: xrcestream.RelStream,
+                        timeout_ms: Int) -> RosPoll [e]
+    if not rostransport.session_is_ready(s)
+        return poll_none(s, r, rosret.ROS_RET_NOT_INIT, 0 - 1)
+    if receive(u, var d, var m, timeout_ms) != xrceframe.XRCE_PUSH_FRAME
+        return poll_none(s, r, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1)
+    let reply = xrcewire.read_reply(var m)
+    let ev = xrcestream.receive(var m, r)
+    let heard = rostransport.session_heard(s)
+    var a: Vec[u8; 512] = Vec.new()
+    if ev.ack
+        let _built = xrcewire.acknack(var a, xrcestream.in_first(ev.stream),
+                                      xrcestream.in_bitmap(ev.stream),
+                                      xrcewire.XRCE_STREAM_RELIABLE)
+        let _sent = send(u, var a, var f)
+    if ev.resend
+        for j in 0..xrcestream.XRCE_ACKNACK_SPAN
+            if xrcestream.out_resend(ev.stream, ev.resend_first, ev.resend_bitmap, j)
+                let n = xrcestream.history_load(var h, xrcestream.seq_add(ev.resend_first, j),
+                                                var a)
+                if n > 0
+                    let _again = send(u, var a, var f)
+    if ev.sample.found
+        return RosPoll { session: heard, stream: ev.stream, code: rosret.ROS_RET_OK,
+                         status: 0 - 1, sample: ev.sample }
+    if reply.kind == xrcewire.XRCE_REPLY_STATUS and not xrcewire.status_is_ok(reply.status)
+        return poll_none(heard, ev.stream, rosret.ROS_RET_ERROR, reply.status)
+    poll_none(heard, ev.stream, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1)

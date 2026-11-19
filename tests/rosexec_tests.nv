@@ -91,6 +91,22 @@ fn test_a_ready_set_is_a_bit_per_handle() [io]
     test.assert_eq(rosexec.ready_count(0), 0)
 
 @test
+fn test_a_subscription_is_ready_when_its_take_found_a_sample() [io]
+    test.case("a take that found one contributes the handle's bit")
+    test.assert_eq(rosexec.ready_from_take(2, rosret.ROS_RET_OK), 4)
+
+    test.case("a take that found nothing, which is not an error, contributes none")
+    test.assert_eq(rosexec.ready_from_take(2, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED), 0)
+    test.assert_eq(rosexec.ready_from_take(0, rosret.ROS_RET_ERROR), 0)
+
+    test.case("two subscriptions, one of which has a sample, dispatch once")
+    let ready = rosexec.ready_from_take(0, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+        | rosexec.ready_from_take(1, rosret.ROS_RET_OK)
+    let e = rosexec.add_handle(rosexec.add_handle(rosexec.executor(2)))
+    test.assert_eq(drive(e, ready), 1)
+    test.assert_eq(rosexec.spin_step(rosexec.spin_begin(e), ready).index, 1)
+
+@test
 fn test_trigger_all_is_what_makes_a_fusion_node_deterministic() [io]
     // A filter that needs a reading from three sensors runs once per
     // complete set rather than three times per set with two thirds of

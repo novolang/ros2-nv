@@ -1,0 +1,762 @@
+// xrcestream_tests.nv — the messages that carry subscriptions and the
+// reliable stream (`xrcewire`), and the stream's state machine
+// (`xrcestream`).
+//
+// THREE KINDS OF EVIDENCE, AND WHERE EACH CAME FROM.
+//
+//  - Recorded: the frames marked "recorded" are bytes a Micro XRCE-DDS
+//    Agent 2.4.3 sent or accepted on 2026-11-19 (its log at verbose level 6
+//    prints every message), with ROS 2 Jazzy publishing to the topic the
+//    node subscribed to, and `ros2 topic echo` printing the numbers the node
+//    wrote on the reliable stream.  `docs/agent-run.md` has the runs.
+//  - Derived: the frames marked "derived" are worked out by hand from the
+//    layout at the top of `src/xrcewire.nv` and from the eProsima client's
+//    serialisers, which are the source the agent's types are generated from.
+//    The agent's HEARTBEAT is one: in the runs it did not send one, because
+//    it never held an unacknowledged message long enough.
+//  - Simulated: the last test drives a sender and a receiver of one reliable
+//    stream against each other, losing, repeating and reordering messages,
+//    with the real builders and readers between them.
+
+use std.list
+use std.test
+use xrcestream
+use xrcewire
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+// A message buffer from a list of bytes.
+fn vec_of(xs: [Int]) -> Vec[u8; 512]
+    var m: Vec[u8; 512] = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+// The bytes of a message buffer, as a list.
+fn list_of(var m: Vec[u8; 512]) -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for x in m
+        let wide = x as Int
+        out = list.push(out, wide)
+    out
+
+// Whether two streams hold the same numbers.
+fn same(a: xrcestream.RelStream, b: xrcestream.RelStream) -> Bool
+    a.out_first == b.out_first and a.out_next == b.out_next
+        and a.out_quiet_ms == b.out_quiet_ms and a.in_handled == b.in_handled
+        and a.in_announced == b.in_announced
+
+// RECORDED.  The agent's DATA on the best-effort stream, answering the
+// READ_DATA of request 5 for the data reader 0x16: header 81 01 04 00
+// (stream 1, sequence 4), submessage 09 01 08 00, ids 00 05 00 16, and the
+// sample, the integer 7.
+fn data_best_effort() -> [Int]
+    [0x81, 0x01, 0x04, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16, 0x07, 0x00, 0x00, 0x00]
+
+// RECORDED.  The agent's DATA on the reliable stream: the same message at
+// sequence `seq` of stream 0x80.  The recorded ones carried the integers 11
+// (sequence 0) and 12 (sequence 1).
+fn data_reliable(seq: Int, value: Int) -> [Int]
+    [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
+     value, 0x00, 0x00, 0x00]
+
+// RECORDED.  The ACKNACK either side sends: header 81 00 00 00 (stream 0,
+// sequence 0), submessage 0A 01 05 00, the first number not received, the
+// bitmap (high byte first), the stream 0x80.  The agent sent 3 with the
+// bitmap 0x0007 after the node's HEARTBEAT announced sequence 5, and the
+// node sent 1 with the bitmap 0 after the agent's first DATA.
+fn acknack_message(first: Int, bitmap: Int) -> [Int]
+    [0x81, 0x00, 0x00, 0x00, 0x0A, 0x01, 0x05, 0x00, first & 0xFF, first >>> 8,
+     bitmap >>> 8, bitmap & 0xFF, 0x80]
+
+// RECORDED when the node sent it (first 3, last 5); DERIVED for the agent,
+// whose serialiser is the same.  The HEARTBEAT of stream 0x80.
+fn heartbeat_message(first: Int, last: Int) -> [Int]
+    [0x81, 0x00, 0x00, 0x00, 0x0B, 0x01, 0x05, 0x00, first & 0xFF, first >>> 8, last & 0xFF,
+     last >>> 8, 0x80]
+
+// The STATUS the agent answers a request with.
+fn status_message(request: Int, object: Int, status: Int) -> [Int]
+    [0x81, 0x01, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, request >>> 8, request & 0xFF,
+     object >>> 8, object & 0xFF, status, 0x00]
+
+// ── xrcewire: the messages ───────────────────────────────────────────
+
+@test
+fn test_a_read_request_is_what_the_agent_accepted() [io]
+    var m: Vec[u8; 512] = Vec.new()
+
+    // RECORDED.  READ_DATA for the data reader 0x16 (id 1, kind 6), request
+    // 5, on stream 1 at sequence 4, asking for every sample (0xFFFF) on the
+    // best-effort stream:
+    //   header     81 01 04 00
+    //   submessage 08 01 10 00     READ_DATA, little-endian, length 16
+    //   payload    00 05 00 16 | 01 (stream) 00 (format DATA) 00 (no filter)
+    //              01 (delivery control) | FF FF (samples) 00 00 (seconds)
+    //              00 00 (rate) 00 00 (pace)
+    test.case("READ_DATA for every sample on the best-effort stream")
+    test.assert(xrcewire.read_data(var m, 1, 4, 5, xrcewire.object_id(1, xrcewire.XRCE_KIND_DATAREADER),
+                                   xrcewire.XRCE_STREAM_BEST_EFFORT, xrcewire.XRCE_SAMPLES_UNLIMITED))
+    test.assert_eq(list_of(var m),
+                   [0x81, 0x01, 0x04, 0x00, 0x08, 0x01, 0x10, 0x00, 0x00, 0x05, 0x00, 0x16,
+                    0x01, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+    // RECORDED.  The same, with the samples to come back on stream 0x80.
+    test.case("the samples on the reliable stream")
+    test.assert(xrcewire.read_data(var m, 1, 4, 5, 0x16, xrcewire.XRCE_STREAM_RELIABLE,
+                                   xrcewire.XRCE_SAMPLES_UNLIMITED))
+    test.assert_eq(m[12] as Int, 0x80)
+    test.assert_eq(m.len(), 24)
+
+    // RECORDED.  A request for no samples at all ends the one before it:
+    // request 0x4C at sequence 5.
+    test.case("a request for no samples stops the reading")
+    test.assert(xrcewire.read_data(var m, 1, 5, 0x4C, 0x16, xrcewire.XRCE_STREAM_RELIABLE, 0))
+    test.assert_eq(list_of(var m),
+                   [0x81, 0x01, 0x05, 0x00, 0x08, 0x01, 0x10, 0x00, 0x00, 0x4C, 0x00, 0x16,
+                    0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+    test.case("one sample")
+    test.assert(xrcewire.read_data(var m, 1, 0, 1, 0x16, 1, 1))
+    test.assert_eq(m[16] as Int, 1)
+    test.assert_eq(m[17] as Int, 0)
+
+@test
+fn test_the_stream_messages_are_what_the_agent_accepted() [io]
+    var m: Vec[u8; 512] = Vec.new()
+
+    // RECORDED.  The node's HEARTBEAT for stream 0x80: first 3, last 5.
+    test.case("HEARTBEAT")
+    test.assert(xrcewire.heartbeat(var m, 3, 5, xrcewire.XRCE_STREAM_RELIABLE))
+    test.assert_eq(list_of(var m), heartbeat_message(3, 5))
+
+    // RECORDED.  The node's ACKNACK after the agent's first DATA.
+    test.case("ACKNACK")
+    test.assert(xrcewire.acknack(var m, 1, 0, xrcewire.XRCE_STREAM_RELIABLE))
+    test.assert_eq(list_of(var m), acknack_message(1, 0))
+
+    // RECORDED.  The bitmap goes high byte first: 0x0007 is 00 07.
+    test.case("an ACKNACK with a bitmap, and a number past 255")
+    test.assert(xrcewire.acknack(var m, 3, 7, xrcewire.XRCE_STREAM_RELIABLE))
+    test.assert_eq(list_of(var m), acknack_message(3, 7))
+    test.assert(xrcewire.acknack(var m, 0x1234, 0xABCD, xrcewire.XRCE_STREAM_RELIABLE))
+    test.assert_eq(list_of(var m),
+                   [0x81, 0x00, 0x00, 0x00, 0x0A, 0x01, 0x05, 0x00, 0x34, 0x12, 0xAB, 0xCD, 0x80])
+
+    // RECORDED.  A WRITE_DATA on the reliable stream: stream 0x80, sequence
+    // 3, request 8, writer 0x15, the integer 3.
+    test.case("WRITE_DATA on stream 0x80")
+    test.assert(xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_RELIABLE, 3, 8, 0x15))
+    test.assert(xrcewire.put_sample_i32(var m, 3))
+    test.assert_eq(xrcewire.finish_write_data(var m), 8)
+    test.assert_eq(list_of(var m),
+                   [0x81, 0x80, 0x03, 0x00, 0x07, 0x01, 0x08, 0x00, 0x00, 0x08, 0x00, 0x15,
+                    0x03, 0x00, 0x00, 0x00])
+
+@test
+fn test_a_sample_is_read_where_the_agent_put_it() [io]
+    test.case("the recorded DATA on the best-effort stream")
+    var a = vec_of(data_best_effort())
+    let s = xrcewire.read_sample(var a)
+    test.assert(s.found)
+    test.assert_eq(s.request, 5)
+    test.assert_eq(s.object, 0x16)
+    test.assert_eq(s.start, 12)
+    test.assert_eq(s.length, 4)
+    test.assert_eq(xrcewire.sample_i32(var a, s), 7)
+    test.assert_eq(xrcewire.message_stream(var a), 1)
+    test.assert_eq(xrcewire.message_seq(var a), 4)
+
+    test.case("the recorded DATA on the reliable stream")
+    var b = vec_of(data_reliable(1, 12))
+    test.assert_eq(xrcewire.message_stream(var b), 0x80)
+    test.assert_eq(xrcewire.message_seq(var b), 1)
+    test.assert_eq(xrcewire.sample_i32(var b, xrcewire.read_sample(var b)), 12)
+
+    test.case("the sequence number is two bytes, low byte first")
+    var wide = vec_of(data_reliable(0x1234, 1))
+    test.assert_eq(xrcewire.message_seq(var wide), 0x1234)
+
+    test.case("a negative number is its two's complement")
+    var neg = vec_of([0x81, 0x01, 0x00, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
+                      0xFF, 0xFF, 0xFF, 0xFF])
+    test.assert_eq(xrcewire.sample_i32(var neg, xrcewire.read_sample(var neg)), 0 - 1)
+    var low = vec_of([0x81, 0x01, 0x00, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
+                      0x00, 0x00, 0x00, 0x80])
+    test.assert_eq(xrcewire.sample_i32(var low, xrcewire.read_sample(var low)), 0 - 2147483648)
+
+    test.case("a longer sample, and the bytes copied out")
+    var longer = vec_of([0x81, 0x01, 0x00, 0x00, 0x09, 0x01, 0x0A, 0x00, 0x00, 0x05, 0x00, 0x16,
+                         0x09, 0x00, 0x00, 0x00, 0xAA, 0xBB])
+    let l = xrcewire.read_sample(var longer)
+    test.assert_eq(l.length, 6)
+    test.assert_eq(xrcewire.sample_i32(var longer, l), 9)
+    var out: Vec[u8; 512] = Vec.new()
+    test.assert(xrcewire.copy_sample(var longer, l, var out))
+    test.assert_eq(list_of(var out), [0x09, 0x00, 0x00, 0x00, 0xAA, 0xBB])
+
+    test.case("a sample too short for an integer reads as zero")
+    var tiny = vec_of([0x81, 0x01, 0x00, 0x00, 0x09, 0x01, 0x06, 0x00, 0x00, 0x05, 0x00, 0x16,
+                       0x09, 0x01])
+    let t = xrcewire.read_sample(var tiny)
+    test.assert(t.found)
+    test.assert_eq(t.length, 2)
+    test.assert_eq(xrcewire.sample_i32(var tiny, t), 0)
+
+    test.case("a DATA behind another submessage")
+    // The HEARTBEAT ends at offset 13 and the DATA starts at 16.
+    var behind = vec_of([0x81, 0x00, 0x00, 0x00, 0x0B, 0x01, 0x05, 0x00, 0, 0, 0, 0, 0x80, 0, 0, 0,
+                         0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16, 0x07, 0x00, 0x00, 0x00])
+    let b2 = xrcewire.read_sample(var behind)
+    test.assert(b2.found)
+    test.assert_eq(b2.start, 24)
+
+    test.case("a header with a client key is eight bytes")
+    var keyed = vec_of([0x01, 0x01, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD,
+                        0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16, 0x07, 0x00, 0x00, 0x00])
+    test.assert_eq(xrcewire.read_sample(var keyed).start, 16)
+
+@test
+fn test_what_is_not_a_sample_is_not_found() [io]
+    var out: Vec[u8; 512] = Vec.new()
+
+    test.case("a message with no DATA")
+    var status = vec_of(status_message(1, 0x16, 0))
+    let none = xrcewire.read_sample(var status)
+    test.assert(not none.found)
+    test.assert(not xrcewire.copy_sample(var status, none, var out))
+    test.assert_eq(out.len(), 0)
+    test.assert_eq(xrcewire.sample_i32(var status, none), 0)
+
+    test.case("a DATA in another format")
+    // Flags 01 | 02 is the SAMPLE format, which carries a sample's info
+    // before its bytes; only the DATA format is read.
+    var other = vec_of([0x81, 0x01, 0x00, 0x00, 0x09, 0x03, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
+                        0x07, 0x00, 0x00, 0x00])
+    test.assert(not xrcewire.read_sample(var other).found)
+
+    test.case("a DATA shorter than its two ids")
+    var shorter = vec_of([0x81, 0x01, 0x00, 0x00, 0x09, 0x01, 0x02, 0x00, 0x00, 0x05])
+    test.assert(not xrcewire.read_sample(var shorter).found)
+
+    test.case("a DATA that runs past the end of the message")
+    var cut = vec_of([0x81, 0x01, 0x00, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
+                      0x07])
+    test.assert(not xrcewire.read_sample(var cut).found)
+
+    test.case("an empty message")
+    var empty: Vec[u8; 512] = Vec.new()
+    test.assert(not xrcewire.read_sample(var empty).found)
+    test.assert_eq(xrcewire.message_stream(var empty), 0 - 1)
+    test.assert_eq(xrcewire.message_seq(var empty), 0 - 1)
+    test.assert_eq(xrcewire.find_submessage(var empty, xrcewire.XRCE_SUB_DATA).id, 0 - 1)
+
+    test.case("a submessage found carries its id, flags, body and length")
+    var one = vec_of(data_best_effort())
+    let sub = xrcewire.find_submessage(var one, xrcewire.XRCE_SUB_DATA)
+    test.assert_eq(sub.id, xrcewire.XRCE_SUB_DATA)
+    test.assert_eq(sub.flags, 1)
+    test.assert_eq(sub.body, 8)
+    test.assert_eq(sub.length, 8)
+
+@test
+fn test_a_heartbeat_and_an_acknack_are_read() [io]
+    test.case("the node's recorded HEARTBEAT")
+    var h = vec_of(heartbeat_message(3, 5))
+    let beat = xrcewire.read_heartbeat(var h)
+    test.assert(beat.found)
+    test.assert_eq(beat.first, 3)
+    test.assert_eq(beat.last, 5)
+    test.assert_eq(beat.stream, 0x80)
+
+    test.case("numbers past 255 are two bytes, low byte first")
+    var wide = vec_of(heartbeat_message(0x1234, 0xFFFE))
+    let w = xrcewire.read_heartbeat(var wide)
+    test.assert_eq(w.first, 0x1234)
+    test.assert_eq(w.last, 0xFFFE)
+
+    test.case("the agent's recorded ACKNACK")
+    var a = vec_of(acknack_message(3, 7))
+    let nack = xrcewire.read_acknack(var a)
+    test.assert(nack.found)
+    test.assert_eq(nack.first, 3)
+    test.assert_eq(nack.bitmap, 7)
+    test.assert_eq(nack.stream, 0x80)
+
+    test.case("a bitmap is two bytes, high byte first")
+    var big = vec_of(acknack_message(0x0102, 0xA005))
+    let b = xrcewire.read_acknack(var big)
+    test.assert_eq(b.first, 0x0102)
+    test.assert_eq(b.bitmap, 0xA005)
+
+    test.case("each is not the other, and neither is in a DATA")
+    test.assert(not xrcewire.read_acknack(var h).found)
+    test.assert(not xrcewire.read_heartbeat(var a).found)
+    var d = vec_of(data_best_effort())
+    test.assert(not xrcewire.read_heartbeat(var d).found)
+    test.assert(not xrcewire.read_acknack(var d).found)
+
+    test.case("a payload shorter than five bytes is not one")
+    var cut = vec_of([0x81, 0x00, 0x00, 0x00, 0x0A, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00])
+    test.assert(not xrcewire.read_acknack(var cut).found)
+    var cut_beat = vec_of([0x81, 0x00, 0x00, 0x00, 0x0B, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00])
+    test.assert(not xrcewire.read_heartbeat(var cut_beat).found)
+
+// ── xrcestream: the arithmetic ───────────────────────────────────────
+
+@test
+fn test_sequence_numbers_wrap_at_sixteen_bits() [io]
+    test.assert_eq(xrcestream.seq_add(65535, 2), 1)
+    test.assert_eq(xrcestream.seq_add(5, 3), 8)
+    test.assert_eq(xrcestream.seq_sub(1, 65535), 2)
+    test.assert_eq(xrcestream.seq_sub(5, 3), 2)
+    test.assert_eq(xrcestream.seq_sub(3, 5), 65534)
+
+    test.case("later is a distance forward under half the space")
+    test.assert(xrcestream.seq_after(1, 65535))
+    test.assert(xrcestream.seq_after(5, 4))
+    test.assert(not xrcestream.seq_after(65535, 1))
+    test.assert(not xrcestream.seq_after(5, 5))
+    test.assert(xrcestream.seq_after(32767, 0))
+    test.assert(not xrcestream.seq_after(32768, 0))
+
+@test
+fn test_the_output_side_counts_what_is_unacknowledged() [io]
+    var r = xrcestream.rel_stream()
+    test.assert(xrcestream.out_idle(r))
+    test.assert(xrcestream.out_can_write(r))
+    test.assert_eq(xrcestream.out_in_flight(r), 0)
+
+    test.case("four messages fill the history")
+    for _i in 0..4
+        r = xrcestream.out_wrote(r)
+    test.assert_eq(r.out_next, 4)
+    test.assert_eq(xrcestream.out_in_flight(r), 4)
+    test.assert_eq(xrcestream.out_last(r), 3)
+    test.assert(not xrcestream.out_can_write(r))
+    test.assert(not xrcestream.out_idle(r))
+
+    test.case("an acknowledgement frees what it covers")
+    r = xrcestream.out_quiet(r, 70)
+    let two = xrcestream.out_ack(r, 2)
+    test.assert_eq(two.out_first, 2)
+    test.assert_eq(xrcestream.out_in_flight(two), 2)
+    test.assert(xrcestream.out_can_write(two))
+    test.assert_eq(two.out_quiet_ms, 0)
+
+    test.case("one for an earlier message, or for one never sent, changes nothing")
+    test.assert(same(xrcestream.out_ack(two, 1), two))
+    test.assert(same(xrcestream.out_ack(two, 9), two))
+
+    test.case("one for the next number to be written acknowledges everything")
+    test.assert(xrcestream.out_idle(xrcestream.out_ack(r, 4)))
+
+    test.case("a stream that has written 65534 and goes on wraps its numbers")
+    var w = xrcestream.RelStream { out_first: 65534, out_next: 65534, out_quiet_ms: 0,
+                                   in_handled: 65535, in_announced: 65535 }
+    for _i in 0..4
+        w = xrcestream.out_wrote(w)
+    test.assert_eq(w.out_next, 2)
+    test.assert_eq(xrcestream.out_in_flight(w), 4)
+    test.assert_eq(xrcestream.out_last(w), 1)
+    let acked = xrcestream.out_ack(w, 0)
+    test.assert_eq(acked.out_first, 0)
+    test.assert_eq(xrcestream.out_in_flight(acked), 2)
+
+@test
+fn test_a_heartbeat_is_due_when_the_stream_has_been_quiet_with_something_unacknowledged() [io]
+    var r = xrcestream.rel_stream()
+
+    test.case("nothing unacknowledged, nothing to announce")
+    test.assert(not xrcestream.out_heartbeat_due(xrcestream.out_quiet(r, 5000)))
+
+    test.case("a message written starts the quiet time over")
+    r = xrcestream.out_quiet(r, 90)
+    r = xrcestream.out_wrote(r)
+    test.assert_eq(r.out_quiet_ms, 0)
+
+    test.case("99 ms is not enough and 100 is")
+    test.assert(not xrcestream.out_heartbeat_due(xrcestream.out_quiet(r, 99)))
+    let due = xrcestream.out_quiet(r, 100)
+    test.assert(xrcestream.out_heartbeat_due(due))
+
+    test.case("sending the HEARTBEAT starts the quiet time over")
+    let sent = xrcestream.out_heartbeat_sent(due)
+    test.assert_eq(sent.out_quiet_ms, 0)
+    test.assert(not xrcestream.out_heartbeat_due(sent))
+    test.assert_eq(sent.out_next, due.out_next)
+
+@test
+fn test_a_bitmap_names_the_messages_to_send_again() [io]
+    // Messages 2 and 3 are in the history: first 2, next 4.
+    let r = xrcestream.RelStream { out_first: 2, out_next: 4, out_quiet_ms: 0,
+                                   in_handled: 65535, in_announced: 65535 }
+
+    test.case("bit j is the message first + j, if it is still in the history")
+    test.assert(xrcestream.out_resend(r, 2, 0x5, 0))
+    test.assert(not xrcestream.out_resend(r, 2, 0x5, 1))
+    // Bit 2 names message 4, which was never written.
+    test.assert(not xrcestream.out_resend(r, 2, 0x5, 2))
+
+    test.case("a message already acknowledged is not sent again")
+    test.assert(not xrcestream.out_resend(r, 1, 0x1, 0))
+    test.assert(xrcestream.out_resend(r, 1, 0x3, 1))
+
+    test.case("across the wrap")
+    let w = xrcestream.RelStream { out_first: 65535, out_next: 1, out_quiet_ms: 0,
+                                   in_handled: 65535, in_announced: 65535 }
+    test.assert(xrcestream.out_resend(w, 65535, 0x3, 0))
+    test.assert(xrcestream.out_resend(w, 65535, 0x3, 1))
+    test.assert(not xrcestream.out_resend(w, 65535, 0x3, 2))
+
+@test
+fn test_the_history_keeps_a_message_in_the_slot_of_its_number() [io]
+    var h = xrcestream.history()
+    test.assert_eq(h.len(), xrcestream.XRCE_HISTORY_BYTES)
+    var m = vec_of([0x81, 0x80, 0x03, 0x00, 0x07, 0x01])
+    var back: Vec[u8; 512] = Vec.new()
+
+    test.case("a message stored comes back")
+    test.assert(xrcestream.history_store(var h, 3, var m))
+    test.assert_eq(xrcestream.history_load(var h, 3, var back), 6)
+    test.assert_eq(list_of(var back), [0x81, 0x80, 0x03, 0x00, 0x07, 0x01])
+
+    test.case("a slot never written is empty")
+    test.assert_eq(xrcestream.history_load(var h, 2, var back), 0)
+    test.assert_eq(back.len(), 0)
+
+    test.case("the number four on keeps the slot, and the wrap keeps it too")
+    var other = vec_of([0x01, 0x02])
+    test.assert(xrcestream.history_store(var h, 7, var other))
+    test.assert_eq(xrcestream.history_load(var h, 3, var back), 2)
+    test.assert_eq(xrcestream.history_load(var h, 65535, var back), 2)
+
+    test.case("a message of 512 bytes fills its slot and touches no other")
+    var full: Vec[u8; 512] = Vec.new()
+    for _i in 0..512
+        let _ = full.push(0xEE)
+    test.assert(xrcestream.history_store(var h, 0, var full))
+    test.assert_eq(xrcestream.history_load(var h, 0, var back), 512)
+    test.assert_eq(back[511] as Int, 0xEE)
+    test.assert_eq(xrcestream.history_load(var h, 1, var back), 0)
+    test.assert_eq(xrcestream.history_load(var h, 3, var back), 2)
+
+    test.case("a history that was not made by history() keeps nothing")
+    var bare: Vec[u8; 2056] = Vec.new()
+    test.assert(not xrcestream.history_store(var bare, 0, var m))
+    test.assert_eq(xrcestream.history_load(var bare, 0, var back), 0)
+
+@test
+fn test_the_input_side_delivers_in_order_and_asks_for_the_rest() [io]
+    var r = xrcestream.rel_stream()
+    test.assert_eq(xrcestream.in_first(r), 0)
+
+    test.case("the first message is number 0")
+    test.assert_eq(xrcestream.in_verdict(r, 0), xrcestream.REL_DELIVER)
+    test.assert_eq(xrcestream.in_verdict(r, 3), xrcestream.REL_AHEAD)
+    test.assert_eq(xrcestream.in_verdict(r, 65535), xrcestream.REL_DUPLICATE)
+
+    test.case("two in order")
+    r = xrcestream.in_receive(r, 0)
+    r = xrcestream.in_receive(r, 1)
+    test.assert_eq(r.in_handled, 1)
+    test.assert_eq(xrcestream.in_first(r), 2)
+    test.assert_eq(xrcestream.in_missing(r), 0)
+    test.assert_eq(xrcestream.in_bitmap(r), 0)
+
+    test.case("a repeat is a duplicate and changes nothing")
+    test.assert_eq(xrcestream.in_verdict(r, 1), xrcestream.REL_DUPLICATE)
+    test.assert(same(xrcestream.in_receive(r, 1), r))
+    test.assert(same(xrcestream.in_receive(r, 0), r))
+
+    test.case("a message after a gap is announced, and not kept")
+    let gap = xrcestream.in_receive(r, 4)
+    test.assert_eq(gap.in_handled, 1)
+    test.assert_eq(gap.in_announced, 4)
+    test.assert_eq(xrcestream.in_missing(gap), 3)
+    // Messages 2, 3 and 4 are asked for: bits 0, 1 and 2.
+    test.assert_eq(xrcestream.in_bitmap(gap), 7)
+    test.assert_eq(xrcestream.in_verdict(gap, 4), xrcestream.REL_AHEAD)
+
+    test.case("the gap fills in order, and the announcement stays")
+    let two = xrcestream.in_receive(gap, 2)
+    test.assert_eq(two.in_handled, 2)
+    test.assert_eq(two.in_announced, 4)
+    test.assert_eq(xrcestream.in_bitmap(two), 3)
+    let four = xrcestream.in_receive(xrcestream.in_receive(two, 3), 4)
+    test.assert_eq(four.in_handled, 4)
+    test.assert_eq(xrcestream.in_missing(four), 0)
+
+    test.case("a lower number after a higher one does not lower the announcement")
+    test.assert_eq(xrcestream.in_receive(gap, 3).in_announced, 4)
+
+    test.case("the wrap is a step like any other")
+    let edge = xrcestream.RelStream { out_first: 0, out_next: 0, out_quiet_ms: 0,
+                                      in_handled: 65534, in_announced: 65534 }
+    let past = xrcestream.in_receive(xrcestream.in_receive(edge, 65535), 0)
+    test.assert_eq(past.in_handled, 0)
+    test.assert_eq(xrcestream.in_first(past), 1)
+
+    test.case("an ACKNACK names at most sixteen messages")
+    let far = xrcestream.in_receive(xrcestream.rel_stream(), 30)
+    test.assert_eq(xrcestream.in_missing(far), 31)
+    test.assert_eq(xrcestream.in_bitmap(far), 0xFFFF)
+
+@test
+fn test_the_agents_heartbeat_announces_and_gives_up() [io]
+    let fresh = xrcestream.rel_stream()
+
+    test.case("a HEARTBEAT over messages not yet received announces them")
+    let told = xrcestream.in_heartbeat(fresh, 0, 2)
+    test.assert_eq(told.in_handled, 65535)
+    test.assert_eq(told.in_announced, 2)
+    test.assert_eq(xrcestream.in_bitmap(told), 7)
+
+    test.case("one that starts past the next message gives up what is before it")
+    let gone = xrcestream.in_heartbeat(fresh, 5, 7)
+    test.assert_eq(gone.in_handled, 4)
+    test.assert_eq(gone.in_announced, 7)
+    test.assert_eq(xrcestream.in_first(gone), 5)
+    test.assert_eq(xrcestream.in_bitmap(gone), 7)
+
+    test.case("one that is behind what is known changes nothing")
+    let known = xrcestream.in_receive(xrcestream.in_receive(fresh, 0), 1)
+    test.assert(same(xrcestream.in_heartbeat(known, 0, 1), known))
+    test.assert(same(xrcestream.in_heartbeat(known, 1, 1), known))
+
+    test.case("one with nothing outstanding moves the delivered mark only if it is ahead")
+    // first = last + 1: the agent holds nothing.
+    test.assert(same(xrcestream.in_heartbeat(known, 2, 1), known))
+    let skipped = xrcestream.in_heartbeat(known, 9, 8)
+    test.assert_eq(skipped.in_handled, 8)
+    test.assert_eq(skipped.in_announced, 8)
+    test.assert_eq(xrcestream.in_missing(skipped), 0)
+
+// ── xrcestream: a received message ───────────────────────────────────
+
+@test
+fn test_a_received_message_is_run_through_the_stream() [io]
+    let fresh = xrcestream.rel_stream()
+
+    test.case("RECORDED DATA at sequence 0 of the reliable stream is delivered and acknowledged")
+    var d0 = vec_of(data_reliable(0, 11))
+    let e0 = xrcestream.receive(var d0, fresh)
+    test.assert(e0.sample.found)
+    test.assert_eq(xrcewire.sample_i32(var d0, e0.sample), 11)
+    test.assert(e0.ack)
+    test.assert(not e0.resend)
+    test.assert_eq(e0.stream.in_handled, 0)
+    test.assert_eq(xrcestream.in_first(e0.stream), 1)
+
+    test.case("the same message again is dropped and acknowledged again")
+    var again = vec_of(data_reliable(0, 11))
+    let e1 = xrcestream.receive(var again, e0.stream)
+    test.assert(not e1.sample.found)
+    test.assert(e1.ack)
+    test.assert(same(e1.stream, e0.stream))
+
+    test.case("a message after a gap is dropped, and the gap is asked for")
+    var ahead = vec_of(data_reliable(2, 13))
+    let e2 = xrcestream.receive(var ahead, e0.stream)
+    test.assert(not e2.sample.found)
+    test.assert(e2.ack)
+    test.assert_eq(xrcestream.in_first(e2.stream), 1)
+    test.assert_eq(xrcestream.in_bitmap(e2.stream), 3)
+
+    test.case("a message on the best-effort stream is delivered and not acknowledged")
+    var plain = vec_of(data_best_effort())
+    let e3 = xrcestream.receive(var plain, fresh)
+    test.assert(e3.sample.found)
+    test.assert(not e3.ack)
+    test.assert(same(e3.stream, fresh))
+
+    test.case("any message on the reliable stream is acknowledged, a STATUS among them")
+    var status = vec_of([0x81, 0x80, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, 0x00, 0x05, 0x00, 0x16,
+                         0x84, 0x00])
+    let e4 = xrcestream.receive(var status, fresh)
+    test.assert(not e4.sample.found)
+    test.assert(e4.ack)
+    test.assert_eq(e4.stream.in_handled, 0)
+
+    test.case("a message with no stream to speak of asks for nothing")
+    var short = vec_of([0x81, 0x01])
+    let e5 = xrcestream.receive(var short, fresh)
+    test.assert(not e5.sample.found)
+    test.assert(not e5.ack)
+    test.assert(not e5.resend)
+    test.assert(same(e5.stream, fresh))
+
+@test
+fn test_a_heartbeat_asks_for_an_acknack_and_an_acknack_for_a_resend() [io]
+    test.case("the agent's HEARTBEAT announces messages and is answered")
+    var beat = vec_of(heartbeat_message(0, 2))
+    let e0 = xrcestream.receive(var beat, xrcestream.rel_stream())
+    test.assert(e0.ack)
+    test.assert_eq(xrcestream.in_bitmap(e0.stream), 7)
+    test.assert(not e0.sample.found)
+
+    test.case("a HEARTBEAT about another stream is not ours")
+    var other = vec_of([0x81, 0x00, 0x00, 0x00, 0x0B, 0x01, 0x05, 0x00, 0x00, 0x00, 0x02, 0x00, 0x81])
+    let e1 = xrcestream.receive(var other, xrcestream.rel_stream())
+    test.assert(not e1.ack)
+    test.assert(same(e1.stream, xrcestream.rel_stream()))
+
+    // Three messages, 3 to 5, are in flight.
+    let sent = xrcestream.RelStream { out_first: 3, out_next: 6, out_quiet_ms: 60,
+                                      in_handled: 65535, in_announced: 65535 }
+
+    test.case("RECORDED ACKNACK, first 3 and bitmap 7: nothing acknowledged, three to send")
+    var nack = vec_of(acknack_message(3, 7))
+    let e2 = xrcestream.receive(var nack, sent)
+    test.assert(e2.resend)
+    test.assert_eq(e2.resend_first, 3)
+    test.assert_eq(e2.resend_bitmap, 7)
+    test.assert_eq(e2.stream.out_first, 3)
+    test.assert_eq(e2.stream.out_quiet_ms, 0)
+    test.assert(not e2.ack)
+
+    test.case("RECORDED ACKNACK, first 4 and bitmap 3: message 3 is acknowledged")
+    var nack4 = vec_of(acknack_message(4, 3))
+    let e3 = xrcestream.receive(var nack4, sent)
+    test.assert_eq(e3.stream.out_first, 4)
+    test.assert_eq(e3.resend_bitmap, 3)
+    test.assert(xrcestream.out_resend(e3.stream, e3.resend_first, e3.resend_bitmap, 0))
+    test.assert(xrcestream.out_resend(e3.stream, e3.resend_first, e3.resend_bitmap, 1))
+    test.assert(not xrcestream.out_resend(e3.stream, e3.resend_first, e3.resend_bitmap, 2))
+
+    test.case("RECORDED ACKNACK, first 6: everything is acknowledged")
+    var all = vec_of(acknack_message(6, 0))
+    test.assert(xrcestream.out_idle(xrcestream.receive(var all, sent).stream))
+
+    test.case("an ACKNACK about another stream is not ours")
+    var foreign = vec_of([0x81, 0x00, 0x00, 0x00, 0x0A, 0x01, 0x05, 0x00, 0x06, 0x00, 0x00, 0x00, 0x81])
+    let e4 = xrcestream.receive(var foreign, sent)
+    test.assert(not e4.resend)
+    test.assert(same(e4.stream, sent))
+
+// ── the two ends, with a link that loses, repeats and reorders ───────
+
+// One reliable stream between a sender, which plays the agent and writes
+// DATA, and a receiver, which plays the node.  Each end holds its own
+// `RelStream`; what crosses is bytes, run through the real reader, and the
+// test is what the link does to them: a message handed to the receiver is
+// delivered, and one that is not is lost.
+
+// The sender writes the next DATA, carrying `value`, keeps it in its
+// history, and answers it as it would go on the wire.
+fn write_one(var s: xrcestream.RelStream, var h: Vec[u8; 2056], value: Int) -> Vec[u8; 512]
+    var m = vec_of(data_reliable(s.out_next, value))
+    let _k = xrcestream.history_store(var h, s.out_next, var m)
+    s = xrcestream.out_wrote(s)
+    m
+
+// The receiver takes a message off the link: answers the values it
+// delivered, in order, and its ACKNACK for the sender.
+var g_delivered: [Int] = []
+
+fn receiver_takes(var rx: xrcestream.RelStream, var m: Vec[u8; 512]) -> Vec[u8; 512]
+    let ev = xrcestream.receive(var m, rx)
+    rx = ev.stream
+    if ev.sample.found
+        g_delivered = list.push(g_delivered, xrcewire.sample_i32(var m, ev.sample))
+    var reply: Vec[u8; 512] = Vec.new()
+    if ev.ack
+        let _a = xrcewire.acknack(var reply, xrcestream.in_first(rx), xrcestream.in_bitmap(rx),
+                                  xrcewire.XRCE_STREAM_RELIABLE)
+    reply
+
+// The sender takes the receiver's ACKNACK and answers the messages it
+// sends again, from its history.
+fn sender_takes(var tx: xrcestream.RelStream, var h: Vec[u8; 2056], var reply: Vec[u8; 512]) -> [[Int]]
+    let ev = xrcestream.receive(var reply, tx)
+    tx = ev.stream
+    var again: [[Int]] = []
+    if ev.resend
+        for j in 0..xrcestream.XRCE_ACKNACK_SPAN
+            if xrcestream.out_resend(tx, ev.resend_first, ev.resend_bitmap, j)
+                var m: Vec[u8; 512] = Vec.new()
+                if xrcestream.history_load(var h, xrcestream.seq_add(ev.resend_first, j), var m) > 0
+                    again = list.push(again, list_of(var m))
+    again
+
+@test
+fn test_a_stream_survives_loss_repetition_and_reordering() [io, mutate]
+    var tx = xrcestream.rel_stream()
+    var rx = xrcestream.rel_stream()
+    var h = xrcestream.history()
+    g_delivered = []
+
+    // Messages 0, 1 and 2, carrying 100, 101 and 102.  Message 1 is lost.
+    test.case("a message lost, the next one arrives after the gap")
+    var m0 = write_one(var tx, var h, 100)
+    var m1 = write_one(var tx, var h, 101)
+    var m2 = write_one(var tx, var h, 102)
+    var ack0 = receiver_takes(var rx, var m0)
+    var ack2 = receiver_takes(var rx, var m2)
+    test.assert_eq(g_delivered, [100])
+    test.assert_eq(xrcestream.in_first(rx), 1)
+    // The receiver's ACKNACK after message 2 names 1 and 2: it kept nothing
+    // past 0.
+    var gap = vec_of(list_of(var ack2))
+    let nack = xrcewire.read_acknack(var gap)
+    test.assert_eq(nack.first, 1)
+    test.assert_eq(nack.bitmap, 3)
+
+    test.case("the first ACKNACK acknowledged message 0 and the second asks for 1 and 2")
+    let none = sender_takes(var tx, var h, var ack0)
+    test.assert_eq(list.len(none), 0)
+    test.assert_eq(tx.out_first, 1)
+    let again = sender_takes(var tx, var h, var ack2)
+    test.assert_eq(list.len(again), 2)
+
+    test.case("the two sent again arrive in order, and the receiver is whole")
+    var r1 = vec_of(again[0])
+    var r2 = vec_of(again[1])
+    var ack_r1 = receiver_takes(var rx, var r1)
+    var ack_r2 = receiver_takes(var rx, var r2)
+    test.assert_eq(g_delivered, [100, 101, 102])
+    let done = sender_takes(var tx, var h, var ack_r2)
+    test.assert_eq(list.len(done), 0)
+    test.assert(xrcestream.out_idle(tx))
+
+    test.case("a message delivered twice is delivered once")
+    var dup = vec_of(again[0])
+    var ack_dup = receiver_takes(var rx, var dup)
+    test.assert_eq(g_delivered, [100, 101, 102])
+    var ack_dup_copy = ack_dup
+    var nack_dup = vec_of(list_of(var ack_dup_copy))
+    test.assert_eq(xrcewire.read_acknack(var nack_dup).first, 3)
+    // A stale ACKNACK changes nothing at the sender.
+    test.assert_eq(list.len(sender_takes(var tx, var h, var ack_r1)), 0)
+    test.assert(xrcestream.out_idle(tx))
+
+    // Message 3 is the last one written and it is lost, so no later message
+    // shows the gap: the sender's HEARTBEAT does.
+    test.case("the last message lost is found by the HEARTBEAT")
+    var m3 = write_one(var tx, var h, 103)
+    test.assert_eq(m3.len(), 16)
+    var tick = xrcestream.out_quiet(tx, 100)
+    test.assert(xrcestream.out_heartbeat_due(tick))
+    var beat: Vec[u8; 512] = Vec.new()
+    let _built = xrcewire.heartbeat(var beat, tick.out_first, xrcestream.out_last(tick),
+                                    xrcewire.XRCE_STREAM_RELIABLE)
+    tx = xrcestream.out_heartbeat_sent(tick)
+    var ack_beat = receiver_takes(var rx, var beat)
+    test.assert_eq(g_delivered, [100, 101, 102])
+    var asked = vec_of(list_of(var ack_beat))
+    test.assert_eq(xrcewire.read_acknack(var asked).first, 3)
+    test.assert_eq(xrcewire.read_acknack(var asked).bitmap, 1)
+    let last = sender_takes(var tx, var h, var ack_beat)
+    test.assert_eq(list.len(last), 1)
+    var r3 = vec_of(last[0])
+    var ack_r3 = receiver_takes(var rx, var r3)
+    test.assert_eq(g_delivered, [100, 101, 102, 103])
+    let end = sender_takes(var tx, var h, var ack_r3)
+    test.assert_eq(list.len(end), 0)
+    test.assert(xrcestream.out_idle(tx))
+
+    test.case("the history holds four, and a fifth waits for an acknowledgement")
+    for k in 0..4
+        let _m = write_one(var tx, var h, 200 + k)
+    test.assert(not xrcestream.out_can_write(tx))

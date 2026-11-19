@@ -777,6 +777,54 @@ fn test_the_tcp_link_frames_and_reassembles_a_message() [io, net]
                             l.ros_close()
                             rosagent.disconnect(l)
 
+// A poll is a receive with a timeout of 0, and it must not wait for a byte.
+// A socket with no receive timeout set would hold the caller until one came.
+@test
+fn test_a_poll_of_zero_does_not_wait_for_a_byte() [io, net]
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.fail("no loopback listener, so the link cannot be tested")
+        Some(server) =>
+            let port = net.local_port(server)
+            match net.connect("127.0.0.1", port)
+                None       => test.fail("a listener that would not accept a connection")
+                Some(sock) =>
+                    match net.accept(server)
+                        None       => test.fail("a connection that was not accepted")
+                        Some(pair) =>
+                            let (peer, _) = pair
+                            let l = rosagent.link_over(sock, rosagent.ROS_AGENT_MTU)
+
+                            test.case("nothing sent: a timeout of zero answers at once")
+                            match l.ros_recv(0)
+                                None    => test.assert(true)
+                                Some(_) => test.assert(false)
+
+                            test.case("a message already sent is taken by a timeout of zero")
+                            test.assert(net.send_bytes(
+                                peer, rosagent.length_prefix(4) + bytes.zeros(4)))
+                            test.assert(net.fd_wait_readable(sock, 1000))
+                            match l.ros_recv(0)
+                                None       => test.assert(false)
+                                Some(back) => test.assert_eq(bytes.len(back), 4)
+
+                            test.case("and the poll after it finds nothing again")
+                            match l.ros_recv(0)
+                                None    => test.assert(true)
+                                Some(_) => test.assert(false)
+
+                            test.case("a message cut off after its first byte is lost when the rest does not come")
+                            // This is what the wait for the rest is for: a
+                            // byte of the length prefix, and then nothing.
+                            test.assert(net.send_bytes(peer, bytes.zeros(1)))
+                            test.assert(net.fd_wait_readable(sock, 1000))
+                            match l.ros_recv(30)
+                                None    => test.assert(true)
+                                Some(_) => test.assert(false)
+
+                            test.case("the wait for the rest of a message is a second")
+                            test.assert_eq(rosagent.ROS_TCP_FRAME_MS, 1000)
+                            l.ros_close()
+
 @test
 fn test_a_message_larger_than_the_link_carries_is_not_sent() [io, net]
     match net.listen_on("127.0.0.1", 0)

@@ -5,6 +5,68 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.2 — 2026-11-19
+
+A node can subscribe, and can write and read on a reliable stream. Additive:
+every signature and type of 0.1.1 is unchanged, the best-effort stream is
+still the default, and a node that does not call the new functions builds
+and behaves as it did. Both were run against a Micro XRCE-DDS Agent 2.4.3
+and ROS 2 Jazzy on 2026-11-19; `docs/agent-run.md` has the commands and the
+agent's log.
+
+### Added
+
+- **Subscriptions.** `xrcewire.read_data` builds the READ_DATA that asks
+  the agent for samples (one, a number, `XRCE_SAMPLES_UNLIMITED`, or 0 to
+  stop) on the best-effort or the reliable stream; `XRCE_KIND_SUBSCRIBER`
+  and `XRCE_KIND_DATAREADER` create the entities through the existing
+  `create_entity`. `xrcewire.read_sample`, `copy_sample` and `sample_i32`
+  read the agent's DATA. `rostransport.request_data` and `rostransport.poll`
+  (host, over any `RosTransport`) and `rosuart.request_data` and
+  `rosuart.poll` (device, no heap) ask for samples and take the next
+  message; a sample comes back as a `RosMessage` on the host and as a
+  position in the caller's message buffer on a device.
+  `rostransport.keepalive` and `rosuart.keepalive` are the send-only half
+  of `heartbeat`, for a program that polls, and `rosexec.ready_from_take`
+  turns a take's code into a handle's bit in the ready set.
+- **The reliable stream**, stream `0x80`, in both directions. The new
+  module **`xrcestream`** holds it as arithmetic over integers with no
+  allocation: a `RelStream` of five integers, sequence numbers that wrap at
+  sixteen bits, a history of four messages in a `Vec[u8; 2056]`, the input
+  side that delivers in order and asks for the rest, the output side that
+  frees what an ACKNACK acknowledges, and `receive`, which says what a
+  received message asks of the session. `xrcewire.heartbeat` and
+  `xrcewire.acknack` build the two submessages and `read_heartbeat` and
+  `read_acknack` read them. `rostransport.write_sample_reliable`,
+  `rosuart.publish_i32_reliable` and `reliable_tick` on both write a sample
+  that stays in the history until the agent acknowledges it, announce it
+  with a HEARTBEAT when the stream has been quiet for 100 ms, and send it
+  again when `poll` reads an ACKNACK that names it. The README says what a
+  reliable stream costs on a device: 2,104 bytes of RAM.
+- **`examples/host_listener.nv`** subscribes to `/novo_cmd` over TCP, on
+  either stream; **`examples/uart_stdio_listener.nv`** is the device's
+  subscription run on a PC; **`examples/host_talker.nv`** takes `reliable`
+  as a third argument and writes its counter on the reliable stream.
+- **Tests.** `tests/xrcestream_tests.nv` and `tests/rossub_tests.nv`, with
+  frames the agent sent and accepted, the state machine's loss, duplicate,
+  out-of-order, HEARTBEAT and ACKNACK cases, a sender and a receiver run
+  against each other over a lossy link, and the subscription paths over a
+  recording pipe and a fake UART. `tests/embedded_probe.nv` runs 113 checks,
+  twelve more, and passes under QEMU.
+- **`docs/agent-run.md`** records the runs: a subscription over TCP and
+  over a pseudoterminal pair on both streams, the talker on the reliable
+  stream read by `ros2 topic echo`, and three samples written while the
+  link was down, sent again and received.
+
+### Fixed
+
+- **`rosagent`'s receive with a timeout of 0 waited for a byte.** A socket
+  with no receive timeout set held the caller until the agent sent
+  something, so a poll was not one. It now asks whether the socket is
+  readable first, and answers nothing at once if it is not. Once the first
+  byte of a message is in, the rest is waited for at least
+  `ROS_TCP_FRAME_MS`, 1000, whatever the timeout was.
+
 ## 0.1.1 — 2026-11-10
 
 A node can be a micro-ROS node over a UART. Additive: every signature and

@@ -36,6 +36,7 @@
 use std.list
 use rosmsg
 use rosret
+use xrcestream
 use xrcewire
 
 // ── Stream kinds ─────────────────────────────────────────────────────
@@ -614,3 +615,222 @@ fn heartbeat<T: RosTransport[e]>(t: T, s: RosSession, elapsed_ms: Int) -> RosSes
 pub @tier(system)
 fn is_connected<T: RosTransport[e]>(t: T, s: RosSession) -> Bool [e]
     t.ros_is_open() and session_is_ready(s)
+
+// ── Subscriptions and the reliable stream ────────────────────────────
+
+// A session, a reliable stream and the code of the last thing done with
+// them.
+//
+// What the reliable writes answer, for the reason `RosOutcome` exists:
+// each of them changes the stream as well as the session, and a `@value`
+// cannot be changed through a pipe's `self`.
+pub @value
+struct RosRelOutcome
+    // The session after the call.
+    session: RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // One of the `rosret` codes: `ROS_RET_OK`; `ROS_RET_NOT_INIT` for a
+    // session that is not established; `ROS_RET_BAD_ALLOC` when the
+    // history is full, which is to say `XRCE_HISTORY` messages are
+    // written and not yet acknowledged; `ROS_RET_INVALID_ARGUMENT` for a
+    // sample that does not fit; `ROS_RET_AGENT_UNREACHABLE` when the pipe
+    // refused the bytes. The sample is kept in the history in that last
+    // case and goes out again when the agent asks for it.
+    code: Int
+    // The agent's status number when a status came back, else -1.
+    status: Int
+
+// What `poll` took from the pipe.
+//
+// A PLAIN STRUCT, because the message holds a `Bytes`.
+pub struct RosTaken
+    // The session after the call. Any message from the agent clears its
+    // silence.
+    session: RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // `ROS_RET_OK` when `message` is a sample; `ROS_RET_SUBSCRIPTION_TAKE_FAILED`
+    // when nothing arrived or what arrived held no sample, which is not
+    // an error; `ROS_RET_NOT_INIT` for a session that is not established;
+    // `ROS_RET_ERROR` when the agent answered a request with a status that
+    // is not OK, and `status` has the number.
+    code: Int
+    // The agent's status number when `code` is `ROS_RET_ERROR`, else -1.
+    status: Int
+    // The data reader's object id the sample belongs to, else 0.
+    object: Int
+    // The sample, as the same `RosMessage` the publish path takes: its
+    // payload is the CDR body, its encapsulation is little-endian CDR
+    // because the agent drops the header on the way (see `xrcewire`), and
+    // its type is the one the caller named.
+    message: RosMessage
+
+// A `RosRelOutcome` from its parts.
+@tier(embedded)
+@no_alloc
+fn rel_outcome(s: RosSession, r: xrcestream.RelStream, code: Int, status: Int) -> RosRelOutcome
+    RosRelOutcome { session: s, stream: r, code: code, status: status }
+
+// A `RosTaken` that took no sample.
+@tier(system)
+fn taken_none(s: RosSession, r: xrcestream.RelStream, code: Int, status: Int,
+              type_id: Int) -> RosTaken
+    RosTaken { session: s, stream: r, code: code, status: status, object: 0,
+               message: rosmsg.message(bytes.zeros(0), type_id) }
+
+// Ask the agent for samples from a data reader.
+//
+// `reader` is the data reader's id, `data_stream` the stream the samples
+// are to come back on (`xrcewire.XRCE_STREAM_BEST_EFFORT` or
+// `xrcewire.XRCE_STREAM_RELIABLE`) and `max_samples` how many: 1 for one,
+// `xrcewire.XRCE_SAMPLES_UNLIMITED` for every sample from now on, 0 to
+// stop. Goes out on the best-effort stream and is not waited for: the
+// agent answers a request it accepts with the samples and a request it
+// refuses with a status, and `poll` reads both. The outcome's `code` says
+// whether the pipe took the bytes.
+pub @tier(system)
+fn request_data<T: RosTransport[e]>(t: T, s: RosSession, reader: Int, data_stream: Int,
+                                    max_samples: Int) -> RosOutcome [e]
+    system
+        if not session_is_ready(s)
+            return outcome(s, rosret.ROS_RET_NOT_INIT, 0 - 1)
+        var m: Vec[u8; 512] = Vec.new()
+        let request = s.next_request
+        let sent = session_wrote(session_next_request(s))
+        let _built = xrcewire.read_data(var m, xrcewire.XRCE_STREAM_BEST_EFFORT, s.output_seq,
+                                        request, reader, data_stream, max_samples)
+        if not t.ros_send(wire_bytes(var m))
+            return outcome(s, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+        return outcome(sent, rosret.ROS_RET_OK, 0 - 1)
+
+// Write one sample to a data writer on the reliable stream.
+//
+// `sample` is the CDR body without the representation header, as for
+// `write_sample`. The message takes the next sequence number of the
+// stream and a slot of the history `h`, which `xrcestream.history` makes;
+// it stays in the slot until the agent acknowledges it, and goes out again
+// whenever the agent's ACKNACK asks (see `poll`) or the stream's HEARTBEAT
+// prompts one (see `reliable_tick`). A write finds the window full when
+// `xrcestream.XRCE_HISTORY` messages are unacknowledged, and answers
+// `ROS_RET_BAD_ALLOC` without writing.
+pub @tier(system)
+fn write_sample_reliable<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
+                                             var h: Vec[u8; 2056], writer: Int,
+                                             sample: Bytes) -> RosRelOutcome [e]
+    system
+        if not session_is_ready(s)
+            return rel_outcome(s, r, rosret.ROS_RET_NOT_INIT, 0 - 1)
+        if not xrcestream.out_can_write(r)
+            return rel_outcome(s, r, rosret.ROS_RET_BAD_ALLOC, 0 - 1)
+        var m: Vec[u8; 512] = Vec.new()
+        let request = s.next_request
+        let sent = session_next_request(s)
+        var ok = xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_RELIABLE, r.out_next,
+                                           request, writer)
+        for i in 0..bytes.len(sample)
+            ok = ok and xrcewire.put_sample_byte(var m, bytes.byte_at(sample, i) ?? 0)
+        if not ok
+            return rel_outcome(s, r, rosret.ROS_RET_INVALID_ARGUMENT, 0 - 1)
+        let _len = xrcewire.finish_write_data(var m)
+        let _kept = xrcestream.history_store(var h, r.out_next, var m)
+        let after = xrcestream.out_wrote(r)
+        if not t.ros_send(wire_bytes(var m))
+            return rel_outcome(sent, after, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+        return rel_outcome(sent, after, rosret.ROS_RET_OK, 0 - 1)
+
+// Count `elapsed_ms` of quiet on the reliable stream, and send a HEARTBEAT
+// if one is due.
+//
+// `elapsed_ms` is how long since this was last called. A stream with
+// unacknowledged messages that has been quiet for
+// `xrcestream.XRCE_STREAM_HEARTBEAT_MS` announces the first and the last
+// of them; the agent answers with an ACKNACK, and a message it never got
+// is named in it and sent again by `poll`. This is what delivers the last
+// message of a burst when the last message is the one that was lost. A
+// session that is not established sends nothing.
+pub @tier(system)
+fn reliable_tick<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
+                                     elapsed_ms: Int) -> xrcestream.RelStream [e]
+    system
+        let q = xrcestream.out_quiet(r, elapsed_ms)
+        if not session_is_ready(s) or not xrcestream.out_heartbeat_due(q)
+            return q
+        var m: Vec[u8; 512] = Vec.new()
+        let _built = xrcewire.heartbeat(var m, q.out_first, xrcestream.out_last(q),
+                                        xrcewire.XRCE_STREAM_RELIABLE)
+        let _sent = t.ros_send(wire_bytes(var m))
+        return xrcestream.out_heartbeat_sent(q)
+
+// Take the next message from the agent and act on it.
+//
+// Waits up to `timeout_ms` for one message and runs it through
+// `xrcestream.receive`. A sample delivered in order comes back as the
+// result's `message`, built with the type `type_id`. A message on the
+// reliable stream is acknowledged, whatever it held. A HEARTBEAT is
+// answered with an ACKNACK. An ACKNACK acknowledges what the node wrote
+// and sends again the messages from the history `h` that its bitmap names.
+// A status the agent sent for a request it refused comes back as
+// `ROS_RET_ERROR` with the number. One message per call: a program drains
+// the pipe by calling it until it answers `ROS_RET_SUBSCRIPTION_TAKE_FAILED`.
+pub @tier(system)
+fn poll<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
+                            var h: Vec[u8; 2056], type_id: Int, timeout_ms: Int) -> RosTaken [e]
+    system
+        if not session_is_ready(s)
+            return taken_none(s, r, rosret.ROS_RET_NOT_INIT, 0 - 1, type_id)
+        let answer = t.ros_recv(timeout_ms)
+        if answer == None
+            return taken_none(s, r, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1, type_id)
+        let raw: Bytes = answer ?? bytes.zeros(0)
+        var m: Vec[u8; 512] = Vec.new()
+        wire_read(var m, raw)
+        let reply = xrcewire.read_reply(var m)
+        let ev = xrcestream.receive(var m, r)
+        let heard = session_heard(s)
+        if ev.ack
+            let _built = xrcewire.acknack(var m, xrcestream.in_first(ev.stream),
+                                          xrcestream.in_bitmap(ev.stream),
+                                          xrcewire.XRCE_STREAM_RELIABLE)
+            let _sent = t.ros_send(wire_bytes(var m))
+        if ev.resend
+            for j in 0..xrcestream.XRCE_ACKNACK_SPAN
+                if xrcestream.out_resend(ev.stream, ev.resend_first, ev.resend_bitmap, j)
+                    let n = xrcestream.history_load(var h, xrcestream.seq_add(ev.resend_first, j),
+                                                    var m)
+                    if n > 0
+                        let _again = t.ros_send(wire_bytes(var m))
+        if ev.sample.found
+            let body = bytes.slice(raw, ev.sample.start, ev.sample.start + ev.sample.length)
+            return RosTaken { session: heard, stream: ev.stream, code: rosret.ROS_RET_OK,
+                              status: 0 - 1, object: ev.sample.object,
+                              message: rosmsg.message(body, type_id) }
+        if reply.kind == xrcewire.XRCE_REPLY_STATUS and not xrcewire.status_is_ok(reply.status)
+            return taken_none(heard, ev.stream, rosret.ROS_RET_ERROR, reply.status, type_id)
+        return taken_none(heard, ev.stream, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1,
+                          type_id)
+
+// Count `elapsed_ms` of silence, and send a ping if the agent has been
+// quiet long enough to be asked.
+//
+// The send-only half of `heartbeat`, for a program that calls `poll`:
+// `heartbeat` waits for the agent's INFO and so takes every other message
+// that arrives meanwhile, a sample among them. Here the answer is left in
+// the pipe and `poll` reads it, as it reads every message, and any message
+// clears the silence. A session silent for longer than
+// `ROS_SESSION_TIMEOUT_MS` becomes `ROS_SESSION_LOST`; one that is not
+// established is returned as it is.
+pub @tier(system)
+fn keepalive<T: RosTransport[e]>(t: T, s: RosSession, elapsed_ms: Int) -> RosSession [e]
+    system
+        let waited = session_silent(s, elapsed_ms)
+        if not session_is_ready(waited)
+            return waited
+        if session_is_stale(waited, ROS_SESSION_TIMEOUT_MS)
+            return session_with_state(waited, ROS_SESSION_LOST)
+        if waited.silent_ms < ROS_HEARTBEAT_MS
+            return waited
+        var m: Vec[u8; 512] = Vec.new()
+        let _built = xrcewire.ping(var m, waited.next_request)
+        let _sent = t.ros_send(wire_bytes(var m))
+        return session_next_request(waited)

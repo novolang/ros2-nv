@@ -1,0 +1,730 @@
+// rossub_tests.nv — subscriptions and the reliable stream through the two
+// sessions: `rostransport` over a pipe that records what it is handed, and
+// `rosuart` over a fake UART.
+//
+// The frames marked "recorded" are bytes a Micro XRCE-DDS Agent 2.4.3 sent
+// or accepted on 2026-11-19, with ROS 2 Jazzy publishing to the topic the
+// node subscribed to and `ros2 topic echo` printing what the node wrote on
+// the reliable stream; `docs/agent-run.md` has the runs and
+// `tests/xrcestream_tests.nv` has the messages one at a time.  What is
+// asserted here is what each function does with them: which frames it puts
+// on the pipe, what it answers, and what it leaves alone.
+
+use std.list
+use std.test
+use rosmsg
+use rosret
+use rostransport
+use rosuart
+use xrceframe
+use xrcestream
+use xrcewire
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+fn vec_of(xs: [Int]) -> Vec[u8; 512]
+    var m: Vec[u8; 512] = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+fn list_of(var m: Vec[u8; 512]) -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for x in m
+        let wide = x as Int
+        out = list.push(out, wide)
+    out
+
+// RECORDED.  The agent's DATA on the best-effort stream carrying the
+// integer 7, and on the reliable stream at `seq` carrying `value`.
+fn data_best_effort() -> [Int]
+    [0x81, 0x01, 0x04, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16, 0x07, 0x00, 0x00, 0x00]
+
+fn data_reliable(seq: Int, value: Int) -> [Int]
+    [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
+     value, 0x00, 0x00, 0x00]
+
+// RECORDED.  An ACKNACK of stream 0x80, either way.
+fn acknack_message(first: Int, bitmap: Int) -> [Int]
+    [0x81, 0x00, 0x00, 0x00, 0x0A, 0x01, 0x05, 0x00, first & 0xFF, first >>> 8,
+     bitmap >>> 8, bitmap & 0xFF, 0x80]
+
+// RECORDED when the node sent it; DERIVED for the agent.
+fn heartbeat_message(first: Int, last: Int) -> [Int]
+    [0x81, 0x00, 0x00, 0x00, 0x0B, 0x01, 0x05, 0x00, first & 0xFF, first >>> 8, last & 0xFF,
+     last >>> 8, 0x80]
+
+// RECORDED.  The WRITE_DATA the node wrote on the reliable stream: sequence
+// `seq`, request 8, writer 0x15, the integer `value`.
+fn write_reliable(seq: Int, value: Int) -> [Int]
+    [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x07, 0x01, 0x08, 0x00, 0x00, 0x08, 0x00, 0x15,
+     value, 0x00, 0x00, 0x00]
+
+// RECORDED.  The READ_DATA for every sample, request 5, stream 1 at
+// sequence 4, the samples to come back on `data_stream`.
+fn read_data_message(data_stream: Int) -> [Int]
+    [0x81, 0x01, 0x04, 0x00, 0x08, 0x01, 0x10, 0x00, 0x00, 0x05, 0x00, 0x16,
+     data_stream, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+// RECORDED.  The agent's INFO, answering a ping.
+fn info_message() -> [Int]
+    [0x80, 0x00, 0x00, 0x00, 0x06, 0x01, 0x1C, 0x00, 0x00, 0x00, 0xFF, 0xFD, 0x00, 0x01,
+     0x01, 0x0D, 0x58, 0x52, 0x43, 0x45, 0x01, 0x00, 0x01, 0x0F, 0x00, 0x01, 0x0D, 0x00,
+     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+// A STATUS answering a request on the best-effort stream.
+fn status_message(request: Int, object: Int, status: Int) -> [Int]
+    [0x81, 0x01, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, request >>> 8, request & 0xFF,
+     object >>> 8, object & 0xFF, status, 0x00]
+
+fn an_open_session() -> RosSession
+    rostransport.session_established(rostransport.session(0xAABBCCDD, 512), 0x81)
+
+// The session after the four creates the examples make: request 5 is next
+// and the best-effort stream is at sequence 4, which is what the recorded
+// READ_DATA was written at.
+fn session_after_creates() -> RosSession
+    var s = an_open_session()
+    for _i in 0..4
+        s = rostransport.session_wrote(rostransport.session_next_request(s))
+    s
+
+// The session at request 8, which is what the recorded reliable
+// WRITE_DATA carried.
+fn session_at_request_8() -> RosSession
+    var s = an_open_session()
+    for _i in 0..7
+        s = rostransport.session_next_request(s)
+    s
+
+// A stream that has written and had acknowledged every message before
+// `next`.
+fn stream_at(next: Int) -> xrcestream.RelStream
+    xrcestream.RelStream { out_first: next, out_next: next, out_quiet_ms: 0,
+                           in_handled: 65535, in_announced: 65535 }
+
+// A stream with the messages `first` to `next - 1` unacknowledged.
+fn stream_in_flight(first: Int, next: Int) -> xrcestream.RelStream
+    xrcestream.RelStream { out_first: first, out_next: next, out_quiet_ms: 0,
+                           in_handled: 65535, in_announced: 65535 }
+
+// A history holding the recorded WRITE_DATA for each sequence number from
+// `first` to `next - 1`.
+fn history_of(first: Int, next: Int) -> Vec[u8; 2056]
+    var h = xrcestream.history()
+    for seq in first..next
+        var m = vec_of(write_reliable(seq, seq))
+        let _ = xrcestream.history_store(var h, seq, var m)
+    h
+
+// ── rostransport: over a pipe that records ───────────────────────────
+
+// Every frame the pipe is handed, as a list of bytes.
+var g_sent: [[Int]]  = []
+// What the agent says next, one message to each receive.
+var g_queue: [Bytes] = []
+// Whether the pipe takes what it is handed.
+var g_takes          = true
+
+struct RecPipe
+    id: Int
+
+impl RosTransport[mutate] for RecPipe
+    fn ros_send(self, frame: Bytes) -> Bool [mutate]
+        if not g_takes
+            return false
+        var xs: [Int] = []
+        for i in 0..bytes.len(frame)
+            xs = list.push(xs, bytes.byte_at(frame, i) ?? 0)
+        g_sent = list.push(g_sent, xs)
+        true
+
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
+        if list.len(g_queue) == 0
+            return None
+        let first = g_queue[0]
+        g_queue = list.drop(g_queue, 1)
+        Some(first)
+
+    fn ros_is_open(self) -> Bool [mutate]
+        g_takes
+
+    fn ros_close(self) [mutate]
+        ()
+
+    fn ros_mtu(self) -> Int
+        512
+
+fn pipe_reset() [mutate]
+    g_sent = []
+    g_queue = []
+    g_takes = true
+
+// The agent says this next.
+fn agent_says(xs: [Int]) [mutate]
+    g_queue = list.push(g_queue, bytes.from_byte_list(xs))
+
+@test
+fn test_asking_for_samples_puts_the_recorded_request_on_the_pipe() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let s = session_after_creates()
+
+    test.case("RECORDED READ_DATA for every sample, on the best-effort stream")
+    pipe_reset()
+    let out = rostransport.request_data(pipe, s, 0x16, xrcewire.XRCE_STREAM_BEST_EFFORT,
+                                        xrcewire.XRCE_SAMPLES_UNLIMITED)
+    test.assert_eq(out.code, rosret.ROS_RET_OK)
+    test.assert_eq(g_sent, [read_data_message(1)])
+    test.assert_eq(out.session.next_request, 6)
+    test.assert_eq(out.session.output_seq, 5)
+
+    test.case("on the reliable stream")
+    pipe_reset()
+    let rel = rostransport.request_data(pipe, s, 0x16, xrcewire.XRCE_STREAM_RELIABLE,
+                                        xrcewire.XRCE_SAMPLES_UNLIMITED)
+    test.assert_eq(rel.code, rosret.ROS_RET_OK)
+    test.assert_eq(g_sent, [read_data_message(0x80)])
+
+    test.case("a pipe that takes nothing")
+    pipe_reset()
+    g_takes = false
+    let refused = rostransport.request_data(pipe, s, 0x16, 1, 1)
+    test.assert_eq(refused.code, rosret.ROS_RET_AGENT_UNREACHABLE)
+    test.assert_eq(refused.session.next_request, 5)
+
+    test.case("a session that was never opened")
+    pipe_reset()
+    test.assert_eq(rostransport.request_data(pipe, rostransport.session(1, 512), 0x16, 1, 1).code,
+                   rosret.ROS_RET_NOT_INIT)
+    test.assert_eq(list.len(g_sent), 0)
+
+@test
+fn test_a_sample_written_on_the_reliable_stream_is_kept_until_it_is_acknowledged() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let s = session_at_request_8()
+    let three = bytes.u32_le(3)
+
+    test.case("RECORDED WRITE_DATA at sequence 3 of stream 0x80")
+    pipe_reset()
+    var h = xrcestream.history()
+    let out = rostransport.write_sample_reliable(pipe, s, stream_at(3), var h, 0x15, three)
+    test.assert_eq(out.code, rosret.ROS_RET_OK)
+    test.assert_eq(g_sent, [write_reliable(3, 3)])
+    test.assert_eq(out.stream.out_next, 4)
+    test.assert_eq(xrcestream.out_in_flight(out.stream), 1)
+    // The best-effort counter is not the reliable stream's.
+    test.assert_eq(out.session.next_request, 9)
+    test.assert_eq(out.session.output_seq, 0)
+
+    test.case("the message is in the history, to be sent again")
+    var back: Vec[u8; 512] = Vec.new()
+    test.assert_eq(xrcestream.history_load(var h, 3, var back), 16)
+    test.assert_eq(list_of(var back), write_reliable(3, 3))
+
+    test.case("a full window writes nothing and says so")
+    pipe_reset()
+    var full = stream_at(0)
+    for _i in 0..4
+        full = xrcestream.out_wrote(full)
+    var h2 = xrcestream.history()
+    let blocked = rostransport.write_sample_reliable(pipe, s, full, var h2, 0x15, three)
+    test.assert_eq(blocked.code, rosret.ROS_RET_BAD_ALLOC)
+    test.assert_eq(blocked.stream.out_next, 4)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("a pipe that takes nothing keeps the sample and goes on")
+    pipe_reset()
+    g_takes = false
+    var h3 = xrcestream.history()
+    let lost = rostransport.write_sample_reliable(pipe, s, stream_at(3), var h3, 0x15, three)
+    test.assert_eq(lost.code, rosret.ROS_RET_AGENT_UNREACHABLE)
+    test.assert_eq(lost.stream.out_next, 4)
+    test.assert_eq(xrcestream.history_load(var h3, 3, var back), 16)
+
+    test.case("a sample that does not fit the message")
+    pipe_reset()
+    let big = rostransport.write_sample_reliable(pipe, s, stream_at(3), var h3, 0x15,
+                                                 bytes.zeros(600))
+    test.assert_eq(big.code, rosret.ROS_RET_INVALID_ARGUMENT)
+    test.assert_eq(big.stream.out_next, 3)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("a session that was never opened")
+    test.assert_eq(rostransport.write_sample_reliable(pipe, rostransport.session(1, 512),
+                                                      stream_at(3), var h3, 0x15, three).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_a_quiet_stream_with_something_unacknowledged_sends_a_heartbeat() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let s = an_open_session()
+    let held = stream_in_flight(3, 6)
+
+    test.case("fifty milliseconds is not enough, and the quiet time is kept")
+    pipe_reset()
+    let early = rostransport.reliable_tick(pipe, s, held, 50)
+    test.assert_eq(early.out_quiet_ms, 50)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("RECORDED HEARTBEAT of 3 to 5 when it has been a hundred")
+    let due = rostransport.reliable_tick(pipe, s, early, 50)
+    test.assert_eq(g_sent, [heartbeat_message(3, 5)])
+    test.assert_eq(due.out_quiet_ms, 0)
+    test.assert_eq(due.out_first, 3)
+    test.assert_eq(due.out_next, 6)
+
+    test.case("nothing unacknowledged, nothing to say")
+    pipe_reset()
+    let idle = rostransport.reliable_tick(pipe, s, stream_at(6), 500)
+    test.assert_eq(idle.out_quiet_ms, 500)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("a session that is not open says nothing")
+    test.assert_eq(rostransport.reliable_tick(pipe, rostransport.session(1, 512), held, 500).out_quiet_ms,
+                   500)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("a pipe that takes nothing is tried again a hundred milliseconds on")
+    g_takes = false
+    test.assert_eq(rostransport.reliable_tick(pipe, s, held, 100).out_quiet_ms, 0)
+
+@test
+fn test_polling_takes_a_sample_and_acknowledges_a_reliable_one() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = rostransport.session_silent(an_open_session(), 300)
+    let type_id = 1234
+
+    test.case("a session that was never opened takes nothing")
+    pipe_reset()
+    agent_says(data_best_effort())
+    var closed_history = xrcestream.history()
+    test.assert_eq(rostransport.poll(pipe, rostransport.session(1, 512), xrcestream.rel_stream(),
+                                     var closed_history, type_id, 0).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+    test.case("nothing on the pipe is a take that failed, which is not an error")
+    pipe_reset()
+    var h = xrcestream.history()
+    let quiet = rostransport.poll(pipe, up, xrcestream.rel_stream(), var h, type_id, 0)
+    test.assert_eq(quiet.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert(not rosret.ros_ret_is_error(quiet.code))
+    test.assert_eq(quiet.session.silent_ms, 300)
+
+    test.case("RECORDED DATA on the best-effort stream is the sample, with the same message shape as a publish")
+    pipe_reset()
+    agent_says(data_best_effort())
+    let got = rostransport.poll(pipe, up, xrcestream.rel_stream(), var h, type_id, 0)
+    test.assert_eq(got.code, rosret.ROS_RET_OK)
+    test.assert_eq(got.object, 0x16)
+    test.assert_eq(rosmsg.payload_length(got.message), 4)
+    test.assert_eq(bytes.u32_le_at(rosmsg.payload(got.message), 0) ?? 0 - 1, 7)
+    test.assert_eq(got.message.type_id, type_id)
+    test.assert_eq(got.message.encapsulation, rosmsg.ROS_CDR_LE)
+    test.assert_eq(rosmsg.wire_length(got.message), 8)
+    // Any message from the agent clears the silence, and a best-effort one
+    // is not acknowledged.
+    test.assert_eq(got.session.silent_ms, 0)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("RECORDED DATA at sequence 0 of the reliable stream is acknowledged with the next number")
+    pipe_reset()
+    agent_says(data_reliable(0, 11))
+    let first = rostransport.poll(pipe, up, xrcestream.rel_stream(), var h, type_id, 0)
+    test.assert_eq(first.code, rosret.ROS_RET_OK)
+    test.assert_eq(bytes.u32_le_at(rosmsg.payload(first.message), 0) ?? 0 - 1, 11)
+    test.assert_eq(first.stream.in_handled, 0)
+    test.assert_eq(g_sent, [acknack_message(1, 0)])
+
+    test.case("the same message again is not a second sample, and is acknowledged again")
+    pipe_reset()
+    agent_says(data_reliable(0, 11))
+    let repeat = rostransport.poll(pipe, up, first.stream, var h, type_id, 0)
+    test.assert_eq(repeat.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(g_sent, [acknack_message(1, 0)])
+
+    test.case("a message after a gap is not delivered, and the ACKNACK asks for the gap")
+    pipe_reset()
+    agent_says(data_reliable(2, 13))
+    let gap = rostransport.poll(pipe, up, first.stream, var h, type_id, 0)
+    test.assert_eq(gap.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(g_sent, [acknack_message(1, 3)])
+
+    test.case("the message that fills it is delivered, and the next ACKNACK still asks for the one after")
+    pipe_reset()
+    agent_says(data_reliable(1, 12))
+    let filled = rostransport.poll(pipe, up, gap.stream, var h, type_id, 0)
+    test.assert_eq(filled.code, rosret.ROS_RET_OK)
+    test.assert_eq(g_sent, [acknack_message(2, 1)])
+
+@test
+fn test_a_heartbeat_is_answered_and_an_acknack_sends_messages_again() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = an_open_session()
+
+    test.case("the agent's HEARTBEAT announcing messages is answered with an ACKNACK for them")
+    pipe_reset()
+    var h = xrcestream.history()
+    agent_says(heartbeat_message(0, 2))
+    let beat = rostransport.poll(pipe, up, xrcestream.rel_stream(), var h, 1, 0)
+    test.assert_eq(beat.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(g_sent, [acknack_message(0, 7)])
+
+    // Messages 3 to 5 are in flight and in the history.
+    test.case("RECORDED ACKNACK, first 3 and bitmap 7: all three are sent again")
+    pipe_reset()
+    var held = history_of(3, 6)
+    agent_says(acknack_message(3, 7))
+    let all = rostransport.poll(pipe, up, stream_in_flight(3, 6), var held, 1, 0)
+    test.assert_eq(g_sent, [write_reliable(3, 3), write_reliable(4, 4), write_reliable(5, 5)])
+    test.assert_eq(all.stream.out_first, 3)
+
+    test.case("RECORDED ACKNACK, first 4 and bitmap 3: 3 is acknowledged, 4 and 5 are sent again")
+    pipe_reset()
+    agent_says(acknack_message(4, 3))
+    let two = rostransport.poll(pipe, up, stream_in_flight(3, 6), var held, 1, 0)
+    test.assert_eq(g_sent, [write_reliable(4, 4), write_reliable(5, 5)])
+    test.assert_eq(two.stream.out_first, 4)
+
+    test.case("an ACKNACK that names only one message sends only that one")
+    pipe_reset()
+    agent_says(acknack_message(3, 4))
+    let _one = rostransport.poll(pipe, up, stream_in_flight(3, 6), var held, 1, 0)
+    test.assert_eq(g_sent, [write_reliable(5, 5)])
+
+    test.case("an ACKNACK for everything sends nothing and leaves the stream idle")
+    pipe_reset()
+    agent_says(acknack_message(6, 0))
+    let done = rostransport.poll(pipe, up, stream_in_flight(3, 6), var held, 1, 0)
+    test.assert_eq(list.len(g_sent), 0)
+    test.assert(xrcestream.out_idle(done.stream))
+
+    test.case("a message named that the history never held is skipped")
+    pipe_reset()
+    var empty = xrcestream.history()
+    agent_says(acknack_message(3, 1))
+    let _skipped = rostransport.poll(pipe, up, stream_in_flight(3, 6), var empty, 1, 0)
+    test.assert_eq(list.len(g_sent), 0)
+
+@test
+fn test_a_refused_request_comes_back_as_an_error_with_the_number() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = an_open_session()
+    var h = xrcestream.history()
+
+    test.case("a STATUS that is not OK")
+    pipe_reset()
+    agent_says(status_message(5, 0x16, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let refused = rostransport.poll(pipe, up, xrcestream.rel_stream(), var h, 1, 0)
+    test.assert_eq(refused.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(refused.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+
+    test.case("a STATUS that is OK, and an INFO, are not samples and not errors")
+    pipe_reset()
+    agent_says(status_message(5, 0x16, 0))
+    test.assert_eq(rostransport.poll(pipe, up, xrcestream.rel_stream(), var h, 1, 0).code,
+                   rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    agent_says(info_message())
+    test.assert_eq(rostransport.poll(pipe, up, xrcestream.rel_stream(), var h, 1, 0).code,
+                   rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+
+@test
+fn test_keeping_alive_pings_without_waiting_for_the_answer() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = an_open_session()
+
+    test.case("a silence shorter than the interval sends nothing")
+    pipe_reset()
+    test.assert_eq(rostransport.keepalive(pipe, up, 50).silent_ms, 50)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("a longer one sends the recorded ping and takes a request id")
+    let pinged = rostransport.keepalive(pipe, up, 200)
+    test.assert_eq(g_sent,
+                   [[0x80, 0x00, 0x00, 0x00, 0x02, 0x01, 0x08, 0x00, 0x00, 0x01, 0xFF, 0xFD,
+                     0x03, 0x00, 0x00, 0x00]])
+    test.assert_eq(pinged.next_request, 2)
+    test.assert_eq(pinged.silent_ms, 200)
+
+    test.case("the answer is read by poll, and clears the silence")
+    agent_says(info_message())
+    var h = xrcestream.history()
+    let heard = rostransport.poll(pipe, pinged, xrcestream.rel_stream(), var h, 1, 0)
+    test.assert_eq(heard.session.silent_ms, 0)
+
+    test.case("an agent silent past the timeout is gone")
+    test.assert_eq(rostransport.keepalive(pipe, up, 1500).state, rostransport.ROS_SESSION_LOST)
+
+    test.case("a session never opened is left alone")
+    test.assert_eq(rostransport.keepalive(pipe, rostransport.session(1, 512), 1500).state,
+                   rostransport.ROS_SESSION_CLOSED)
+
+// ── rosuart: over a fake UART ────────────────────────────────────────
+
+// The fake UART's state, as in `tests/rosclient_tests.nv`: a module-level
+// variable each, because the trait's methods take `self` by value, and
+// fixed-capacity buffers because the functions under test are `@no_alloc`.
+var u_inbox: Vec[u8; 1100]  = Vec.new()
+var u_cursor                = 0
+var u_outbox: Vec[u8; 1100] = Vec.new()
+var u_refusals              = 0
+
+struct FakeUart
+    id: Int
+
+impl XrceUart[mutate] for FakeUart
+    fn uart_put(self, byte: Int) -> Bool [mutate]
+        if u_refusals < 0
+            return false
+        match u_outbox.push(byte as u8)
+            Ok(_)  => true
+            Err(_) => false
+
+    fn uart_get(self) -> Int [mutate]
+        if u_cursor < u_inbox.len()
+            u_cursor = u_cursor + 1
+            return u_inbox[u_cursor - 1] as Int
+        0 - 1
+
+    fn uart_pause_ms(self, ms: Int) [mutate]
+        ()
+
+fn clear_line() [mutate]
+    u_inbox.clear()
+    u_cursor = 0
+    u_outbox.clear()
+    u_refusals = 0
+
+// The frame an agent sends, appended to what is waiting on the line.
+fn agent_sends(payload: [Int]) [mutate]
+    var p = vec_of(payload)
+    var f: Vec[u8; 1037] = Vec.new()
+    let _ = xrceframe.encode(var f, var p, xrceframe.XRCE_ADDR_AGENT,
+                             xrceframe.XRCE_ADDR_CLIENT)
+    for b in f
+        let _ = u_inbox.push(b)
+
+// Every frame the device has put on the line, taken out of its framing:
+// what an agent would have read.
+fn on_the_line() -> [[Int]]
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var out: [[Int]] = []
+    for b in u_outbox
+        if xrceframe.push_byte(var d, b as Int) == xrceframe.XRCE_PUSH_FRAME
+            var p: [Int] = []
+            // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+            for x in d.payload
+                let wide = x as Int
+                p = list.push(p, wide)
+            out = list.push(out, p)
+    out
+
+@test
+fn test_the_device_asks_for_samples_and_writes_on_the_reliable_stream() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+
+    test.case("RECORDED READ_DATA on the line")
+    clear_line()
+    let asked = rosuart.request_data(u, var m, var f, session_after_creates(), 0x16,
+                                     xrcewire.XRCE_STREAM_RELIABLE,
+                                     xrcewire.XRCE_SAMPLES_UNLIMITED)
+    test.assert_eq(asked.code, rosret.ROS_RET_OK)
+    test.assert_eq(on_the_line(), [read_data_message(0x80)])
+    test.assert_eq(asked.session.next_request, 6)
+    test.assert_eq(asked.session.output_seq, 5)
+
+    test.case("a transmitter that takes nothing, and a session never opened")
+    clear_line()
+    u_refusals = 0 - 1
+    test.assert_eq(rosuart.request_data(u, var m, var f, session_after_creates(), 0x16, 1, 1).code,
+                   rosret.ROS_RET_AGENT_UNREACHABLE)
+    clear_line()
+    test.assert_eq(rosuart.request_data(u, var m, var f, rostransport.session(1, 512), 0x16, 1,
+                                        1).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+    test.case("RECORDED WRITE_DATA at sequence 3 of stream 0x80, kept in the history")
+    clear_line()
+    var h = xrcestream.history()
+    let out = rosuart.publish_i32_reliable(u, var m, var f, var h, session_at_request_8(),
+                                           stream_at(3), 0x15, 3)
+    test.assert_eq(out.code, rosret.ROS_RET_OK)
+    test.assert_eq(on_the_line(), [write_reliable(3, 3)])
+    test.assert_eq(out.stream.out_next, 4)
+    test.assert_eq(out.session.next_request, 9)
+    test.assert_eq(out.session.output_seq, 0)
+    var back: Vec[u8; 512] = Vec.new()
+    test.assert_eq(xrcestream.history_load(var h, 3, var back), 16)
+
+    test.case("a full window writes nothing")
+    clear_line()
+    var full = stream_at(0)
+    for _i in 0..4
+        full = xrcestream.out_wrote(full)
+    var h2 = xrcestream.history()
+    test.assert_eq(rosuart.publish_i32_reliable(u, var m, var f, var h2, session_at_request_8(),
+                                                full, 0x15, 3).code,
+                   rosret.ROS_RET_BAD_ALLOC)
+    test.assert_eq(list.len(on_the_line()), 0)
+
+    test.case("a transmitter that takes nothing keeps the sample")
+    clear_line()
+    u_refusals = 0 - 1
+    var h3 = xrcestream.history()
+    let lost = rosuart.publish_i32_reliable(u, var m, var f, var h3, session_at_request_8(),
+                                            stream_at(3), 0x15, 3)
+    test.assert_eq(lost.code, rosret.ROS_RET_AGENT_UNREACHABLE)
+    test.assert_eq(lost.stream.out_next, 4)
+    test.assert_eq(xrcestream.history_load(var h3, 3, var back), 16)
+
+    test.case("a session never opened")
+    clear_line()
+    test.assert_eq(rosuart.publish_i32_reliable(u, var m, var f, var h3, rostransport.session(1, 512),
+                                                stream_at(3), 0x15, 3).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_the_device_heartbeats_the_reliable_stream_and_keeps_alive() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    let s = an_open_session()
+    let held = stream_in_flight(3, 6)
+
+    test.case("RECORDED HEARTBEAT of 3 to 5 after a hundred milliseconds")
+    clear_line()
+    let early = rosuart.reliable_tick(u, var m, var f, s, held, 60)
+    test.assert_eq(list.len(on_the_line()), 0)
+    let due = rosuart.reliable_tick(u, var m, var f, s, early, 60)
+    test.assert_eq(on_the_line(), [heartbeat_message(3, 5)])
+    test.assert_eq(due.out_quiet_ms, 0)
+
+    test.case("nothing unacknowledged, or no session, says nothing")
+    clear_line()
+    test.assert_eq(rosuart.reliable_tick(u, var m, var f, s, stream_at(6), 500).out_quiet_ms, 500)
+    test.assert_eq(rosuart.reliable_tick(u, var m, var f, rostransport.session(1, 512), held,
+                                         500).out_quiet_ms,
+                   500)
+    test.assert_eq(list.len(on_the_line()), 0)
+
+    test.case("keeping alive sends the recorded ping and does not wait")
+    clear_line()
+    test.assert_eq(rosuart.keepalive(u, var m, var f, s, 50).silent_ms, 50)
+    test.assert_eq(list.len(on_the_line()), 0)
+    let pinged = rosuart.keepalive(u, var m, var f, s, 200)
+    test.assert_eq(on_the_line(),
+                   [[0x80, 0x00, 0x00, 0x00, 0x02, 0x01, 0x08, 0x00, 0x00, 0x01, 0xFF, 0xFD,
+                     0x03, 0x00, 0x00, 0x00]])
+    test.assert_eq(pinged.next_request, 2)
+    test.assert_eq(pinged.silent_ms, 200)
+    test.assert_eq(rosuart.keepalive(u, var m, var f, s, 1500).state, rostransport.ROS_SESSION_LOST)
+    test.assert_eq(rosuart.keepalive(u, var m, var f, rostransport.session(1, 512), 1500).state,
+                   rostransport.ROS_SESSION_CLOSED)
+
+@test
+fn test_the_device_polls_a_sample_and_leaves_it_in_the_message_buffer() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    let up = rostransport.session_silent(an_open_session(), 300)
+
+    test.case("a session never opened takes nothing")
+    clear_line()
+    agent_sends(data_best_effort())
+    test.assert_eq(rosuart.poll(u, var d, var m, var f, var h, rostransport.session(1, 512),
+                                xrcestream.rel_stream(), 0).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+    test.case("an empty line is a take that failed, which is not an error")
+    clear_line()
+    let quiet = rosuart.poll(u, var d, var m, var f, var h, up, xrcestream.rel_stream(), 3)
+    test.assert_eq(quiet.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(quiet.session.silent_ms, 300)
+
+    test.case("RECORDED DATA on the best-effort stream")
+    clear_line()
+    agent_sends(data_best_effort())
+    let got = rosuart.poll(u, var d, var m, var f, var h, up, xrcestream.rel_stream(), 3)
+    test.assert_eq(got.code, rosret.ROS_RET_OK)
+    test.assert_eq(got.sample.object, 0x16)
+    test.assert_eq(xrcewire.sample_i32(var m, got.sample), 7)
+    test.assert_eq(got.session.silent_ms, 0)
+    test.assert_eq(list.len(on_the_line()), 0)
+
+    test.case("RECORDED DATA at sequence 0 of the reliable stream is acknowledged, and the sample survives the reply")
+    clear_line()
+    agent_sends(data_reliable(0, 11))
+    let first = rosuart.poll(u, var d, var m, var f, var h, up, xrcestream.rel_stream(), 3)
+    test.assert_eq(first.code, rosret.ROS_RET_OK)
+    test.assert_eq(on_the_line(), [acknack_message(1, 0)])
+    test.assert_eq(xrcewire.sample_i32(var m, first.sample), 11)
+
+    test.case("a message after a gap is not delivered, and the ACKNACK asks for the gap")
+    clear_line()
+    agent_sends(data_reliable(2, 13))
+    let gap = rosuart.poll(u, var d, var m, var f, var h, up, first.stream, 3)
+    test.assert_eq(gap.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(on_the_line(), [acknack_message(1, 3)])
+
+    test.case("a damaged frame is not a sample")
+    clear_line()
+    agent_sends(data_reliable(1, 12))
+    u_inbox[u_inbox.len() - 1] = 0x00
+    test.assert_eq(rosuart.poll(u, var d, var m, var f, var h, up, first.stream, 3).code,
+                   rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(list.len(on_the_line()), 0)
+
+    test.case("the agent's HEARTBEAT is answered")
+    clear_line()
+    agent_sends(heartbeat_message(0, 2))
+    let beat = rosuart.poll(u, var d, var m, var f, var h, up, xrcestream.rel_stream(), 3)
+    test.assert_eq(beat.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(on_the_line(), [acknack_message(0, 7)])
+
+    test.case("a refused request comes back as an error with the number")
+    clear_line()
+    agent_sends(status_message(5, 0x16, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let refused = rosuart.poll(u, var d, var m, var f, var h, up, xrcestream.rel_stream(), 3)
+    test.assert_eq(refused.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(refused.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+
+@test
+fn test_the_device_sends_messages_again_when_the_agent_asks() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    let up = an_open_session()
+    var held = history_of(3, 6)
+
+    test.case("RECORDED ACKNACK, first 3 and bitmap 7: all three are sent again, in order")
+    clear_line()
+    agent_sends(acknack_message(3, 7))
+    let all = rosuart.poll(u, var d, var m, var f, var held, up, stream_in_flight(3, 6), 3)
+    test.assert_eq(on_the_line(), [write_reliable(3, 3), write_reliable(4, 4), write_reliable(5, 5)])
+    test.assert_eq(all.stream.out_first, 3)
+
+    test.case("RECORDED ACKNACK, first 4 and bitmap 3: 3 is acknowledged")
+    clear_line()
+    agent_sends(acknack_message(4, 3))
+    let two = rosuart.poll(u, var d, var m, var f, var held, up, stream_in_flight(3, 6), 3)
+    test.assert_eq(on_the_line(), [write_reliable(4, 4), write_reliable(5, 5)])
+    test.assert_eq(two.stream.out_first, 4)
+
+    test.case("an ACKNACK for everything sends nothing and leaves the stream idle")
+    clear_line()
+    agent_sends(acknack_message(6, 0))
+    let done = rosuart.poll(u, var d, var m, var f, var held, up, stream_in_flight(3, 6), 3)
+    test.assert_eq(list.len(on_the_line()), 0)
+    test.assert(xrcestream.out_idle(done.stream))
+
+    test.case("a message the history never held is skipped")
+    clear_line()
+    var empty = xrcestream.history()
+    agent_sends(acknack_message(3, 1))
+    let _skipped = rosuart.poll(u, var d, var m, var f, var empty, up, stream_in_flight(3, 6), 3)
+    test.assert_eq(list.len(on_the_line()), 0)

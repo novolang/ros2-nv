@@ -38,6 +38,10 @@ pub const ROS_AGENT_DEFAULT_PORT = 8888
 // transport: 2.
 pub const ROS_TCP_LENGTH_BYTES = 2
 
+// How long a poll waits for the rest of a message whose first byte has
+// arrived, in milliseconds: 1000.
+pub const ROS_TCP_FRAME_MS = 1000
+
 // The largest message this transport carries, in bytes: 2048.
 //
 // Larger than the 512 a serial link gets, because TCP has no such
@@ -94,8 +98,20 @@ impl RosTransport[net] for RosAgentLink
             // `take_frame` itself.
             if not self.open
                 return None
+            // With nothing buffered, wait for the first byte: up to
+            // `timeout_ms`, and with 0 not at all, so that 0 is a poll.
+            // A socket with no receive timeout set would otherwise hold
+            // the caller until a byte came.
+            if bytes.len(self.pending) == 0 and not net.fd_wait_readable(self.sock, timeout_ms)
+                return None
+            // The agent writes a message in one piece, so once its first
+            // byte is here the rest follows at once; a poll waits the
+            // rest out for `ROS_TCP_FRAME_MS`, because a message cut off
+            // here is lost and the stream is then out of step.
             if timeout_ms > 0
                 net.set_recv_timeout(self.sock, timeout_ms)
+            else
+                net.set_recv_timeout(self.sock, ROS_TCP_FRAME_MS)
             var buffered: Bytes = bytes.clone(self.pending)
             while true
                 let frame_len = length_of_prefix(buffered)

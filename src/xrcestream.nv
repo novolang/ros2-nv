@@ -1,0 +1,409 @@
+// xrcestream.nv — one reliable stream, as arithmetic over integers and a
+// buffer the caller owns.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it, with no allocation.
+// The state is a `@value` of five integers, the history is a `Vec[u8; 2056]`
+// the caller holds, and nothing here sends or receives: the functions
+// answer what a session is to do, and `rostransport` and `rosuart` do it
+// over their own pipes.
+//
+// WHAT A RELIABLE STREAM IS.  A message on a best-effort stream is sent
+// once and forgotten.  A message on a reliable stream carries a sequence
+// number, and the sender keeps it until the receiver says it has it.  Two
+// submessages carry the conversation, both on stream 0 and about a stream
+// by the id in their payload (`xrcewire` has the bytes):
+//
+//   HEARTBEAT   from the sender: the first sequence number it still holds
+//               and the last it sent.  It is how a receiver learns that a
+//               message was sent when the last one is the one that was
+//               lost, because no later message arrives to show the gap.
+//   ACKNACK     from the receiver: the first sequence number it does not
+//               have, and a bitmap of the messages after it that are
+//               missing.  The sender drops what the first number
+//               acknowledges and sends the messages the bitmap names
+//               again.
+//
+// THIS MODULE KEEPS ONE STREAM EACH WAY, the stream with id 0x80.  The
+// eProsima client numbers streams by index and a node may hold several;
+// a node here holds one, and a message about any other stream is ignored.
+//
+// THE OUTPUT SIDE keeps `XRCE_HISTORY` messages, in a ring of slots of
+// `XRCE_SLOT_BYTES` each, so a message is a slot from the moment it goes
+// out until the agent acknowledges it.  A write finds the window full when
+// that many are unacknowledged, and the caller decides what to do: wait for
+// an acknowledgement, or drop the sample.  The ring costs
+// `XRCE_HISTORY_BYTES` of RAM, and nothing else here is larger than the
+// state's forty bytes.
+//
+// THE INPUT SIDE keeps nothing but two numbers.  A message that arrives
+// in order is delivered.  A message that arrives after a gap is dropped and
+// counted as announced, so the next ACKNACK names every message from the
+// first missing one up to it, and the agent sends them again in order.
+// That costs retransmissions that a buffer on this side would avoid, and
+// costs no RAM.  A message already delivered is dropped and acknowledged
+// again, because the agent may have missed the acknowledgement.
+//
+// SEQUENCE NUMBERS ARE SIXTEEN BITS AND WRAP.  Every comparison here is on
+// the distance forward from one number to the other, modulo 65536; a
+// distance under 32768 means "later" and any other means "earlier", which
+// is how the eProsima client and the agent compare them.
+
+use xrcewire
+
+// How many messages the output side holds for retransmission: 4, the
+// number a stock micro-ROS build keeps.
+pub const XRCE_HISTORY = 4
+// The bytes one slot of the history takes: 514, the two bytes of a message's
+// length and a 512-byte message.
+pub const XRCE_SLOT_BYTES = 514
+// The bytes the history takes: 2056.
+pub const XRCE_HISTORY_BYTES = 2056
+// How long a sender with unacknowledged messages stays quiet before it
+// sends a HEARTBEAT, in milliseconds: 100.
+pub const XRCE_STREAM_HEARTBEAT_MS = 100
+// How many messages after the first missing one an ACKNACK can name: 16.
+pub const XRCE_ACKNACK_SPAN = 16
+
+// The input side has delivered nothing and been told of nothing.  Sequence
+// number 65535 is the one before 0.
+const SEQ_NONE = 65535
+
+// The message is the next one in order: deliver it.
+pub const REL_DELIVER = 0
+// The message was delivered before: drop it and acknowledge again.
+pub const REL_DUPLICATE = 1
+// The message comes after a gap: drop it, and ask for the gap.
+pub const REL_AHEAD = 2
+
+// One reliable stream in both directions.
+//
+// A `@value` of integers, so a driver holds it beside its session with
+// nothing on a heap.  The output side is `out_first` to `out_next`; the
+// input side is `in_handled` and `in_announced`.
+pub @value
+struct RelStream
+    // The oldest sequence number the agent has not acknowledged.
+    out_first: Int
+    // The sequence number the next message written will carry.
+    out_next: Int
+    // Milliseconds since the last message written, the last HEARTBEAT, or
+    // the last acknowledgement that moved `out_first`.
+    out_quiet_ms: Int
+    // The sequence number of the last message delivered, 65535 for none.
+    in_handled: Int
+    // The highest sequence number known to exist, 65535 for none.
+    in_announced: Int
+
+// What one received message asks the session to do.
+pub @value
+struct RelEvent
+    // The stream after the message.
+    stream: RelStream
+    // Whether to send an ACKNACK for the input side.
+    ack: Bool
+    // The sample to hand up, or `found = false`.  Only a message delivered
+    // in order carries one.
+    sample: xrcewire.XrceSample
+    // Whether the message was an ACKNACK for the output side, so that the
+    // messages its bitmap names are to be sent again.
+    resend: Bool
+    // The ACKNACK's first sequence number, valid when `resend`.
+    resend_first: Int
+    // The ACKNACK's bitmap, valid when `resend`.
+    resend_bitmap: Int
+
+// The sequence number `n` after `a`, wrapping at 65536.
+//
+// ```novo
+// use xrcestream
+//
+// fn main() [io]
+//     println("${xrcestream.seq_add(65535, 2)}")   // 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn seq_add(a: Int, n: Int) -> Int []
+    (a + n) % 65536
+
+// How far forward `b` is from `a`, from 0 to 65535.
+//
+// ```novo
+// use xrcestream
+//
+// fn main() [io]
+//     println("${xrcestream.seq_sub(1, 65535)}")   // 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn seq_sub(b: Int, a: Int) -> Int []
+    (b - a + 65536) % 65536
+
+// Whether `a` is later than `b`: its distance forward from `b` is from 1
+// to 32767.
+pub @tier(embedded)
+@no_alloc
+fn seq_after(a: Int, b: Int) -> Bool []
+    let d = seq_sub(a, b)
+    d > 0 and d < 32768
+
+// A stream with nothing sent and nothing received.
+pub @tier(embedded)
+@no_alloc
+fn rel_stream() -> RelStream []
+    RelStream { out_first: 0, out_next: 0, out_quiet_ms: 0, in_handled: SEQ_NONE,
+                in_announced: SEQ_NONE }
+
+// The stream with the output side replaced and the input side kept.
+@tier(embedded)
+@no_alloc
+fn with_out(r: RelStream, first: Int, next: Int, quiet: Int) -> RelStream []
+    RelStream { out_first: first, out_next: next, out_quiet_ms: quiet,
+                in_handled: r.in_handled, in_announced: r.in_announced }
+
+// The stream with the input side replaced and the output side kept.
+@tier(embedded)
+@no_alloc
+fn with_in(r: RelStream, handled: Int, announced: Int) -> RelStream []
+    RelStream { out_first: r.out_first, out_next: r.out_next, out_quiet_ms: r.out_quiet_ms,
+                in_handled: handled, in_announced: announced }
+
+// ── The output side ──────────────────────────────────────────────────
+
+// How many messages are written and not yet acknowledged.
+pub @tier(embedded)
+@no_alloc
+fn out_in_flight(r: RelStream) -> Int []
+    seq_sub(r.out_next, r.out_first)
+
+// Whether the history has a free slot.
+pub @tier(embedded)
+@no_alloc
+fn out_can_write(r: RelStream) -> Bool []
+    out_in_flight(r) < XRCE_HISTORY
+
+// Whether every message written has been acknowledged.
+pub @tier(embedded)
+@no_alloc
+fn out_idle(r: RelStream) -> Bool []
+    out_in_flight(r) == 0
+
+// The stream after one message was written with the sequence number
+// `out_next`: the next number is one more, and the quiet time starts over.
+pub @tier(embedded)
+@no_alloc
+fn out_wrote(r: RelStream) -> RelStream []
+    with_out(r, r.out_first, seq_add(r.out_next, 1), 0)
+
+// The stream after the agent acknowledged every message before `first`.
+//
+// An acknowledgement from `out_first` up to and including `out_next` is
+// taken; any other is an old one, or one for a message never sent, and
+// changes nothing.  Taking one starts the quiet time over, which is what
+// stops a HEARTBEAT going out while the agent is answering.
+pub @tier(embedded)
+@no_alloc
+fn out_ack(r: RelStream, first: Int) -> RelStream []
+    if seq_sub(first, r.out_first) <= out_in_flight(r)
+        return with_out(r, first, r.out_next, 0)
+    r
+
+// The stream after `elapsed_ms` of quiet.
+pub @tier(embedded)
+@no_alloc
+fn out_quiet(r: RelStream, elapsed_ms: Int) -> RelStream []
+    with_out(r, r.out_first, r.out_next, r.out_quiet_ms + elapsed_ms)
+
+// Whether a HEARTBEAT is due: messages are unacknowledged and the stream
+// has been quiet for `XRCE_STREAM_HEARTBEAT_MS`.
+pub @tier(embedded)
+@no_alloc
+fn out_heartbeat_due(r: RelStream) -> Bool []
+    not out_idle(r) and r.out_quiet_ms >= XRCE_STREAM_HEARTBEAT_MS
+
+// The stream after a HEARTBEAT went out.
+pub @tier(embedded)
+@no_alloc
+fn out_heartbeat_sent(r: RelStream) -> RelStream []
+    with_out(r, r.out_first, r.out_next, 0)
+
+// The last sequence number written, which a HEARTBEAT announces.
+pub @tier(embedded)
+@no_alloc
+fn out_last(r: RelStream) -> Int []
+    seq_sub(r.out_next, 1)
+
+// Whether the message with the sequence number `first + j` is to be sent
+// again: its bit in an ACKNACK's bitmap is set, and it is still in the
+// history.  `r` is the stream after the ACKNACK was taken by `out_ack`.
+pub @tier(embedded)
+@no_alloc
+fn out_resend(r: RelStream, first: Int, bitmap: Int, j: Int) -> Bool []
+    let seq = seq_add(first, j)
+    ((bitmap >>> j) & 1) == 1 and seq_sub(seq, r.out_first) < out_in_flight(r)
+
+// The history, with every byte zero.
+//
+// `Vec[u8; 2056]` holds `XRCE_HISTORY` slots of `XRCE_SLOT_BYTES`: a
+// message's length in two bytes, least significant first, and the message.
+// A message with the sequence number `n` takes slot `n % XRCE_HISTORY`, and
+// 65536 is a multiple of the history, so the slot of a number does not
+// change when the sequence wraps.
+pub @tier(embedded)
+@no_alloc
+fn history() -> Vec[u8; 2056] []
+    var h: Vec[u8; 2056] = Vec.new()
+    for _i in 0..XRCE_HISTORY_BYTES
+        let _ = h.push(0)
+    h
+
+// The offset of the slot a sequence number takes.
+@tier(embedded)
+@no_alloc
+fn slot_at(seq: Int) -> Int []
+    (seq % XRCE_HISTORY) * XRCE_SLOT_BYTES
+
+// Keep the message in `m` in the slot of the sequence number `seq`.
+//
+// Answers false, and keeps nothing, for a history that `history()` did not
+// make.
+pub @tier(embedded)
+@no_alloc
+fn history_store(var h: Vec[u8; 2056], seq: Int, var m: Vec[u8; 512]) -> Bool []
+    if h.len() < XRCE_HISTORY_BYTES
+        return false
+    let at = slot_at(seq)
+    let n = m.len()
+    h[at] = (n & 0xFF) as u8
+    h[at + 1] = ((n >>> 8) & 0xFF) as u8
+    for i in 0..n
+        h[at + 2 + i] = m[i]
+    true
+
+// Copy the message in the slot of `seq` into `m`, replacing what it held.
+// Answers its length, 0 for a slot never written or a history that
+// `history()` did not make.
+pub @tier(embedded)
+@no_alloc
+fn history_load(var h: Vec[u8; 2056], seq: Int, var m: Vec[u8; 512]) -> Int []
+    m.clear()
+    if h.len() < XRCE_HISTORY_BYTES
+        return 0
+    let at = slot_at(seq)
+    let n = h[at] as Int + h[at + 1] as Int * 256
+    for i in 0..n
+        let _ = m.push(h[at + 2 + i])
+    n
+
+// ── The input side ───────────────────────────────────────────────────
+
+// The first sequence number not yet delivered, which an ACKNACK names.
+pub @tier(embedded)
+@no_alloc
+fn in_first(r: RelStream) -> Int []
+    seq_add(r.in_handled, 1)
+
+// What to do with a message with this sequence number: `REL_DELIVER`,
+// `REL_DUPLICATE` or `REL_AHEAD`.
+pub @tier(embedded)
+@no_alloc
+fn in_verdict(r: RelStream, seq: Int) -> Int []
+    let d = seq_sub(seq, in_first(r))
+    if d == 0
+        return REL_DELIVER
+    if d >= 32768
+        return REL_DUPLICATE
+    REL_AHEAD
+
+// The later of two sequence numbers.
+@tier(embedded)
+@no_alloc
+fn later(a: Int, b: Int) -> Int []
+    if seq_after(b, a)
+        return b
+    a
+
+// The stream after a message with this sequence number arrived.
+//
+// In order, it is delivered and `in_handled` moves to it.  After a gap it
+// is announced and nothing else changes.  A duplicate changes nothing.
+pub @tier(embedded)
+@no_alloc
+fn in_receive(r: RelStream, seq: Int) -> RelStream []
+    let verdict = in_verdict(r, seq)
+    if verdict == REL_DELIVER
+        return with_in(r, seq, later(r.in_announced, seq))
+    if verdict == REL_AHEAD
+        return with_in(r, r.in_handled, later(r.in_announced, seq))
+    r
+
+// The stream after the agent's HEARTBEAT said it holds `first` to `last`.
+//
+// A `first` beyond the next message in line means the agent no longer holds
+// the ones before it, so the messages between are given up and delivery
+// resumes at `first`.  A `last` beyond what was known is announced.
+pub @tier(embedded)
+@no_alloc
+fn in_heartbeat(r: RelStream, first: Int, last: Int) -> RelStream []
+    var handled = r.in_handled
+    if seq_after(first, in_first(r))
+        handled = seq_sub(first, 1)
+    let announced = later(later(r.in_announced, last), handled)
+    with_in(r, handled, announced)
+
+// How many messages are announced and not delivered.
+pub @tier(embedded)
+@no_alloc
+fn in_missing(r: RelStream) -> Int []
+    if seq_after(r.in_announced, r.in_handled)
+        return seq_sub(r.in_announced, r.in_handled)
+    0
+
+// The bitmap an ACKNACK carries: bit j is set when the message
+// `in_first + j` is announced, and so missing, because nothing past
+// `in_handled` is kept.
+pub @tier(embedded)
+@no_alloc
+fn in_bitmap(r: RelStream) -> Int []
+    let missing = in_missing(r)
+    var bitmap = 0
+    for j in 0..XRCE_ACKNACK_SPAN
+        if j < missing
+            bitmap = bitmap | (1 << j)
+    bitmap
+
+// ── A received message ───────────────────────────────────────────────
+
+// What a received message asks of the session, and the stream after it.
+//
+// A message on a reliable stream is run through the input side whatever
+// it holds, because it used up a sequence number; its sample is handed up
+// only when it arrived in order, and an ACKNACK is due either way.  A
+// HEARTBEAT about the reliable stream moves the input side and asks for an
+// ACKNACK.  An ACKNACK about it acknowledges the output side and names the
+// messages to send again.  A message about any other stream, or short of a
+// header, asks for nothing.
+pub @tier(embedded)
+@no_alloc
+fn receive(var m: Vec[u8; 512], r: RelStream) -> RelEvent []
+    var st = r
+    var ack = false
+    var deliver = true
+    if xrcewire.message_stream(var m) >= xrcewire.XRCE_STREAM_RELIABLE
+        let seq = xrcewire.message_seq(var m)
+        deliver = in_verdict(st, seq) == REL_DELIVER
+        st = in_receive(st, seq)
+        ack = true
+    var sample = xrcewire.XrceSample { found: false, request: 0, object: 0, start: 0, length: 0 }
+    if deliver
+        sample = xrcewire.read_sample(var m)
+    let beat = xrcewire.read_heartbeat(var m)
+    if beat.found and beat.stream == xrcewire.XRCE_STREAM_RELIABLE
+        st = in_heartbeat(st, beat.first, beat.last)
+        ack = true
+    let nack = xrcewire.read_acknack(var m)
+    var resend = false
+    if nack.found and nack.stream == xrcewire.XRCE_STREAM_RELIABLE
+        st = out_ack(st, nack.first)
+        resend = true
+    RelEvent { stream: st, ack: ack, sample: sample, resend: resend,
+               resend_first: nack.first, resend_bitmap: nack.bitmap }
