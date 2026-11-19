@@ -17,19 +17,17 @@ in. The commands below work with either; the name is the only difference.
 | The node reaches the agent by | Program | Start the agent with |
 | --- | --- | --- |
 | TCP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv` | `MicroXRCEAgent tcp4 --port 2018` |
+| UDP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, with `udp` as the last argument | `MicroXRCEAgent udp4 --port 2018` |
 | A serial line, from a board | `examples/dk_talker.nv` | `MicroXRCEAgent serial --dev /dev/ttyACM<n> -b 115200` |
 | A serial line, from a PC | `examples/uart_stdio.nv`, `examples/uart_stdio_listener.nv` | `MicroXRCEAgent serial --dev <the PC end of the line> -b 115200` |
-| UDP | none | `MicroXRCEAgent udp4 --port 8888` |
 
-**The UDP agent cannot be reached from this package.** A datagram comes
-back from the standard library as a NUL-terminated string, so it is cut at
-its first zero byte, and an XRCE message has a zero in its second byte.
-The command is listed because it is the agent most boards on a network
-use, and so that nobody starts it expecting this package to answer.
-
-The examples use TCP port 2018 for the agent. `rosagent.ROS_AGENT_DEFAULT_PORT`
-is 8888, which is the UDP agent's port, so a program that connects to a TCP
-agent names the port.
+The examples use port 2018 for either agent, TCP or UDP.
+`rosagent.ROS_AGENT_DEFAULT_PORT` is 8888, which is the UDP agent's own
+default, so a program that does not name the port gets that one. The
+transport is the program's choice, `rosagent.connect` or
+`rosagent.connect_udp`, and the agent has to be started for the same one: an
+agent started with `tcp4` does not read a datagram and one started with
+`udp4` does not accept a connection.
 
 ## The steps
 
@@ -40,7 +38,9 @@ agent names the port.
 3. Start the program.
    - Host: `novo run examples/host_talker.nv`. It takes the agent's host
      and port as arguments, `novo run examples/host_talker.nv 192.168.1.20
-     2018`, and prints one line for each thing it did.
+     2018`, and prints one line for each thing it did. A fourth argument,
+     `udp`, reaches an agent started with `udp4`: `novo run
+     examples/host_talker.nv 192.168.1.20 2018 best_effort udp`.
    - Board: build with the console on the UART and flash:
 
      ```
@@ -132,6 +132,10 @@ and whose `status` is the agent's own number when it answered.
 | A create before the session is open | `ROS_RET_NOT_INIT` |
 | A description longer than the 512-byte message buffer | `ROS_RET_INVALID_ARGUMENT` |
 | The agent is restarted while the node runs | Nothing: every `write_sample` and `publish_i32` answers `ROS_RET_OK`, because the bytes went out. The heartbeat is what notices: `rostransport.heartbeat` (host) and `rosuart.heartbeat` (device) ping the agent, and when no answer has come for `ROS_SESSION_TIMEOUT_MS` the session's state becomes `ROS_SESSION_LOST`. `dk_talker` then opens a session again; the new agent holds none of the old entities, so it creates them again. `host_talker` does not call the heartbeat. |
+| No agent is listening on a UDP port | `rosagent.connect_udp` answers a link, because UDP has no connection to refuse. `open_session` answers a session whose state is closed once its timeout has passed, and nothing logs anywhere. Observed: `host_talker 127.0.0.1 2999 best_effort udp` with nothing on the port printed `session: closed` after two seconds. |
+| A datagram arrives from an address that is not the agent's | `ros_recv` drops it and answers nothing. |
+| A sample is longer than one message and was asked for on the best-effort stream | Nothing arrives. The agent cannot cut a message on a best-effort stream, logs `serialization warning: Trying to serialize 1012 in 512 MTU stream` and sends nothing. Ask for the samples on the reliable stream and take them with `poll_long`. Observed. |
+| A sample is longer than the reassembly allows | `poll_long` answers `ROS_RET_BAD_ALLOC` once, on the call that took the first piece, acknowledges and drops the rest of the pieces, and takes the next sample as usual. Observed with a text of 2,100 characters against the 2,040-byte limit. |
 | A data reader is asked for before it exists, or the id is wrong | The agent answers a STATUS with `0x84`, unknown reference, on the reliable stream; `poll` answers `ROS_RET_ERROR` with `status` `0x84`. |
 | A sample is expected and none arrives | `poll` answers `ROS_RET_SUBSCRIPTION_TAKE_FAILED`, which is not an error. Check that the publisher's QoS is compatible with the data reader's, which `rosqos.compatible` answers, and that the topic and type names are the ones in the table above. |
 | The reliable stream's history is full | `write_sample_reliable` and `publish_i32_reliable` answer `ROS_RET_BAD_ALLOC` and write nothing, because `XRCE_HISTORY` messages are unacknowledged. Call `poll` so the agent's ACKNACKs are read, and `reliable_tick` so the stream announces itself. |
@@ -478,6 +482,214 @@ duplicate and acknowledged it again. `ros2 topic echo` printed `data: 0` to
   silence counter, which has to be fed the time that passed and not the
   length of the wait. A poll that returns at once because a frame was
   there, counted as 200 ms, makes a loop that pings on every turn.
+
+## A run over UDP, with long samples, 2026-11-19
+
+Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy on one machine, novo 0.26.0, agent
+verbose level 6, the node on `127.0.0.1`. The agent was started with its
+libraries on `LD_LIBRARY_PATH`. The board was not involved. The programs were
+built with `novo build examples/host_talker.nv` and `novo build
+examples/host_listener.nv`. Every `ros2` command ran under `bash -c 'source
+/opt/ros/jazzy/setup.bash && ...'`.
+
+### (a) The talker over UDP
+
+```
+MicroXRCEAgent udp4 --port 2058 -v 6
+ros2 topic echo /novo_counter std_msgs/msg/Int32
+./host_talker 127.0.0.1 2058 best_effort udp
+```
+
+The program printed what it prints over TCP:
+
+```
+session: established
+participant: code 0, agent status 0 (ok)
+topic: code 0, agent status 0 (ok)
+publisher: code 0, agent status 0 (ok)
+datawriter: code 0, agent status 0 (ok)
+published 0: code 0
+...
+published 9: code 0
+```
+
+`ros2 topic echo` printed `data: 0` to `data: 9`, each followed by `---`. The
+agent's log shows the datagrams it read, one message to each, with no length
+in front: the CREATE_CLIENT is 24 bytes, and the session is established
+for the address of the node's socket.
+
+```
+recv_message | [==>> UDP <<==] | client_key: 0x00000000, len: 24
+0000: 80 00 00 00 00 01 10 00 58 52 43 45 01 00 01 0F AA BB CC DD 81 00 00 02
+establish_session | session established | client_key: 0xAABBCCDD, address: 127.0.0.1:47836
+send_message | [** <<UDP>> **] | client_key: 0xAABBCCDD, len: 19
+0000: 81 00 00 00 04 01 0B 00 00 00 58 52 43 45 01 00 01 0F 00
+create_datawriter | datawriter created | client_key: 0xAABBCCDD, datawriter_id: 0x001(5), publisher_id: 0x001(3)
+recv_message | [==>> UDP <<==] | client_key: 0xAABBCCDD, len: 16
+0000: 81 01 04 00 07 01 08 00 00 05 00 15 00 00 00 00
+write | [** <<DDS>> **] | client_key: 0x00000001, len: 4
+0000: 00 00 00 00
+```
+
+The STATUS_AGENT the agent sent back has zero bytes at offsets 1 to 3 and 7
+to 9, and the node read it whole: a datagram of 19 bytes, which is what
+`net.udp_recv_from` answers since novo 0.10.0 and what it did not before.
+
+On the reliable stream, `./host_talker 127.0.0.1 2058 reliable udp` printed
+`after a second: 0 unacknowledged` after each of its ten samples, so the
+agent's ACKNACKs arrived as datagrams and were read. The agent's log has the
+ten WRITE_DATA messages on stream `0x80`, sequence 0 to 9, each followed by
+its ACKNACK, and each written to DDS. `ros2 topic echo` printed `data: 0` to
+`data: 9`; see the last list of this section for the two runs on a freshly
+started agent that printed `data: 2` first.
+
+### (b) The listener over UDP
+
+```
+./host_listener 127.0.0.1 2058 best_effort 14 int32 udp
+ros2 topic pub --once /novo_cmd std_msgs/msg/Int32 "{data: 7}"
+```
+
+```
+session: established
+participant: code 0, agent status 0 (ok)
+topic: code 0, agent status 0 (ok)
+subscriber: code 0, agent status 0 (ok)
+datareader: code 0, agent status 0 (ok)
+request: code 0
+sample 0: data 7, 4 bytes
+received 1 sample(s)
+```
+
+### (c) A sample of a thousand characters
+
+A `std_msgs/msg/String` of 1,000 characters (`0123456789abcdef` repeated) is
+1,008 bytes of CDR: the length 1,001, the characters, the closing zero and
+three bytes of padding. The listener asks for it on the reliable stream:
+
+```
+./host_listener 127.0.0.1 2058 reliable 14 string udp
+ros2 topic pub --once -w 1 /novo_text std_msgs/msg/String "{data: '<1,000 characters>'}"
+```
+
+```
+session: established
+participant: code 0, agent status 0 (ok)
+topic: code 0, agent status 0 (ok)
+subscriber: code 0, agent status 0 (ok)
+datareader: code 0, agent status 0 (ok)
+request: code 0
+sample 0: text of 1000 characters, 1008 bytes, begins "0123456789abcdef01234567", ends "0123456789abcdef01234567"
+received 1 sample(s)
+```
+
+The same command with `tcp` and the TCP agent, started with `MicroXRCEAgent
+tcp4 --port 2038 -v 6`, printed the same sample line.
+
+The agent cut the DATA into three messages, each a FRAGMENT (submessage id 13,
+`0D`) on stream `0x80`, and the node acknowledged each as it came. The
+messages are 512, 512 and 16 bytes. The first carries the DATA's own header
+(`09 01 F4 03`, length 1,012), the request and reader ids (`00 05 00 16`)
+and the sample; the flags of the first two are `01`, and the last has bit 1
+set:
+
+```
+recv  81 01 04 00 08 01 10 00 00 05 00 16 80 00 00 01 FF FF 00 00 00 00 00 00
+send  81 80 00 00 0D 01 F8 01 09 01 F4 03 00 05 00 16 E9 03 00 00 30 31 32 33 34 35 36 37 38 39 61 62 ...  (512 bytes)
+recv  81 00 00 00 0A 01 05 00 01 00 00 00 80
+send  81 80 01 00 0D 01 F8 01 63 64 65 66 30 31 32 33 34 35 36 37 38 39 61 62 ...  (512 bytes)
+recv  81 00 00 00 0A 01 05 00 02 00 00 00 80
+send  81 80 02 00 0D 03 08 00 34 35 36 37 00 00 00 00                               (16 bytes)
+recv  81 00 00 00 0A 01 05 00 03 00 00 00 80
+```
+
+The READ_DATA is the first line (stream `0x80`, `... 80 00 00 01 FF FF ...`).
+Each piece is 504 bytes of the serialised DATA, and 504 + 504 + 8 is the 1,016
+bytes of a 4-byte header, a 4-byte pair of ids and the 1,008-byte sample. The
+last ACKNACK, first number not received 3, says every piece is in. The
+hand-built pieces in `tests/rosfrag_tests.nv` reproduce these messages byte for
+byte, and the last one is used as recorded.
+
+### (d) A sample too long for the reassembly, then one that fits
+
+The same listener, with the reassembly at its 2,040-byte limit, then
+`ros2 topic pub` with a text of 2,100 characters and one of 700:
+
+```
+a sample longer than 2040 bytes was dropped
+sample 0: text of 700 characters, 708 bytes, begins "0123456789abcdef01234567", ends "456789abcdef0123456789ab"
+received 1 sample(s)
+```
+
+The long sample was dropped once, with the call that took its first piece
+answering `ROS_RET_BAD_ALLOC`, its other pieces were acknowledged and
+dropped, and the sample that followed it was joined from its own first piece.
+
+### (e) A long sample on the best-effort stream
+
+```
+./host_listener 127.0.0.1 2058 best_effort 12 string udp
+ros2 topic pub --once -w 1 /novo_text std_msgs/msg/String "{data: '<1,000 characters>'}"
+```
+
+The listener printed `received 0 sample(s)`. The agent's log has the reason:
+
+```
+push_submessage | serialization warning | Trying to serialize 1012 in 512 MTU stream
+```
+
+### (f) A long sample over a serial line, with the device code
+
+`examples/uart_stdio_listener.nv` takes `string` as its third argument and
+polls with `rosuart.poll_long`, the device function, over `ConsoleUart` and the
+serial framing. The line was a pair of connected pseudoterminals, as in the
+run of the subscription:
+
+```
+socat pty,raw,echo=0,link=ttyAGENT pty,raw,echo=0,link=ttyBOARD
+MicroXRCEAgent serial --dev ttyAGENT -b 115200 -v 6
+novo build examples/uart_stdio_listener.nv -o uart_stdio_listener
+./uart_stdio_listener reliable 20 string <>ttyBOARD >&0 2> listener.out
+ros2 topic pub --once -w 1 /novo_text std_msgs/msg/String "{data: '<1,000 characters>'}"
+```
+
+`listener.out` held:
+
+```
+sample 0: text of 1000 characters, 1008 bytes, first 48 last 55
+received 1 sample(s), silence 480 ms
+```
+
+The first and last characters are 48 and 55, which are `0` and `7`, the
+first and last of the text. The agent's log has the same three messages as
+over UDP, 512, 512 and 16 bytes, on stream `0x80`, with `0D 01 F8 01`, `0D 01 F8 01` and
+`0D 03 08 00` as their FRAGMENT headers. The buffers in this program are all
+on its stack: the message, the frame, the de-framer, the history and the
+2,056-byte reassembly buffer.
+
+### What this run taught the package
+
+- A FRAGMENT's payload is a slice of the whole submessage, header included.
+  The first piece does not start with the sample: it starts with the DATA's
+  own header, and the sample is eight bytes in. The agent's source says so
+  (`ReliableOutputStream::push_submessage` serialises the header and then
+  cuts), and the log above shows it: `09 01 F4 03` after the FRAGMENT's own
+  header.
+- The agent cuts at the MTU the node announced in its CREATE_CLIENT, 512, less
+  the eight bytes of the message and submessage headers, so the node's
+  announcement is also the limit on what it can be sent in one message.
+- A best-effort stream cannot carry a sample longer than one message. This is
+  the agent's, not the node's, and nothing on the node's side can say so.
+- `ros2 topic echo` missed the first two samples in two runs of the reliable
+  talker over UDP, each the first session of a freshly started agent, and
+  printed `data: 2` first. On a later session of the same agent the same
+  command printed `data: 0` to `data: 9`, as did the talker over TCP, with
+  this package and with 0.1.2, and over UDP on the best-effort stream. In both
+  short runs the agent's log has all ten samples written to DDS, one a second
+  and in order, and each acknowledged, so the link delivered them and the
+  ROS side had not matched the new writer yet. The cause was not run down.
+  The examples wait a second after creating the writer, which is not always
+  enough for a fresh agent.
 
 ## The board
 

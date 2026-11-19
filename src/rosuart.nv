@@ -33,6 +33,7 @@
 use rostransport
 use rosret
 use xrceframe
+use xrcefrag
 use xrcestream
 use xrcewire
 
@@ -387,6 +388,30 @@ fn keepalive<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
     let _sent = send(u, var m, var f)
     rostransport.session_next_request(waited)
 
+// Send what a received message asks of this side of the reliable stream: the
+// ACKNACK for the input side, and the messages of the history that an
+// ACKNACK from the agent names.
+//
+// The replies are built in a scratch message on the stack, so the message
+// that was received is left as it is.
+@tier(embedded)
+@no_alloc
+fn answer_stream<U: XrceUart[e]>(u: U, var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                                 ev: xrcestream.RelEvent) [e]
+    var a: Vec[u8; 512] = Vec.new()
+    if ev.ack
+        let _built = xrcewire.acknack(var a, xrcestream.in_first(ev.stream),
+                                      xrcestream.in_bitmap(ev.stream),
+                                      xrcewire.XRCE_STREAM_RELIABLE)
+        let _sent = send(u, var a, var f)
+    if ev.resend
+        for j in 0..xrcestream.XRCE_ACKNACK_SPAN
+            if xrcestream.out_resend(ev.stream, ev.resend_first, ev.resend_bitmap, j)
+                let n = xrcestream.history_load(var h, xrcestream.seq_add(ev.resend_first, j),
+                                                var a)
+                if n > 0
+                    let _again = send(u, var a, var f)
+
 // Take the next frame from the agent and act on it.
 //
 // Waits up to `timeout_ms` for one frame, as `receive` does, leaves its
@@ -412,22 +437,86 @@ fn poll<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512]
     let reply = xrcewire.read_reply(var m)
     let ev = xrcestream.receive(var m, r)
     let heard = rostransport.session_heard(s)
-    var a: Vec[u8; 512] = Vec.new()
-    if ev.ack
-        let _built = xrcewire.acknack(var a, xrcestream.in_first(ev.stream),
-                                      xrcestream.in_bitmap(ev.stream),
-                                      xrcewire.XRCE_STREAM_RELIABLE)
-        let _sent = send(u, var a, var f)
-    if ev.resend
-        for j in 0..xrcestream.XRCE_ACKNACK_SPAN
-            if xrcestream.out_resend(ev.stream, ev.resend_first, ev.resend_bitmap, j)
-                let n = xrcestream.history_load(var h, xrcestream.seq_add(ev.resend_first, j),
-                                                var a)
-                if n > 0
-                    let _again = send(u, var a, var f)
+    answer_stream(u, var f, var h, ev)
     if ev.sample.found
         return RosPoll { session: heard, stream: ev.stream, code: rosret.ROS_RET_OK,
                          status: 0 - 1, sample: ev.sample }
     if reply.kind == xrcewire.XRCE_REPLY_STATUS and not xrcewire.status_is_ok(reply.status)
         return poll_none(heard, ev.stream, rosret.ROS_RET_ERROR, reply.status)
     poll_none(heard, ev.stream, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1)
+
+// What `poll_long` took from the UART.
+pub @value
+struct RosLongPoll
+    // The session after the call. Any message from the agent clears its
+    // silence.
+    session: rostransport.RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // The reassembly after the call; pass it to the next `poll_long`.
+    assembly: xrcefrag.FragState
+    // `ROS_RET_OK` when `sample` was found, whole or joined from pieces;
+    // `ROS_RET_SUBSCRIPTION_TAKE_FAILED` when no whole frame came in time, or
+    // what came was a piece of a sample not yet whole, or held no sample,
+    // which is not an error; `ROS_RET_BAD_ALLOC` when a sample is longer than
+    // the reassembly allows and was dropped; `ROS_RET_NOT_INIT` for a session
+    // that is not established; `ROS_RET_ERROR` when the agent answered a
+    // request with a status that is not OK, and `status` has the number.
+    code: Int
+    // The agent's status number when `code` is `ROS_RET_ERROR`, else -1.
+    status: Int
+    // The sample. Its bytes are `a[0]` to `a[sample.length - 1]` of the
+    // caller's reassembly buffer, whether the agent sent it in one message
+    // or in pieces; `sample.start` is 0.
+    sample: xrcewire.XrceSample
+
+// A `RosLongPoll` that took no sample.
+@tier(embedded)
+@no_alloc
+fn long_none(s: rostransport.RosSession, r: xrcestream.RelStream, state: xrcefrag.FragState,
+             code: Int, status: Int) -> RosLongPoll []
+    RosLongPoll { session: s, stream: r, assembly: state, code: code, status: status,
+                  sample: xrcewire.XrceSample { found: false, request: 0, object: 0, start: 0,
+                                                length: 0 } }
+
+// Take the next frame from the agent and act on it, joining a sample the
+// agent sent in pieces.
+//
+// `poll` for samples longer than one message, with the rule of
+// `rostransport.poll_long`: the samples are asked for on the reliable
+// stream, `a` is the buffer the pieces are joined in, and `state`, from
+// `xrcefrag.reassembly`, says how large a sample it will take. The caller keeps
+// `a` and passes the `assembly` of the result to the next call. A sample that
+// is whole is left in `a`, from its first byte, until the next call. `m`
+// holds the last frame, as it does after `poll`. One frame per call.
+pub @tier(embedded)
+@no_alloc
+fn poll_long<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                             var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                             var a: Vec[u8; 2048], s: rostransport.RosSession,
+                             r: xrcestream.RelStream, state: xrcefrag.FragState,
+                             timeout_ms: Int) -> RosLongPoll [e]
+    let st = xrcefrag.begin(state, var a)
+    if not rostransport.session_is_ready(s)
+        return long_none(s, r, st, rosret.ROS_RET_NOT_INIT, 0 - 1)
+    if receive(u, var d, var m, timeout_ms) != xrceframe.XRCE_PUSH_FRAME
+        return long_none(s, r, st, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1)
+    let reply = xrcewire.read_reply(var m)
+    let ev = xrcestream.receive(var m, r)
+    let heard = rostransport.session_heard(s)
+    // A sample in one frame, or a piece of one, is joined before anything
+    // else is built; the replies use a scratch message.
+    var joined = xrcefrag.event(st, xrcefrag.FRAG_NONE)
+    if ev.sample.found
+        joined = xrcefrag.keep_sample(var m, ev.sample, st, var a)
+    else if xrcestream.delivers(var m, r)
+        joined = xrcefrag.push(var m, st, var a)
+    answer_stream(u, var f, var h, ev)
+    if joined.code == xrcefrag.FRAG_DONE
+        return RosLongPoll { session: heard, stream: ev.stream, assembly: joined.assembly,
+                             code: rosret.ROS_RET_OK, status: 0 - 1, sample: joined.sample }
+    if joined.code == xrcefrag.FRAG_TOO_LONG
+        return long_none(heard, ev.stream, joined.assembly, rosret.ROS_RET_BAD_ALLOC, 0 - 1)
+    if reply.kind == xrcewire.XRCE_REPLY_STATUS and not xrcewire.status_is_ok(reply.status)
+        return long_none(heard, ev.stream, joined.assembly, rosret.ROS_RET_ERROR, reply.status)
+    long_none(heard, ev.stream, joined.assembly, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1)

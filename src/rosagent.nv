@@ -1,32 +1,35 @@
-// rosagent.nv — the byte pipe to a micro-ROS agent, over TCP.
+// rosagent.nv: the byte pipe to a micro-ROS agent, over TCP or UDP.
 //
 // THE ONE MODULE IN THIS PACKAGE THAT PERFORMS ANYTHING, and its row is
 // `[net]` and nothing else.  No clock: every timeout here is handed to
 // the socket, which is what measures it.
 //
-// TCP, AND NOT THE TWO TRANSPORTS A REAL DEPLOYMENT WOULD RATHER USE.
-// A micro-ROS agent listens on four: UDP, TCP, a serial line and CAN
-// FD.  A board on a bench is almost always on the serial line and a
-// board on a robot is almost always on UDP.  Neither can be written
-// against the standard library today, and each is a row worth opening:
+// A micro-ROS agent listens on four transports: UDP, TCP, a serial line
+// and CAN FD.  This module reaches two of them:
 //
-//   - a UDP datagram comes back from `net.udp_recv_from` as a
-//     NUL-terminated string, so it is truncated at its first zero byte
-//     — and an XRCE message's header has a zero in its second byte.
-//     TCP has `net.send_bytes` and `net.recv_bytes`, which is why this
-//     module exists at all.
-//   - there is no serial port in the standard library.  No baud rate,
-//     no parity, no inter-character timeout.
+//   - TCP, with `connect`, which answers a `RosAgentLink`.  A stream has
+//     no message boundaries, so the link frames: see below.
+//   - UDP, with `connect_udp`, which answers a `RosUdpLink`.  A datagram is
+//     one message and needs no framing, so the link holds no buffer.  The
+//     agent's UDP transport is the one a board on a robot's network uses.
 //
-// So this is the transport a development machine and a continuous
-// integration run use, and the one a test against a real agent can be
-// written with.  A device brings its own `RosTransport` over its UART.
+// A serial line is not here, because the standard library has no serial
+// port: no baud rate, no parity, no inter-character timeout.  A device
+// brings its own transport over its UART (`rosuart`), and a PC reaches an
+// agent's serial transport through a pseudoterminal pair, as
+// `docs/agent-run.md` shows.  CAN FD is not reached.
+//
+// A DATAGRAM IS BYTES.  `net.udp_recv_from` answers the length the kernel
+// reported, so a zero byte inside a datagram is a byte like any other,
+// and an XRCE message has one in its second byte.  Before novo 0.10.0 it
+// answered a NUL-terminated string and cut the datagram at its first zero
+// byte, which is why this module had no UDP link until now.
 //
 // A TCP MESSAGE IS LENGTH-PREFIXED, and the prefix is not part of the
 // message.  Micro XRCE-DDS puts two bytes of little-endian length in
 // front of every message on a stream transport, because TCP has no
 // frames of its own and a reader that took whatever `recv` returned
-// would get half a message as often as it got two.  `recv_frame` is
+// would get half a message as often as it got two.  `ros_recv` is
 // what reassembles them, and it is the reason the link holds a buffer.
 
 use rostransport
@@ -49,6 +52,15 @@ pub const ROS_TCP_FRAME_MS = 1000
 // that a node written against this one still fits a serial link later
 // if its messages fit here with room over.
 pub const ROS_AGENT_MTU = 2048
+
+// The largest message the UDP link carries, in bytes: 512.
+//
+// The size of the buffer a message is built in and read into, which is
+// also the size the session announces to the agent.  An agent writes no
+// datagram longer than the size it was told, so 512 is what a datagram
+// can be, and a sample longer than that arrives in pieces
+// (`xrcefrag`).
+pub const ROS_UDP_MTU = 512
 
 // An open connection to an agent, and the bytes not yet reassembled
 // into a message.
@@ -275,3 +287,129 @@ fn feed(l: RosAgentLink, chunk: Bytes) -> RosAgentLink []
 pub @tier(system)
 fn pending_bytes(l: RosAgentLink) -> Int []
     bytes.len(l.pending)
+
+// ── UDP ──────────────────────────────────────────────────────────────
+
+// An open UDP socket and the agent it sends to.
+//
+// A PLAIN STRUCT, because it holds a socket and strings.  UDP has no
+// connection, so the link keeps the agent's address, which it sends to and
+// which it accepts datagrams from: a datagram from anywhere else is not the
+// agent's and is dropped.
+pub struct RosUdpLink
+    // The socket.
+    sock: Sock
+    // The agent's host, as it was given.
+    host: Str
+    // The agent's port.
+    port: Int
+    // The agent's address as the receive call spells a sender, `IP:PORT`.
+    peer: Str
+    // The largest message this link will carry.
+    mtu: Int
+    // Whether the socket is open.
+    open: Bool
+
+impl RosTransport[net] for RosUdpLink
+    // Send one message as one datagram.
+    @tier(system)
+    fn ros_send(self, frame: Bytes) -> Bool [net]
+        system
+            // A datagram is a message and has no length in front of it.  A
+            // message longer than the link's size is refused here, so that
+            // it is not cut by whatever is between this socket and the
+            // agent.
+            if not self.open
+                return false
+            if bytes.len(frame) > self.mtu
+                return false
+            return net.udp_send_to(self.sock, self.host, self.port, frame)
+
+    // Take one datagram from the agent, or nothing.
+    @tier(system)
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes [net]
+        system
+            // With nothing queued, wait up to `timeout_ms`; 0 is a poll.
+            if not self.open
+                return None
+            if not net.fd_wait_readable(self.sock, timeout_ms)
+                return None
+            // One datagram per call, as the whole of one: the buffer is the
+            // link's size, and a longer datagram is cut by the kernel.  A
+            // sender that is not the agent is dropped, and the caller asks
+            // again.
+            match net.udp_recv_from(self.sock, self.mtu)
+                None => return None
+                Some((data, from)) =>
+                    if from != self.peer
+                        return None
+                    return Some(bytes.from_str(data))
+
+    @tier(system)
+    fn ros_is_open(self) -> Bool [net]
+        self.open
+
+    @tier(system)
+    fn ros_close(self) [net]
+        // The field says how the link was opened and cannot be written
+        // through `self`; what closing means here is closing the
+        // socket.
+        if self.open
+            net.close(self.sock)
+
+    @tier(system)
+    fn ros_mtu(self) -> Int
+        self.mtu
+
+// Open a UDP link to an agent.
+//
+// `[net]`: one socket, and a name lookup when `host` is a name and not an
+// address.  Answers nothing when the socket cannot be made or the host does
+// not resolve.  UDP has no connection, so an agent that is not listening
+// is not found out here: the first message goes out and nothing comes back,
+// which `open_session` reports as a session that is closed.
+//
+// ```novo
+// use rosagent
+//
+// fn main() [net, io]
+//     match rosagent.connect_udp("127.0.0.1", rosagent.ROS_AGENT_DEFAULT_PORT)
+//         Some(_) => println("socket open")
+//         None    => println("no socket")
+// ```
+pub @tier(system)
+fn connect_udp(host: Str, port: Int) -> ?RosUdpLink [net]
+    // The default size is the datagram link's own; a caller with a
+    // different one calls `connect_udp_with_mtu`.
+    connect_udp_with_mtu(host, port, ROS_UDP_MTU)
+
+// Open a UDP link with a stated message size.
+pub @tier(system)
+fn connect_udp_with_mtu(host: Str, port: Int, mtu: Int) -> ?RosUdpLink [net]
+    system
+        // The agent's address is looked up once, so that a datagram can be
+        // checked against it without a lookup per datagram.
+        let ip = match net.dns_lookup(host)
+            Some(found) => found
+            None        => ""
+        if ip == ""
+            return None
+        match net.udp_socket()
+            // cov: skip — the system refuses a socket only when it is out of descriptors
+            None       => return None
+            Some(sock) =>
+                return Some(RosUdpLink {
+                    sock: sock,
+                    host: host,
+                    port: port,
+                    peer: ip + ":" + str.from_int(port),
+                    mtu: mtu,
+                    open: true })
+
+// Close the link.
+pub @tier(system)
+fn disconnect_udp(l: RosUdpLink) [net]
+    // Closing twice is harmless, and the link's own field records how it
+    // was opened.
+    if l.open
+        net.close(l.sock)

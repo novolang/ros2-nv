@@ -30,6 +30,7 @@ use rosret
 use rostransport
 use rosuart
 use xrceframe
+use xrcefrag
 use xrcestream
 use xrcewire
 
@@ -170,6 +171,79 @@ fn stream_score() -> Int
         n = n + 1
     let got = rosuart.poll(u, var d, var m, var f, var h, up, w.stream, 2)
     if got.code == rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED
+        n = n + 1
+    n
+
+// A DATA carrying the integer 7, cut as the agent cuts one longer than its
+// message: the first ten bytes of the submessage in one FRAGMENT and the last
+// two in another, on stream 0x80 at sequences 0 and 1.
+const A_PIECE_1 = [0x81, 0x80, 0x00, 0x00, 0x0D, 0x01, 0x0A, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00,
+                   0x05, 0x00, 0x16, 0x07, 0x00]
+const A_PIECE_2 = [0x81, 0x80, 0x01, 0x00, 0x0D, 0x03, 0x02, 0x00, 0x00, 0x00]
+
+// One of the two pieces, as a message in a buffer.
+@tier(embedded)
+@no_alloc
+fn message_of_piece(first: Bool) -> Vec[u8; 512] []
+    var m: Vec[u8; 512] = Vec.new()
+    if first
+        for k in 0..18
+            let _p = m.push(A_PIECE_1[k] as u8)
+    else
+        for k in 0..10
+            let _p = m.push(A_PIECE_2[k] as u8)
+    m
+
+// Fragments: the reader, the joining in a buffer on the stack, a sample too
+// long for the buffer the caller allowed, and the device poll over a line
+// with nothing on it.  Eight checks.
+@tier(embedded)
+@no_alloc
+fn frag_score() -> Int
+    var n = 0
+    var p1 = message_of_piece(true)
+    var p2 = message_of_piece(false)
+    let f1 = xrcewire.read_fragment(var p1)
+    if f1.found and not f1.last and f1.length == 10
+        n = n + 1
+    let f2 = xrcewire.read_fragment(var p2)
+    if f2.found and f2.last and f2.start == 8
+        n = n + 1
+
+    var a: Vec[u8; 2048] = Vec.new()
+    var state = xrcefrag.reassembly(100)
+    let e1 = xrcefrag.push(var p1, state, var a)
+    if e1.code == xrcefrag.FRAG_MORE and a.len() == 10
+        n = n + 1
+    let e2 = xrcefrag.push(var p2, e1.assembly, var a)
+    if e2.code == xrcefrag.FRAG_DONE and e2.sample.length == 4 and a[0] == 7
+        n = n + 1
+    state = xrcefrag.begin(e2.assembly, var a)
+    if a.len() == 0 and not state.finished
+        n = n + 1
+
+    // The smallest reassembly takes no sample, and drops this one with all
+    // its pieces.
+    let none = xrcefrag.reassembly(0)
+    let d1 = xrcefrag.push(var p1, none, var a)
+    let d2 = xrcefrag.push(var p2, d1.assembly, var a)
+    if d1.code == xrcefrag.FRAG_TOO_LONG and d2.code == xrcefrag.FRAG_MORE and a.len() == 0
+        n = n + 1
+
+    let u = EmptyUart { id: 1 }
+    var m: Vec[u8; 512] = Vec.new()
+    var fr: Vec[u8; 1037] = Vec.new()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var h = xrcestream.history()
+    let up = rostransport.session_established(rostransport.session(1, 512),
+                                              xrcewire.XRCE_SESSION_ID)
+    let got = rosuart.poll_long(u, var d, var m, var fr, var h, var a, up,
+                                xrcestream.rel_stream(), state, 2)
+    if got.code == rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED
+        n = n + 1
+    let kept = xrcefrag.keep_sample(var p1, xrcewire.XrceSample { found: true, request: 5,
+                                    object: 0x16, start: 16, length: 2 }, state, var a)
+    if kept.code == xrcefrag.FRAG_DONE and a.len() == 2
         n = n + 1
     n
 
@@ -435,16 +509,16 @@ fn score() -> Int
     if rosexec.spin_wait_ms(rosexec.set_timeout(e, 100), early) == 60
         n = n + 1
 
-    n + wire_score() + stream_score()
+    n + wire_score() + stream_score() + frag_score()
 
 @tier(rt)
 fn main() [hw]
     bsp.board.init()
-    // 113 is the number of checks in `score` and `wire_score`.  The count is printed on a
+    // 121 is the number of checks in `score`, `wire_score`, `stream_score` and `frag_score`.  The count is printed on a
     // failure rather than only compared, so a device that disagrees with
     // the host says HOW MANY it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 113
+    if n == 121
         hal.uart.write("PASS: ros2-embedded\n")
     else
         hal.uart.write("FAIL: ros2-embedded score=")

@@ -129,6 +129,12 @@ pub const XRCE_SUB_DATA = 9
 pub const XRCE_SUB_ACKNACK = 10
 // Submessage id of HEARTBEAT: 11.
 pub const XRCE_SUB_HEARTBEAT = 11
+// Submessage id of FRAGMENT: 13.  One piece of a submessage too long for
+// one message.
+pub const XRCE_SUB_FRAGMENT = 13
+
+// The flag of a FRAGMENT that marks the last piece: 0x02.
+pub const XRCE_FLAG_LAST_FRAGMENT = 0x02
 
 // Object kinds, from the client's `DDS_XRCE_OBJK_*`.
 pub const XRCE_KIND_PARTICIPANT = 1
@@ -742,6 +748,39 @@ fn read_acknack(var m: Vec[u8; 512]) -> XrceAckNack []
         stream: m[sub.body + 4] as Int,
         first: m[sub.body] as Int + m[sub.body + 1] as Int * 256,
         bitmap: m[sub.body + 2] as Int * 256 + m[sub.body + 3] as Int }
+
+// A FRAGMENT read out of a received message.
+pub @value
+struct XrceFragment
+    // Whether the message held one.
+    found: Bool
+    // Whether it is the last piece of its submessage.
+    last: Bool
+    // The offset of the piece's first byte in the message.
+    start: Int
+    // The piece's length in bytes.
+    length: Int
+
+// Read a FRAGMENT out of a received message; `found = false` when there
+// is none.
+//
+// An agent sends a submessage longer than the message it may send as a
+// run of messages on a reliable stream, each holding one FRAGMENT.  The
+// pieces, joined in order, are the whole submessage with its own
+// submessage header in front (Micro-XRCE-DDS-Agent,
+// `ReliableOutputStream::push_submessage`), and the last piece has bit 1 of
+// its flags set.  `xrcefrag` joins them.
+pub @tier(embedded)
+@no_alloc
+fn read_fragment(var m: Vec[u8; 512]) -> XrceFragment []
+    let sub = find_submessage(var m, XRCE_SUB_FRAGMENT)
+    if sub.id < 0
+        return XrceFragment { found: false, last: false, start: 0, length: 0 }
+    XrceFragment {
+        found: true,
+        last: (sub.flags & XRCE_FLAG_LAST_FRAGMENT) != 0,
+        start: sub.body,
+        length: sub.length }
 
 // The 32-bit integer a sample holds in its first four bytes, least
 // significant first, as a signed number. The sample of a

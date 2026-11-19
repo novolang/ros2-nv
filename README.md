@@ -140,13 +140,14 @@ Build and test with `novo pkg build` and `novo test tests`.
 | `rosgraph` | How many of each thing a firmware was built to hold, how many have been created, and whether two endpoints will connect. |
 | `rosexec` | The executor as a step a caller drives, the two dispatch semantics, the three trigger policies, and periodic timers counted in the caller's own milliseconds. |
 | `rosmsg` | A serialised message as bytes this package does not read, the four-byte header that says which byte order they are in, and whether the whole thing fits the transport. |
-| `rostransport` | The session with the agent, the two stream kinds, `RosTransport`, the byte pipe a program implements over its own link, and the functions that open a session, create entities, write samples, ask for samples and take them over one. |
-| `xrcewire` | The Micro XRCE-DDS messages a client sends and the replies it reads, built in a buffer the caller owns: the requests that create entities, write and read samples, and the HEARTBEAT and ACKNACK of a reliable stream. |
+| `rostransport` | The session with the agent, the two stream kinds, `RosTransport`, the byte pipe a program implements over its own link, and the functions that open a session, create entities, write samples, ask for samples and take them over one, a sample longer than one message included (`poll_long`). |
+| `xrcewire` | The Micro XRCE-DDS messages a client sends and the replies it reads, built in a buffer the caller owns: the requests that create entities, write and read samples, the HEARTBEAT and ACKNACK of a reliable stream, and the FRAGMENT a long sample is cut into. |
 | `xrcestream` | One reliable stream as arithmetic over integers: sequence numbers that wrap, the history of messages kept for retransmission, what a received message asks of the session, and when a HEARTBEAT is due. It allocates nothing. |
+| `xrcefrag` | A sample longer than one message, joined from the pieces the agent sends it in, in a buffer the caller owns, with a limit the caller sets. It allocates nothing. |
 | `xrceframe` | The framing of a serial link to an agent: begin flag, addresses, length, byte stuffing and CRC-16, as a framer and a de-framer that allocate nothing. |
-| `rosuart` | The session over a UART, for a device: the same requests as `rostransport`, including subscriptions and the reliable stream, with no heap, over `XrceUart`, the trait a board's UART implements. |
+| `rosuart` | The session over a UART, for a device: the same requests as `rostransport`, including subscriptions, the reliable stream and long samples, with no heap, over `XrceUart`, the trait a board's UART implements. |
 | `rosparam` | The three parameter types a microcontroller node can have, the seven it cannot, and the rule that a parameter keeps the type it was declared with. |
-| `rosagent` | A byte pipe to a micro-ROS agent over TCP. The only module in the package that opens anything. |
+| `rosagent` | A byte pipe to a micro-ROS agent over TCP or UDP. The only module in the package that opens anything. |
 
 ## How to choose an entry point
 
@@ -159,16 +160,20 @@ exists, and it is most of what it is for.
 **A program with a link to an agent calls `rostransport`.** Its
 functions take a `RosTransport` and cost whatever that implementation
 costs. A program on a development machine gets one from
-`rosagent.connect`, and `examples/host_talker.nv` is one that publishes a
-counter through it, on the best-effort stream or, given `reliable`, on the
-reliable one. `examples/host_listener.nv` subscribes: it creates a data
-reader, asks for samples and prints each one `poll` takes.
+`rosagent.connect`, which reaches an agent over TCP, or from
+`rosagent.connect_udp`, which reaches one over UDP. `examples/host_talker.nv`
+is a program that publishes a counter through either, on the best-effort
+stream or, given `reliable`, on the reliable one, and `udp` as the fourth
+argument chooses the datagram link. `examples/host_listener.nv` subscribes:
+it creates a data reader, asks for samples and prints each one `poll_long`
+takes, a text of a thousand bytes included.
 
 **A program on a device calls `rosuart`.** Its functions take an
 `XrceUart`, which `rosuart.console_uart` supplies from the board's
 `hal.uart`, and allocate nothing; `examples/dk_talker.nv` is the same
 counter on an nRF54LM20 DK, and `examples/uart_stdio_listener.nv` is the
-device's subscription run on a PC. `docs/agent-run.md` has the steps to run
+device's subscription run on a PC, with `string` as its third argument for a
+sample longer than one message, which `rosuart.poll_long` joins. `docs/agent-run.md` has the steps to run
 each against an agent.
 
 **A program on a device calls the modules that build for it.** See
@@ -227,7 +232,9 @@ each against an agent.
 15. **A message larger than the transport's buffer is dropped below the
     layer that could report it.** The default buffer is 512 bytes,
     shared by every message, and the four-byte encapsulation header and
-    the session framing both come out of it.
+    the session framing both come out of it. That is the node's own
+    writes; a sample the agent sends longer than that arrives in pieces
+    (rule 25).
 16. **rclc carries three of ROS 2's ten parameter types**: boolean,
     integer and double. A node moved from a workstation loses its string
     parameters.
@@ -266,14 +273,76 @@ each against an agent.
     `reliable_tick` take milliseconds the caller measured. A poll that
     returned at once because a frame was waiting did not wait the timeout,
     and counting it as if it had pings the agent on every turn.
+25. **A sample longer than one message needs the reliable stream and
+    `poll_long`.** The agent cuts a sample that does not fit in a 512-byte
+    message into FRAGMENT submessages, one to a message, and only a
+    reliable stream can carry them: a best-effort stream drops a DATA that
+    does not fit. Ask for the samples on `xrcewire.XRCE_STREAM_RELIABLE` and
+    take them with `poll_long`, which joins the pieces in a buffer the
+    caller owns. `poll` reads each piece, acknowledges it and drops it, so
+    a long sample never reaches it.
+26. **The reassembly buffer has a limit, and a sample over it is dropped
+    with `ROS_RET_BAD_ALLOC`.** `xrcefrag.reassembly(n)` takes samples of at
+    most `n` bytes, up to `XRCE_REASSEMBLY_MAX_SAMPLE`, 2,040. The call that
+    meets the first piece of a longer sample answers the code once, the
+    rest of its pieces are acknowledged and dropped, and the next sample
+    is joined from its own first piece. A sample that came in one message
+    is held to the same limit.
+27. **A UDP link has no connection.** `rosagent.connect_udp` answers a link
+    when the socket is made and the host resolves, whether or not an agent
+    listens. A node with no agent finds out when `open_session` answers a
+    session that is closed. The link sends to the agent's address and drops
+    a datagram from any other.
+
+## Reaching an agent over TCP or UDP
+
+An agent listens on the transports it is started with, and a program names
+the one it wants. The agent's own ports are chosen on its command line; 8888
+is the default of its UDP transport and what `rosagent.ROS_AGENT_DEFAULT_PORT`
+says.
+
+```
+MicroXRCEAgent tcp4 --port 2018
+MicroXRCEAgent udp4 --port 8888
+```
+
+`rosagent.connect(host, port)` opens a TCP connection and answers a
+`RosAgentLink`, or nothing when no agent is listening. A stream has no
+message boundaries, so the link puts the two-byte length Micro XRCE-DDS
+uses in front of each message it sends and reads one back whole.
+`rosagent.connect_udp(host, port)` opens a socket and answers a
+`RosUdpLink`. A datagram is one message, so nothing goes in front of it and
+the link holds no buffer. Both implement `RosTransport[net]`, so every
+function of `rostransport` takes either, and a program written over the
+trait does not change when the transport does:
+
+```
+fn run<T: RosTransport[e]>(link: T) [e, io]
+    let s = rostransport.open_session(link, rostransport.session(0xAABBCCDD, 512), 2000)
+    ...
+```
+
+The UDP link is bound by what UDP is. It is not connected, so
+`connect_udp` cannot tell that no agent is listening: it answers a link
+whenever it can make a socket and resolve the host, and the first
+`open_session` that gets no answer is what says so. It sends to the agent's
+address and drops a datagram from any other. It carries 512 bytes a message,
+`rosagent.ROS_UDP_MTU`, which is what the session announces to the agent, so
+the agent sends no datagram longer than that; a long sample arrives in
+pieces, as it does over TCP. A datagram is not retransmitted, so a lost one
+is lost unless the stream it was on is reliable, which is the reliable
+stream's job and not the link's.
+
+Both were run against a Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy;
+`docs/agent-run.md` has the commands and the agent's log.
 
 ## Running on a microcontroller
 
-Eight modules build for a microcontroller with no heap allocator:
+Nine modules build for a microcontroller with no heap allocator:
 `rosret`, `rosqos`, `rosgraph` and `rosexec`, which a node consults before
-it touches the wire, and `xrceframe`, `xrcewire`, `xrcestream` and
-`rosuart`, which are the wire. `tests/embedded_probe.nv` is a firmware
-program that runs a hundred and thirteen checks over them and is compiled
+it touches the wire, and `xrceframe`, `xrcewire`, `xrcestream`, `xrcefrag`
+and `rosuart`, which are the wire. `tests/embedded_probe.nv` is a firmware
+program that runs a hundred and twenty-one checks over them and is compiled
 for a Cortex-M as part of
 this package's checks, so the claim is built rather than asserted. The
 program runs under QEMU and prints `PASS`.
@@ -304,6 +373,30 @@ keeps; a write finds the window full when that many are unacknowledged and
 answers `ROS_RET_BAD_ALLOC`. A smaller history is a different constant and
 a rebuild, because the buffer's size is part of its type.
 
+**What a long sample costs on a device.** A node that wants samples longer
+than 512 bytes passes `rosuart.poll_long` a reassembly buffer,
+`Vec[u8; 2048]`, which is 2,056 bytes, and a `FragState` of 16. The
+buffer holds the DATA submessage as the agent sent it, eight bytes of
+header and ids in front of the sample, so the largest sample is
+`xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE`, 2,040 bytes, and the caller's limit
+(`xrcefrag.reassembly(n)`) can be lower. The buffer's size is part of its
+type, as the history's is, so a different one is a different constant and a
+rebuild. The samples must be asked for on the reliable stream, which costs
+the 2,104 bytes above. A node that never asks for a long sample pays none of
+this. `rosuart.poll_long` builds its replies in the same 520-byte scratch
+message `poll` does, and leaves the sample in the caller's buffer, from its
+first byte, until the next call.
+
+**What a long sample is.** The agent writes what DDS delivers as one DATA
+submessage. If the message that would carry it is longer than the 512 bytes
+the node announced when it opened the session, the agent serialises the
+DATA, header included, cuts it into pieces of 504 bytes, and sends each as
+a FRAGMENT submessage in a message of its own on the reliable stream, the
+last with bit 1 of its flags set. A `std_msgs/msg/String` of a thousand
+characters is three messages of 512, 512 and 16 bytes. The reliable stream
+delivers them in order, so `xrcefrag.push` appends each piece and, at the
+last, checks that what it holds is one DATA and hands back the sample.
+
 `examples/dk_talker.nv` is a node on an nRF54LM20 DK that publishes
 a counter on `/novo_counter` once a second. It is 22,840 bytes of flash and
 2,712 bytes of static RAM, and it ran against a real agent on a PC with the
@@ -325,7 +418,7 @@ is a heap value too, and `Bytes` is not admitted at the embedded tier. A
 firmware node keeps its payload in a buffer it owns, and `rosuart` moves
 that buffer instead.
 
-`rosagent` opens a TCP socket, which is the one thing in this package
+`rosagent` opens a TCP or UDP socket, which is the one thing in this package
 that performs anything at all. The manifest names it in `host_modules`,
 so a device build leaves it out.
 
@@ -333,9 +426,9 @@ The registry measures the tiers per module, and its page for this package
 lists every module except `rosagent` at the embedded and rt tiers. Its tier
 check admits a module that allocates, such as `rosname`, `rosmsg` and
 `rostransport`, because a device program has a heap of fixed size. The
-claim in this section is narrower: it covers the eight modules the probe
+claim in this section is narrower: it covers the nine modules the probe
 builds and the session counters of `rostransport`. The system, wasm and app
-tiers cover all thirteen modules.
+tiers cover all fourteen modules.
 
 ## What is not included
 
@@ -356,12 +449,13 @@ tiers cover all thirteen modules.
   toolchain with it. The consequence is that this package cannot talk
   to a DDS network directly — it talks to a micro-ROS agent, which is
   what a microcontroller does anyway.
-- **A UDP transport.** A micro-ROS agent listens on four links. This
-  package reaches two: TCP, through `rosagent`, and a serial line, through
-  `rosuart` on a device. A UDP datagram comes back from the standard
-  library as a NUL-terminated string, so it is truncated at its first zero
-  byte, and a Micro XRCE-DDS message has a zero in its second byte. A
-  program with a UDP link brings its own `RosTransport`.
+- **CAN FD, and UDP on a device.** A micro-ROS agent listens on four links.
+  This package reaches three from a PC or a device: TCP and UDP, through
+  `rosagent`, and a serial line, through `rosuart` on a device. The
+  agent's CAN FD transport is not reached. `rosagent` is a host module,
+  because it opens a socket through the standard library, so a device that
+  reaches an agent over UDP brings its own link over its own network stack;
+  `rosuart` is the device's transport and takes a UART.
 - **A serial port for a PC.** There is no serial port in the standard
   library, with no baud rate, parity or inter-character timeout. A device
   has `hal.uart`; a PC reaches the same code through standard input and
@@ -376,9 +470,27 @@ tiers cover all thirteen modules.
   after a gap, so the agent sends the gap and what followed it again. That
   costs retransmissions and no RAM. A node on a link that loses often and
   carries large samples would want the buffer.
-- **Fragments.** A message longer than the 512-byte buffer is dropped, a
-  sample longer than that never arrives, and the agent's FRAGMENT
-  submessage, which carries a long message in pieces, is not read.
+- **Sending a long sample.** A sample the agent sends in pieces is joined,
+  and a sample the node writes is not cut: `write_sample`,
+  `write_sample_reliable` and `publish_i32` build a message of at most 512
+  bytes, and a sample that does not fit answers `ROS_RET_INVALID_ARGUMENT`.
+  Writing FRAGMENT submessages needs the reliable output stream to number
+  and keep each piece, and the history holds four messages of 514 bytes.
+- **A long sample on the best-effort stream.** The agent sends no pieces on
+  a best-effort stream and drops a DATA that does not fit one message, so
+  there is nothing to join; the samples are asked for on the reliable
+  stream.
+- **A reassembly buffer of another size.** The buffer is a `Vec[u8; 2048]`,
+  so a sample longer than 2,040 bytes is dropped whatever limit the caller
+  names, and a node that wants more changes a constant and rebuilds. The
+  buffer is also the only one: pieces of two samples are not joined at once,
+  which the agent does not interleave on one stream.
+- **A sample that lost a piece to the agent's HEARTBEAT.** An agent that
+  gives up on messages it no longer holds moves the input side past them,
+  and a sample whose pieces fell on both sides of that is dropped as a
+  malformed one (`xrcefrag.FRAG_BAD`), together with the sample whose first
+  piece followed it, which was joined into the same buffer. A link that
+  loses messages the agent has already forgotten is the case.
 - **Samples in a format other than DATA.** `read_data` asks for the DATA
   format, the sample's bytes as they are, and a DATA in any other format
   is not found. A sample reaches the node without its encapsulation
@@ -386,7 +498,8 @@ tiers cover all thirteen modules.
   publisher is lost; `poll` builds the message as little-endian CDR.
 - **A device listener for a board.** The subscription runs against a real
   agent over TCP, and over a pseudoterminal pair with the device's own code
-  in `examples/uart_stdio_listener.nv`; it has not been put on a board.
+  in `examples/uart_stdio_listener.nv`, a long sample included; it has not
+  been put on a board.
 - **Actions.** ROS 2's third communication pattern, with goals,
   feedback and results, is built on five topics and two services. It is
   a package of its own and rclc treats it that way.
@@ -420,7 +533,7 @@ tiers cover all thirteen modules.
 
 ## Tests
 
-The suite is eleven files under `tests/`. What they assert comes from
+The suite is thirteen files under `tests/`. What they assert comes from
 ROS 2's own behaviour rather than from an implementation: the return
 code numbering rcl publishes, the six quality-of-service profiles ROS 2
 ships and the requested-versus-offered rules the DDS specification
@@ -454,6 +567,16 @@ sender and a receiver against each other over a link that loses messages.
 `tests/rossub_tests.nv` drives `poll`, `request_data`,
 `write_sample_reliable`, `reliable_tick` and `keepalive` over a pipe that
 records what it is handed, and the same functions of `rosuart` over a fake
+UART.
+
+`tests/rosudp_tests.nv` drives the UDP link over loopback sockets: a
+datagram with zero bytes in it goes out and comes back with its length,
+nothing is put in front of it, a datagram from a stranger is dropped, and a
+session opens over it. `tests/rosfrag_tests.nv` holds the FRAGMENT reader
+and the joining to the bytes the agent sent for a text of a thousand
+characters, with pieces in order, repeated, out of order and lost, a sample
+exactly as long as the limit and one byte longer, pieces that are not one
+DATA, and `poll_long` of both sessions over a pipe that records and a fake
 UART.
 
 `tests/embedded_probe.nv` is the microcontroller program described

@@ -1,0 +1,206 @@
+// rosudp_tests.nv: the UDP link of `rosagent`, over loopback sockets.
+//
+// A UDP link holds a socket, so these tests need `[net]`.  The agent's end is
+// a second socket in the test, bound to a port the kernel chooses, so two
+// runs of this file cannot collide.  What is asserted is what a datagram
+// does on the way through the link: that its length survives (an XRCE
+// message has a zero in its second byte, which is what once kept this link
+// from existing), that nothing is put in front of it, that a datagram from
+// anyone but the agent is dropped, and what a link does when its agent is
+// not there.
+
+use std.bytes
+use std.net
+use std.test
+use rosagent
+use rostransport
+
+// A datagram the way an agent sends one: the message header of a session
+// (id 0x81, stream 1, sequence 0), then zero bytes where a real message has
+// them.
+fn a_datagram() -> Bytes
+    bytes.from_byte_list([0x81, 0x00, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, 0x00, 0x01, 0x00, 0x15,
+                          0x00, 0x00])
+
+@test
+fn test_a_datagram_goes_out_and_comes_back_with_its_zero_bytes() [io, net]
+    match net.udp_socket()
+        None        => test.fail("no UDP socket, so the link cannot be tested")
+        Some(agent) =>
+            test.assert(net.udp_bind_on(agent, "127.0.0.1", 0))
+            let agent_port = net.local_port(agent)
+            test.assert(agent_port > 0)
+            match rosagent.connect_udp("127.0.0.1", agent_port)
+                None       => test.fail("a link to a loopback address that was not made")
+                Some(link) =>
+                    test.case("the link answers its size and that it is open")
+                    test.assert_eq(link.ros_mtu(), rosagent.ROS_UDP_MTU)
+                    test.assert_eq(rosagent.ROS_UDP_MTU, 512)
+                    test.assert(link.ros_is_open())
+
+                    test.case("a message is one datagram, with nothing in front of it")
+                    test.assert(link.ros_send(a_datagram()))
+                    match net.udp_recv_from(agent, 2048)
+                        None           => test.fail("the agent's socket got nothing")
+                        Some((got, from)) =>
+                            test.assert_eq(bytes.len(bytes.from_str(got)), 14)
+                            test.assert(bytes.from_str(got) == a_datagram())
+                            // The link's socket is the sender, so a reply goes to it.
+                            let link_port = net.local_port(link.sock)
+                            test.assert_eq(from, "127.0.0.1:${link_port}")
+
+                            test.case("a reply from the agent arrives whole, zero bytes included")
+                            test.assert(net.udp_send_to(agent, "127.0.0.1", link_port, a_datagram()))
+                            match link.ros_recv(1000)
+                                None       => test.fail("the reply did not arrive")
+                                Some(back) =>
+                                    test.assert_eq(bytes.len(back), 14)
+                                    test.assert(back == a_datagram())
+
+                            test.case("an empty queue is nothing, and a poll does not wait")
+                            match link.ros_recv(0)
+                                None    => test.assert(true)
+                                Some(_) => test.assert(false)
+                            match link.ros_recv(20)
+                                None    => test.assert(true)
+                                Some(_) => test.assert(false)
+
+                            test.case("a datagram from anyone but the agent is dropped")
+                            match net.udp_socket()
+                                None           => test.fail("no second UDP socket")
+                                Some(stranger) =>
+                                    test.assert(net.udp_send_to(stranger, "127.0.0.1", link_port,
+                                                                a_datagram()))
+                                    match link.ros_recv(1000)
+                                        None    => test.assert(true)
+                                        Some(_) => test.assert(false)
+                                    net.close(stranger)
+
+                            test.case("a message longer than the link's size is refused")
+                            test.assert(not link.ros_send(bytes.zeros(rosagent.ROS_UDP_MTU + 1)))
+                            test.assert(link.ros_send(bytes.zeros(rosagent.ROS_UDP_MTU)))
+
+                    test.case("closing it twice is harmless")
+                    link.ros_close()
+                    rosagent.disconnect_udp(link)
+
+                    test.case("a socket closed under the link is silence, not a crash")
+                    // The link's own `open` field cannot change, so the copy
+                    // still believes in its socket; the receive fails and
+                    // answers nothing.
+                    match link.ros_recv(0)
+                        None    => test.assert(true)
+                        Some(_) => test.assert(false)
+            net.close(agent)
+
+@test
+fn test_a_link_with_a_stated_size_carries_no_more() [io, net]
+    match net.udp_socket()
+        None        => test.fail("no UDP socket, so the link cannot be tested")
+        Some(agent) =>
+            test.assert(net.udp_bind_on(agent, "127.0.0.1", 0))
+            match rosagent.connect_udp_with_mtu("127.0.0.1", net.local_port(agent), 8)
+                None       => test.fail("a link to a loopback address that was not made")
+                Some(link) =>
+                    test.assert_eq(link.ros_mtu(), 8)
+                    test.assert(link.ros_send(bytes.zeros(8)))
+                    test.assert(not link.ros_send(bytes.zeros(9)))
+                    rosagent.disconnect_udp(link)
+            net.close(agent)
+
+// The session opens over it: CREATE_CLIENT goes out as one datagram of 24
+// bytes and the agent's STATUS_AGENT, which has zero bytes in it, is read.
+@test
+fn test_a_session_opens_over_a_datagram_link() [io, net]
+    match net.udp_socket()
+        None        => test.fail("no UDP socket, so the link cannot be tested")
+        Some(agent) =>
+            test.assert(net.udp_bind_on(agent, "127.0.0.1", 0))
+            match rosagent.connect_udp("127.0.0.1", net.local_port(agent))
+                None       => test.fail("a link to a loopback address that was not made")
+                Some(link) =>
+                    // The link's socket is not bound until it sends, so one
+                    // datagram goes first, which is how the agent's end learns
+                    // where to answer.  The answer is then queued before the
+                    // client asks, because the test has one thread.
+                    test.assert(link.ros_send(bytes.zeros(1)))
+                    match net.udp_recv_from(agent, 64)
+                        None         => test.fail("the agent's socket got nothing")
+                        Some((_, _)) =>
+                            // RECORDED: the agent's STATUS_AGENT, 19 bytes.
+                            let status = bytes.from_byte_list(
+                                [0x81, 0x00, 0x00, 0x00, 0x04, 0x01, 0x0B, 0x00, 0x00, 0x00,
+                                 0x58, 0x52, 0x43, 0x45, 0x01, 0x00, 0x01, 0x0F, 0x00])
+                            test.assert(net.udp_send_to(agent, "127.0.0.1",
+                                                        net.local_port(link.sock), status))
+                            let s0 = rostransport.session(0xAABBCCDD, rosagent.ROS_UDP_MTU)
+                            // `open_session` sends its CREATE_CLIENT and reads the
+                            // status that is already waiting.
+                            let s1 = rostransport.open_session(link, s0, 1000)
+                            test.assert_eq(s1.state, rostransport.ROS_SESSION_ESTABLISHED)
+                            match net.udp_recv_from(agent, 64)
+                                None           => test.fail("CREATE_CLIENT did not arrive")
+                                Some((create, _)) =>
+                                    test.assert_eq(bytes.len(bytes.from_str(create)), 24)
+                    rosagent.disconnect_udp(link)
+            net.close(agent)
+
+// A name that does not resolve is no link.
+@test
+fn test_a_host_that_does_not_resolve_is_no_link() [io, net]
+    match rosagent.connect_udp("", 8888)
+        None    => test.assert(true)
+        Some(_) => test.fail("a link to an empty host name")
+
+// An agent that is not listening: the port answers each datagram with an
+// error, which the next receive reports as nothing.
+@test
+fn test_an_agent_that_is_not_listening_is_silence() [io, net]
+    match net.udp_socket()
+        None        => test.fail("no UDP socket, so the link cannot be tested")
+        Some(agent) =>
+            test.assert(net.udp_bind_on(agent, "127.0.0.1", 0))
+            let port = net.local_port(agent)
+            // Closed before the link sends: nothing listens on `port`.
+            net.close(agent)
+            match rosagent.connect_udp("127.0.0.1", port)
+                None       => test.fail("a link to a loopback address that was not made")
+                Some(link) =>
+                    test.assert(link.ros_send(bytes.zeros(4)))
+                    match link.ros_recv(500)
+                        None    => test.assert(true)
+                        Some(_) => test.assert(false)
+                    let s0 = rostransport.session(0xAABBCCDD, rosagent.ROS_UDP_MTU)
+                    test.assert_eq(rostransport.open_session(link, s0, 100).state,
+                                   rostransport.ROS_SESSION_CLOSED)
+                    rosagent.disconnect_udp(link)
+
+// A link whose socket was never opened.
+//
+// No constructor here produces one, and both of the guards that read the
+// field exist for it, so the value is built directly.
+@test
+fn test_a_datagram_link_that_was_never_opened_refuses_both_ways() [io, net]
+    match net.udp_socket()
+        None       => test.fail("no UDP socket, so a link cannot be had")
+        Some(sock) =>
+            let shut = RosUdpLink {
+                sock: sock,
+                host: "127.0.0.1",
+                port: 9,
+                peer: "127.0.0.1:9",
+                mtu: rosagent.ROS_UDP_MTU,
+                open: false }
+
+            test.case("nothing goes out")
+            test.assert(not shut.ros_send(bytes.zeros(4)))
+
+            test.case("and nothing comes in")
+            match shut.ros_recv(0)
+                None    => test.assert(true)
+                Some(_) => test.assert(false)
+
+            test.case("closing it does nothing")
+            shut.ros_close()
+            rosagent.disconnect_udp(shut)
+            net.close(sock)

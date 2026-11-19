@@ -14,7 +14,15 @@
 //
 // The first argument is the stream the samples come back on, `best_effort`
 // (the default) or `reliable`, and the second is how many seconds to
-// listen, 30 by default.
+// listen, 30 by default.  A third argument, `string`, subscribes to
+// /novo_text of type std_msgs/msg/String instead, and takes samples longer
+// than one message with `rosuart.poll_long`, which joins the agent's FRAGMENT
+// pieces in a buffer on this program's stack:
+//
+//   ./uart_stdio_listener reliable 30 string <>ttyBOARD >&0
+//   ros2 topic pub --once /novo_text std_msgs/msg/String "{data: '<1,000 characters>'}"
+//
+// The pieces come only on the reliable stream.
 //
 // Nothing may print to standard output, because the agent would read it as
 // bytes; the program reports on standard error.
@@ -30,6 +38,7 @@ use rosret
 use rosuart
 use rostransport
 use xrceframe
+use xrcefrag
 use xrcestream
 use xrcewire
 
@@ -43,10 +52,12 @@ const DATAREADER = 0x16
 fn created(out: rostransport.RosOutcome) -> Bool
     out.code == 0
 
-// Open a session and create the four entities.  Answers the session,
-// established with the reader in place, or closed.
+// Open a session and create the four entities, for the DDS topic and type
+// named.  Answers the session, established with the reader in place, or
+// closed.
 fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
-                            var f: Vec[u8; 1037]) -> rostransport.RosSession [e]
+                            var f: Vec[u8; 1037], topic_name: Str,
+                            type_name: Str) -> rostransport.RosSession [e]
     let s = rosuart.open(u, var d, var m, var f, rostransport.session(0xAABBCCDD, 512), 1000)
     if not rostransport.session_is_ready(s)
         return s
@@ -56,13 +67,13 @@ fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 
                                      1000)
     let topic = rosuart.create(u, var d, var m, var f, participant.session, TOPIC,
                                xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
-                               "<dds><topic><name>rt/novo_cmd</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></dds>",
+                               "<dds><topic><name>${topic_name}</name><dataType>${type_name}</dataType></topic></dds>",
                                1000)
     let subscriber = rosuart.create(u, var d, var m, var f, topic.session, SUBSCRIBER,
                                     xrcewire.XRCE_KIND_SUBSCRIBER, PARTICIPANT, "", 1000)
     let reader = rosuart.create(u, var d, var m, var f, subscriber.session, DATAREADER,
                                 xrcewire.XRCE_KIND_DATAREADER, SUBSCRIBER,
-                                "<dds><data_reader><topic><kind>NO_KEY</kind><name>rt/novo_cmd</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></data_reader></dds>",
+                                "<dds><data_reader><topic><kind>NO_KEY</kind><name>${topic_name}</name><dataType>${type_name}</dataType></topic></data_reader></dds>",
                                 1000)
     if created(participant) and created(topic) and created(subscriber) and created(reader)
         return reader.session
@@ -77,13 +88,20 @@ fn main() [hw, io, time]
         stream = xrcewire.XRCE_STREAM_RELIABLE
     if list.len(args) > 2
         seconds = str.to_int(args[2]) ?? 30
+    let text = list.len(args) > 3 and args[3] == "string"
     let u = rosuart.console_uart()
     var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
     var m: Vec[u8; 512] = Vec.new()
     var f: Vec[u8; 1037] = Vec.new()
     var h = xrcestream.history()
+    // The buffer the pieces of a long sample are joined in.
+    var joined: Vec[u8; 2048] = Vec.new()
+    var assembly = xrcefrag.reassembly(xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE)
     var rel = xrcestream.rel_stream()
-    var s = bring_up(u, var d, var m, var f)
+    var s = if text
+        bring_up(u, var d, var m, var f, "rt/novo_text", "std_msgs::msg::dds_::String_")
+    else
+        bring_up(u, var d, var m, var f, "rt/novo_cmd", "std_msgs::msg::dds_::Int32_")
     if not rostransport.session_is_ready(s)
         eprintln("no session: the agent did not answer, or refused an entity")
         return
@@ -94,12 +112,27 @@ fn main() [hw, io, time]
     var last = time.now()
     let end = last + seconds
     while time.now() < end
-        let got = rosuart.poll(u, var d, var m, var f, var h, s, rel, 200)
-        s = got.session
-        rel = got.stream
-        if got.code == rosret.ROS_RET_OK
-            eprintln("sample ${count}: data ${xrcewire.sample_i32(var m, got.sample)}")
-            count = count + 1
+        if text
+            let got = rosuart.poll_long(u, var d, var m, var f, var h, var joined, s, rel, assembly,
+                                        200)
+            s = got.session
+            rel = got.stream
+            assembly = got.assembly
+            if got.code == rosret.ROS_RET_BAD_ALLOC
+                eprintln("a sample longer than ${xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE} bytes was dropped")
+            if got.code == rosret.ROS_RET_OK
+                // A CDR string: a 32-bit length that counts the closing zero,
+                // the characters, the zero.
+                let n = joined[0] as Int + joined[1] as Int * 256 - 1
+                eprintln("sample ${count}: text of ${n} characters, ${got.sample.length} bytes, first ${joined[4] as Int} last ${joined[3 + n] as Int}")
+                count = count + 1
+        else
+            let got = rosuart.poll(u, var d, var m, var f, var h, s, rel, 200)
+            s = got.session
+            rel = got.stream
+            if got.code == rosret.ROS_RET_OK
+                eprintln("sample ${count}: data ${xrcewire.sample_i32(var m, got.sample)}")
+                count = count + 1
         // The silence is counted in the time that passed, which is less
         // than the wait when a frame came early.
         let now = time.now()

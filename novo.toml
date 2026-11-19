@@ -1,7 +1,7 @@
 [package]
 name        = "ros2-nv"
-version     = "0.1.2"
-description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent over TCP or, on a device, over a UART."
+version     = "0.1.3"
+description = "The rclc node model for novo-lang: rcl's return codes, the name rules a node is refused for, QoS compatibility answered before an endpoint is created rather than discovered as silence, a fixed handle table with no allocator behind it, the executor as a step a caller drives, and the Micro XRCE-DDS session that carries it all to a micro-ROS agent over TCP or UDP or, on a device, over a UART, with samples longer than one message joined from the pieces the agent sends them in."
 license     = "Apache-2.0"
 
 stability   = "experimental"
@@ -22,11 +22,13 @@ stability   = "experimental"
 #
 # `tests/embedded_probe.nv` is what makes the claim a thing the audit
 # BUILDS: `rosret`, `rosqos`, `rosgraph`, `rosexec` and the serial session
-# (`xrceframe`, `xrcewire`, `xrcestream`, `rosuart`) link for `--target=nrf52-qemu`.
+# (`xrceframe`, `xrcewire`, `xrcestream`, `xrcefrag`, `rosuart`) link for
+# `--target=nrf52-qemu`.
 layer       = "core"
 
 # `rosagent` is the one module that performs: a Micro XRCE-DDS session
-# over a TCP stream to a micro-ROS agent, through `std.net`'s byte pair.
+# over a TCP stream or a UDP socket to a micro-ROS agent, through
+# `std.net`'s byte pair and its datagram calls.
 # `[net]`, and nothing else — no clock, because every timeout in this
 # package is a number the caller measures.
 #
@@ -39,7 +41,7 @@ host_modules = ["rosagent"]
 category    = "embedded"
 
 tags        = ["ros2", "ros", "rclc", "micro-ros", "robotics", "xrce-dds",
-               "dds", "qos", "embedded", "no-alloc", "serial", "uart"]
+               "dds", "qos", "embedded", "no-alloc", "serial", "uart", "udp", "tcp"]
 repository  = "https://github.com/novolang/ros2-nv"
 maintainers = ["novo-lang"]
 novo        = ">= 0.23.0"

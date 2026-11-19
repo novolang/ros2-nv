@@ -5,6 +5,75 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.3 — 2026-11-19
+
+A node can reach an agent over UDP, and can take a sample longer than one
+message. Additive: every signature and type of 0.1.2 is unchanged, `poll` and
+`rosuart.poll` behave as they did, and a node that does not call the new
+functions builds and behaves as it did. Both were run against a Micro XRCE-DDS
+Agent 2.4.3 and ROS 2 Jazzy on 2026-11-19; `docs/agent-run.md` has the
+commands and the agent's log.
+
+### Added
+
+- **A UDP link.** `rosagent.connect_udp(host, port)` opens a socket and
+  answers a `RosUdpLink`, a second type beside `RosAgentLink`, because a
+  datagram is one message and needs no length in front of it and no buffer.
+  It implements `RosTransport[net]`, so every function of `rostransport`
+  takes it. `connect_udp_with_mtu` and `disconnect_udp` complete it, and
+  `ROS_UDP_MTU`, 512, is its default message size. The link sends to the
+  agent's address and drops a datagram from any other. The `[net]` row stays
+  on `rosagent` alone. This is possible because `net.udp_recv_from` answers
+  the length the kernel reported since novo 0.10.0; the 0.1.0 to 0.1.2
+  comments that said it cut a datagram at its first zero byte were out of
+  date, and the header of `rosagent` now says what is true.
+- **Long samples.** A sample that does not fit in one message is sent by the
+  agent as FRAGMENT submessages on the reliable stream. The new module
+  **`xrcefrag`** joins them with no allocation in a `Vec[u8; 2048]` the
+  caller owns, with a limit the caller sets (`reassembly(n)`, at most
+  `XRCE_REASSEMBLY_MAX_SAMPLE`, 2,040 bytes). A sample over the limit is
+  dropped with all its pieces and reported once. `xrcewire.read_fragment`
+  reads the submessage, `xrcestream.delivers` says whether a message is one
+  the session acts on, and `rostransport.poll_long` (host, over any
+  `RosTransport`, answering a `RosLongTaken`) and `rosuart.poll_long` (device,
+  no heap, answering a `RosLongPoll`) take the next message and hand back the
+  whole sample. A sample that came in one message is taken the same way and
+  held to the same limit, so a caller reads one buffer whichever way the
+  agent sent it. `ROS_RET_BAD_ALLOC` is the code for a sample dropped as too
+  long; the other codes are those of `poll`.
+- **`examples/host_listener.nv`** takes a message type, `int32` or `string`,
+  and a transport, `tcp` or `udp`, and polls with `poll_long`;
+  **`examples/host_talker.nv`** takes `udp` as a fourth argument;
+  **`examples/uart_stdio_listener.nv`** takes `string` and polls with
+  `rosuart.poll_long`.
+- **Tests.** `tests/rosudp_tests.nv` drives the link over loopback sockets,
+  zero bytes included. `tests/rosfrag_tests.nv` holds the reader and the
+  joining to the three messages the agent sent for a text of a thousand
+  characters, in order, repeated, out of order and lost, at the limit and one
+  byte over it, as pieces that are not one DATA, and through both polls.
+  `tests/embedded_probe.nv` runs 121 checks, eight more, and passes under
+  QEMU.
+- **`docs/agent-run.md`** records the runs: the talker and the listener over
+  UDP, a text of 1,000 characters joined from three messages over UDP, over
+  TCP and, with the device code, over a serial line, one of 2,100 characters
+  dropped and the next one taken, a long sample on the best-effort stream
+  that the agent refuses, and what each looks like in the agent's log.
+
+### Changed
+
+- **The UDP row of the agent table** in `docs/agent-run.md` and the "What is
+  not included" list of the README no longer say UDP cannot be reached. What
+  is still not reached is named there: CAN FD, sending a long sample, and a
+  UDP link on a device.
+- **`rostransport.poll` and `rosuart.poll`** build the ACKNACK and the
+  retransmissions in a private function now shared with the new polls. What
+  goes on the pipe and what they answer is unchanged, and the suites that
+  held them to it pass as they were.
+- **`xrcestream.receive`** asks `xrcestream.delivers` whether a message is
+  delivered, where it computed the answer inline. Nothing changed.
+
+This release requires novo 0.23.0 or later.
+
 ## 0.1.2 — 2026-11-19
 
 A node can subscribe, and can write and read on a reliable stream. Additive:

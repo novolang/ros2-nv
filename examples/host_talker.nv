@@ -1,5 +1,5 @@
 // host_talker.nv — a micro-ROS node on a workstation: it opens a session
-// with a Micro XRCE-DDS Agent over TCP, creates a participant, the topic
+// with a Micro XRCE-DDS Agent over TCP or UDP, creates a participant, the topic
 // /novo_counter of type std_msgs/msg/Int32, a publisher and a data
 // writer, and publishes a counter once a second.
 //
@@ -15,6 +15,11 @@
 // instead of the best-effort one:
 //
 //   novo run examples/host_talker.nv 127.0.0.1 2018 reliable
+//
+// A fourth argument, `udp`, reaches an agent started with
+// `MicroXRCEAgent udp4 --port 2018` over UDP instead of TCP:
+//
+//   novo run examples/host_talker.nv 127.0.0.1 2018 best_effort udp
 //
 // A sample on the reliable stream is kept until the agent acknowledges it
 // and is sent again if the agent says it never came, so a sample written
@@ -64,13 +69,20 @@ fn main() [net, io, time]
     if list.len(args) > 2
         port = str.to_int(args[2]) ?? 2018
     let reliable = list.len(args) > 3 and args[3] == "reliable"
-    match rosagent.connect(host, port)
-        None       => println("no agent at ${host}:${port}")
-        Some(link) =>
-            talk(link, reliable)
-            rosagent.disconnect(link)
+    if list.len(args) > 4 and args[4] == "udp"
+        match rosagent.connect_udp(host, port)
+            None       => println("no UDP socket for ${host}:${port}")
+            Some(link) =>
+                talk(link, reliable)
+                rosagent.disconnect_udp(link)
+    else
+        match rosagent.connect(host, port)
+            None       => println("no agent at ${host}:${port}")
+            Some(link) =>
+                talk(link, reliable)
+                rosagent.disconnect(link)
 
-fn talk(link: RosAgentLink, reliable: Bool) [net, io, time]
+fn talk<T: RosTransport[e]>(link: T, reliable: Bool) [e, io, time]
     var s = rostransport.session(0xAABBCCDD, rosagent.ROS_AGENT_MTU)
     s = rostransport.open_session(link, s, 2000)
     println("session: ${rostransport.session_state_name(s.state)}")

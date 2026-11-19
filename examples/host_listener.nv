@@ -1,7 +1,7 @@
 // host_listener.nv — a micro-ROS node on a workstation that subscribes: it
-// opens a session with a Micro XRCE-DDS Agent over TCP, creates a
-// participant, the topic /novo_cmd of type std_msgs/msg/Int32, a subscriber
-// and a data reader, asks the agent for samples, and prints each one.
+// opens a session with a Micro XRCE-DDS Agent over TCP or UDP, creates a
+// participant, a topic, a subscriber and a data reader, asks the agent for
+// samples, and prints each one.
 //
 // Run it with an agent listening, then publish to it from ROS 2:
 //
@@ -10,26 +10,41 @@
 //   ros2 topic pub --once /novo_cmd std_msgs/msg/Int32 "{data: 7}"
 //
 // It takes the agent's host and port, the stream the samples come back
-// on and how many seconds to listen, from its arguments:
+// on, how many seconds to listen, the message type and the transport, from
+// its arguments:
 //
-//   novo run examples/host_listener.nv 127.0.0.1 2018 reliable 30
+//   novo run examples/host_listener.nv 127.0.0.1 2018 reliable 30 int32 tcp
 //
 // The stream is `best_effort`, the default, or `reliable`.  On a reliable
 // stream the agent numbers what it sends and this program acknowledges it
 // and asks for what it missed; on a best-effort stream a sample lost on the
-// way is lost.
+// way is lost.  The type is `int32`, the default, which is
+// std_msgs/msg/Int32 on /novo_cmd, or `string`, which is std_msgs/msg/String
+// on /novo_text.  The transport is `tcp`, the default, or `udp`, which
+// reaches an agent started with `MicroXRCEAgent udp4 --port 2018`.
+//
+// A SAMPLE LONGER THAN 512 BYTES ARRIVES IN PIECES, and only on the reliable
+// stream: the agent cuts it into FRAGMENT submessages, and a best-effort
+// stream has no way to send them.  This program polls with `poll_long`,
+// which joins the pieces in a buffer it owns, so a text of 1,000 bytes
+// reaches it whole:
+//
+//   novo run examples/host_listener.nv 127.0.0.1 2018 reliable 30 string udp
+//   ros2 topic pub --once /novo_text std_msgs/msg/String "{data: '<1,000 characters>'}"
 //
 // The names are the ones `examples/host_talker.nv` explains: the DDS topic
 // of the ROS topic /novo_cmd is `rt/novo_cmd`, and the DDS type of
 // std_msgs/msg/Int32 is `std_msgs::msg::dds_::Int32_`.  The sample is the
-// four bytes of the number, as the agent hands it over without the CDR
-// representation header.
+// bytes of the message in CDR, as the agent hands it over without the
+// representation header: for an Int32 the four bytes of the number, and for
+// a String a 32-bit length that counts the closing zero, the characters and
+// the zero.
 //
-// THE LOOP IS THE EXECUTOR'S SHAPE.  `poll` takes one message and says
-// whether it was a sample; `rosexec.ready_from_take` turns that into the
-// handle's bit, and `spin_step` says which handle to run.  With one handle
-// that is a formality, and with several subscriptions it is the order the
-// handles were added in.
+// THE LOOP IS THE EXECUTOR'S SHAPE.  `poll_long` takes one message and says
+// whether it completed a sample; `rosexec.ready_from_take` turns that into
+// the handle's bit, and `spin_step` says which handle to run.  With one
+// handle that is a formality, and with several subscriptions it is the
+// order the handles were added in.
 
 use std.env
 use std.str
@@ -40,6 +55,7 @@ use rosmsg
 use rosname
 use rosret
 use rostransport
+use xrcefrag
 use xrcestream
 use xrcewire
 
@@ -52,8 +68,23 @@ const TOPIC = 0x12
 const SUBSCRIBER = 0x14
 const DATAREADER = 0x16
 
-const TOPIC_NAME = "rt/novo_cmd"
-const TYPE_NAME = "std_msgs::msg::dds_::Int32_"
+// A topic and a DDS type name, and the ROS type they stand for.
+struct Subject
+    // The DDS topic name: `rt/` and the ROS topic.
+    topic: Str
+    // The DDS type name.
+    dds_type: Str
+    // The ROS type, for `rosname.type_id`.
+    ros_type: Str
+    // Whether a sample is a CDR string and not a 32-bit integer.
+    text: Bool
+
+fn subject_of(kind: Str) -> Subject
+    if kind == "string"
+        return Subject { topic: "rt/novo_text", dds_type: "std_msgs::msg::dds_::String_",
+                         ros_type: "std_msgs/msg/String", text: true }
+    Subject { topic: "rt/novo_cmd", dds_type: "std_msgs::msg::dds_::Int32_",
+              ros_type: "std_msgs/msg/Int32", text: false }
 
 fn say_status(what: Str, out: RosOutcome) [io]
     println("${what}: code ${out.code}, agent status ${out.status} (${xrcewire.status_name(out.status)})")
@@ -64,6 +95,8 @@ fn main() [net, io, time]
     var port = 2018
     var stream = xrcewire.XRCE_STREAM_BEST_EFFORT
     var seconds = 30
+    var kind = "int32"
+    var udp = false
     // args[0] is the program itself.
     if list.len(args) > 1
         host = args[1]
@@ -73,11 +106,23 @@ fn main() [net, io, time]
         stream = xrcewire.XRCE_STREAM_RELIABLE
     if list.len(args) > 4
         seconds = str.to_int(args[4]) ?? 30
-    match rosagent.connect(host, port)
-        None       => println("no agent at ${host}:${port}")
-        Some(link) =>
-            listen(link, stream, seconds)
-            rosagent.disconnect(link)
+    if list.len(args) > 5
+        kind = args[5]
+    if list.len(args) > 6 and args[6] == "udp"
+        udp = true
+    let subject = subject_of(kind)
+    if udp
+        match rosagent.connect_udp(host, port)
+            None       => println("no UDP socket for ${host}:${port}")
+            Some(link) =>
+                listen(link, stream, seconds, subject)
+                rosagent.disconnect_udp(link)
+    else
+        match rosagent.connect(host, port)
+            None       => println("no agent at ${host}:${port}")
+            Some(link) =>
+                listen(link, stream, seconds, subject)
+                rosagent.disconnect(link)
 
 // Little-endian signed 32-bit integer at the start of a payload.
 fn int32_of(payload: Bytes) -> Int
@@ -86,7 +131,21 @@ fn int32_of(payload: Bytes) -> Int
         return v - 4294967296
     v
 
-fn listen(link: RosAgentLink, stream: Int, seconds: Int) [net, io, time]
+// What a sample says, in a line.
+fn describe(subject: Subject, payload: Bytes) -> Str
+    if not subject.text
+        return "data ${int32_of(payload)}, ${bytes.len(payload)} bytes"
+    // A CDR string: the length counts the closing zero.
+    let n = (bytes.u32_le_at(payload, 0) ?? 1) - 1
+    let shown = if n > 24
+        24
+    else
+        n
+    let head = bytes.to_str(bytes.slice(payload, 4, 4 + shown))
+    let tail = bytes.to_str(bytes.slice(payload, 4 + n - shown, 4 + n))
+    "text of ${n} characters, ${bytes.len(payload)} bytes, begins \"${head}\", ends \"${tail}\""
+
+fn listen<T: RosTransport[e]>(link: T, stream: Int, seconds: Int, subject: Subject) [e, io, time]
     var s = rostransport.session(0xAABBCCDD, rosagent.ROS_AGENT_MTU)
     s = rostransport.open_session(link, s, 2000)
     println("session: ${rostransport.session_state_name(s.state)}")
@@ -99,14 +158,14 @@ fn listen(link: RosAgentLink, stream: Int, seconds: Int) [net, io, time]
     say_status("participant", participant)
     let topic = rostransport.create_entity(link, participant.session, TOPIC,
         xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
-        "<dds><topic><name>${TOPIC_NAME}</name><dataType>${TYPE_NAME}</dataType></topic></dds>", 2000)
+        "<dds><topic><name>${subject.topic}</name><dataType>${subject.dds_type}</dataType></topic></dds>", 2000)
     say_status("topic", topic)
     let subscriber = rostransport.create_entity(link, topic.session, SUBSCRIBER,
         xrcewire.XRCE_KIND_SUBSCRIBER, PARTICIPANT, "", 2000)
     say_status("subscriber", subscriber)
     let reader = rostransport.create_entity(link, subscriber.session, DATAREADER,
         xrcewire.XRCE_KIND_DATAREADER, SUBSCRIBER,
-        "<dds><data_reader><topic><kind>NO_KEY</kind><name>${TOPIC_NAME}</name><dataType>${TYPE_NAME}</dataType></topic></data_reader></dds>", 2000)
+        "<dds><data_reader><topic><kind>NO_KEY</kind><name>${subject.topic}</name><dataType>${subject.dds_type}</dataType></topic></data_reader></dds>", 2000)
     say_status("datareader", reader)
     if reader.code != 0
         return
@@ -117,25 +176,32 @@ fn listen(link: RosAgentLink, stream: Int, seconds: Int) [net, io, time]
     s = asked.session
     println("request: code ${asked.code}")
 
-    let type_id = rosname.type_id("std_msgs/msg/Int32")
+    let type_id = rosname.type_id(subject.ros_type)
     var ex = rosexec.add_handle(rosexec.executor(1))
     var rel = xrcestream.rel_stream()
     var hist = xrcestream.history()
+    // The buffer the pieces of a long sample are joined in, and the most
+    // bytes of sample the reassembly takes.
+    var joined: Vec[u8; 2048] = Vec.new()
+    var assembly = xrcefrag.reassembly(xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE)
     var count = 0
     var last = time.now()
     let end = last + seconds
     while time.now() < end
-        let taken = rostransport.poll(link, s, rel, var hist, type_id, 200)
+        let taken = rostransport.poll_long(link, s, rel, assembly, var hist, var joined,
+                                           type_id, 200)
         s = taken.session
         rel = taken.stream
+        assembly = taken.assembly
+        if taken.code == rosret.ROS_RET_BAD_ALLOC
+            println("a sample longer than ${xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE} bytes was dropped")
         if taken.code == rosret.ROS_RET_ERROR
             println("agent refused the request: status ${taken.status} (${xrcewire.status_name(taken.status)})")
             return
         let ready = rosexec.ready_from_take(0, taken.code)
         let step = rosexec.spin_step(rosexec.spin_begin(ex), ready)
         if step.dispatch
-            let value = int32_of(rosmsg.payload(taken.message))
-            println("sample ${count}: data ${value}, ${rosmsg.payload_length(taken.message)} bytes")
+            println("sample ${count}: ${describe(subject, rosmsg.payload(taken.message))}")
             count = count + 1
         let now = time.now()
         s = rostransport.keepalive(link, s, ((now - last) * 1000.0) as Int)

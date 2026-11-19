@@ -1,0 +1,816 @@
+// rosfrag_tests.nv: a sample longer than one message, joined from the
+// FRAGMENT submessages the agent sends it in: the reader in `xrcewire`, the
+// joining in `xrcefrag`, and the two polls that use it, `rostransport.poll_long`
+// over a pipe that is a table and `rosuart.poll_long` over a fake UART.
+//
+// The pieces of the long sample are built the way Micro XRCE-DDS Agent 2.4.3
+// builds them (`ReliableOutputStream::push_submessage`): the DATA submessage
+// is serialised whole, with its own header, and cut into pieces of the
+// message size less the header of the message and of the submessage, 504
+// bytes for a 512-byte message; each piece goes out on stream 0x80 as a
+// FRAGMENT whose flags byte is 0x01, and 0x03 for the last.  The messages
+// marked "recorded" are bytes the agent sent on 2026-11-19 for a
+// std_msgs/msg/String of 1,000 characters published with `ros2 topic pub`,
+// seen in its log at verbose level 6; `docs/agent-run.md` has the run.  The
+// rest are built by the helpers below, which reproduce the recorded ones
+// byte for byte where both exist, and the first test says so.
+
+use std.list
+use std.test
+use rosmsg
+use rosret
+use rostransport
+use rosuart
+use xrceframe
+use xrcefrag
+use xrcestream
+use xrcewire
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+fn vec_of(xs: [Int]) -> Vec[u8; 512]
+    var m: Vec[u8; 512] = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+fn list_of(var m: Vec[u8; 512]) -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for x in m
+        let wide = x as Int
+        out = list.push(out, wide)
+    out
+
+// The reassembly buffer's bytes, as a list.
+fn joined_list(var a: Vec[u8; 2048]) -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for x in a
+        let wide = x as Int
+        out = list.push(out, wide)
+    out
+
+fn hex_char(d: Int) -> Int
+    if d < 10
+        return 0x30 + d
+    0x61 + d - 10
+
+// The CDR body of a std_msgs/msg/String of `n` characters as the agent hands
+// it on: the length with the closing zero counted (4 bytes), the characters
+// `0123456789abcdef` repeated, the zero, and zeros up to a multiple of four.
+fn string_sample(n: Int) -> [Int]
+    var xs: [Int] = [(n + 1) & 0xFF, (n + 1) >>> 8, 0x00, 0x00]
+    for i in 0..n
+        xs = list.push(xs, hex_char(i % 16))
+    xs = list.push(xs, 0x00)
+    while list.len(xs) % 4 != 0
+        xs = list.push(xs, 0x00)
+    xs
+
+// A DATA submessage for data reader 0x16 and request 5, with this sample
+// after the ids: what the agent serialises before it cuts it.
+fn data_submessage(sample: [Int]) -> [Int]
+    let n = list.len(sample) + 4
+    list.concat([0x09, 0x01, n & 0xFF, n >>> 8, 0x00, 0x05, 0x00, 0x16], sample)
+
+// One message on stream 0x80 holding one FRAGMENT.
+fn fragment_message(seq: Int, last: Bool, piece: [Int]) -> [Int]
+    let flags = if last
+        0x03
+    else
+        0x01
+    let n = list.len(piece)
+    list.concat([0x81, 0x80, seq & 0xFF, seq >>> 8, 0x0D, flags, n & 0xFF, n >>> 8], piece)
+
+// The messages that carry `data`, `size` bytes of it to a message, with
+// sequence numbers from `first_seq`.
+fn fragments_of(data: [Int], size: Int, first_seq: Int) -> [[Int]]
+    var out: [[Int]] = []
+    var at = 0
+    var seq = first_seq
+    let total = list.len(data)
+    while at < total
+        var end = at + size
+        if end > total
+            end = total
+        out = list.push(out, fragment_message(seq, end == total, list.slice(data, at, end)))
+        at = end
+        seq = seq + 1
+    out
+
+// The three messages of the recorded run: 1,016 bytes of DATA in pieces of
+// 504, 504 and 8.
+fn recorded_run(first_seq: Int) -> [[Int]]
+    fragments_of(data_submessage(string_sample(1000)), 504, first_seq)
+
+// RECORDED.  The last of the three: sequence 2, the flags 0x03, eight bytes.
+fn recorded_last() -> [Int]
+    [0x81, 0x80, 0x02, 0x00, 0x0D, 0x03, 0x08, 0x00, 0x34, 0x35, 0x36, 0x37, 0x00, 0x00, 0x00,
+     0x00]
+
+// RECORDED.  The agent's DATA carrying the integer `value` on the reliable
+// stream, in one message.
+fn data_reliable(seq: Int, value: Int) -> [Int]
+    [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
+     value, 0x00, 0x00, 0x00]
+
+// RECORDED.  The agent's DATA on the best-effort stream carrying 7.
+fn data_best_effort() -> [Int]
+    [0x81, 0x01, 0x04, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16, 0x07, 0x00, 0x00, 0x00]
+
+// RECORDED.  An ACKNACK of stream 0x80, either way.
+fn acknack_message(first: Int, bitmap: Int) -> [Int]
+    [0x81, 0x00, 0x00, 0x00, 0x0A, 0x01, 0x05, 0x00, first & 0xFF, first >>> 8,
+     bitmap >>> 8, bitmap & 0xFF, 0x80]
+
+// A STATUS answering a request on the best-effort stream.
+fn status_message(request: Int, object: Int, status: Int) -> [Int]
+    [0x81, 0x01, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, request >>> 8, request & 0xFF,
+     object >>> 8, object & 0xFF, status, 0x00]
+
+fn an_open_session() -> RosSession
+    rostransport.session_established(rostransport.session(0xAABBCCDD, 512), 0x81)
+
+// The sample 1,000-character string again, as a list of the bytes a poll
+// should hand back.
+fn whole_string() -> [Int]
+    string_sample(1000)
+
+// ── the reader ───────────────────────────────────────────────────────
+
+@test
+fn test_the_helpers_reproduce_the_messages_the_agent_sent() [io]
+    let run = recorded_run(0)
+    test.assert_eq(list.len(run), 3)
+
+    test.case("RECORDED: the three messages are 512, 512 and 16 bytes")
+    test.assert_eq(list.len(run[0]), 512)
+    test.assert_eq(list.len(run[1]), 512)
+    test.assert_eq(list.len(run[2]), 16)
+
+    test.case("RECORDED: the headers of the first and second piece")
+    test.assert_eq(list.take(run[0], 24),
+                   [0x81, 0x80, 0x00, 0x00, 0x0D, 0x01, 0xF8, 0x01, 0x09, 0x01, 0xF4, 0x03,
+                    0x00, 0x05, 0x00, 0x16, 0xE9, 0x03, 0x00, 0x00, 0x30, 0x31, 0x32, 0x33])
+    test.assert_eq(list.take(run[1], 12),
+                   [0x81, 0x80, 0x01, 0x00, 0x0D, 0x01, 0xF8, 0x01, 0x63, 0x64, 0x65, 0x66])
+
+    test.case("RECORDED: the last piece, byte for byte")
+    test.assert_eq(run[2], recorded_last())
+
+@test
+fn test_a_fragment_is_read_out_of_a_message() [io]
+    test.case("RECORDED: the last piece is last, eight bytes long, at offset 8")
+    var m = vec_of(recorded_last())
+    let last = xrcewire.read_fragment(var m)
+    test.assert(last.found)
+    test.assert(last.last)
+    test.assert_eq(last.start, 8)
+    test.assert_eq(last.length, 8)
+
+    test.case("a piece that is not the last says so")
+    var first = vec_of(recorded_run(0)[0])
+    let piece = xrcewire.read_fragment(var first)
+    test.assert(piece.found)
+    test.assert(not piece.last)
+    test.assert_eq(piece.length, 504)
+
+    test.case("a message with no fragment holds none")
+    var data = vec_of(data_best_effort())
+    test.assert(not xrcewire.read_fragment(var data).found)
+
+    test.case("a fragment cut short is not read")
+    var cut = vec_of(list.take(recorded_last(), 12))
+    test.assert(not xrcewire.read_fragment(var cut).found)
+
+    test.assert_eq(xrcewire.XRCE_SUB_FRAGMENT, 13)
+    test.assert_eq(xrcewire.XRCE_FLAG_LAST_FRAGMENT, 2)
+
+@test
+fn test_a_message_is_delivered_when_it_is_in_order_or_not_on_the_reliable_stream() [io]
+    let fresh = xrcestream.rel_stream()
+    test.case("the first message of the reliable stream is in order")
+    var first = vec_of(data_reliable(0, 1))
+    test.assert(xrcestream.delivers(var first, fresh))
+
+    test.case("a message after a gap, and one seen before, are not")
+    var ahead = vec_of(data_reliable(2, 1))
+    test.assert(not xrcestream.delivers(var ahead, fresh))
+    let after_zero = xrcestream.in_receive(fresh, 0)
+    test.assert(not xrcestream.delivers(var first, after_zero))
+
+    test.case("a message on another stream, and one shorter than a header, are")
+    var best = vec_of(data_best_effort())
+    test.assert(xrcestream.delivers(var best, fresh))
+    var tiny = vec_of([0x81, 0x80])
+    test.assert(xrcestream.delivers(var tiny, fresh))
+
+// ── the joining ──────────────────────────────────────────────────────
+
+@test
+fn test_the_reassembly_never_allows_more_than_the_buffer_holds() [io]
+    test.assert_eq(xrcefrag.reassembly(1000).limit, 1008)
+    test.assert_eq(xrcefrag.reassembly(xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE).limit,
+                   xrcefrag.XRCE_REASSEMBLY_BYTES)
+    test.assert_eq(xrcefrag.reassembly(5000).limit, 2048)
+    test.assert_eq(xrcefrag.reassembly(0).limit, 8)
+    test.assert_eq(xrcefrag.reassembly(0 - 5).limit, 8)
+    test.assert(not xrcefrag.reassembly(10).dropping)
+    test.assert(not xrcefrag.reassembly(10).finished)
+    test.assert_eq(xrcefrag.XRCE_REASSEMBLY_BYTES, 2048)
+    test.assert_eq(xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE, 2040)
+
+@test
+fn test_the_pieces_of_a_long_sample_are_joined_in_order() [io]
+    let run = recorded_run(0)
+    var a: Vec[u8; 2048] = Vec.new()
+    var state = xrcefrag.reassembly(1008)
+
+    test.case("the first piece is kept and more are to come")
+    var m0 = vec_of(run[0])
+    let e0 = xrcefrag.push(var m0, state, var a)
+    test.assert_eq(e0.code, xrcefrag.FRAG_MORE)
+    test.assert(not e0.sample.found)
+    test.assert_eq(a.len(), 504)
+    state = e0.assembly
+
+    test.case("so is the second")
+    var m1 = vec_of(run[1])
+    let e1 = xrcefrag.push(var m1, state, var a)
+    test.assert_eq(e1.code, xrcefrag.FRAG_MORE)
+    test.assert_eq(a.len(), 1008)
+    state = e1.assembly
+
+    test.case("the last piece finishes it, and the sample is at the start of the buffer")
+    var m2 = vec_of(run[2])
+    let e2 = xrcefrag.push(var m2, state, var a)
+    test.assert_eq(e2.code, xrcefrag.FRAG_DONE)
+    test.assert(e2.sample.found)
+    test.assert_eq(e2.sample.request, 5)
+    test.assert_eq(e2.sample.object, 0x16)
+    test.assert_eq(e2.sample.start, 0)
+    test.assert_eq(e2.sample.length, 1008)
+    test.assert_eq(a.len(), 1008)
+    test.assert_eq(joined_list(var a), whole_string())
+    test.assert(e2.assembly.finished)
+    state = e2.assembly
+
+    test.case("the next poll clears it, and the state forgets it")
+    let next = xrcefrag.begin(state, var a)
+    test.assert_eq(a.len(), 0)
+    test.assert(not next.finished)
+
+    test.case("a next sample is joined from its own first piece")
+    var n0 = vec_of(run[0])
+    test.assert_eq(xrcefrag.push(var n0, next, var a).code, xrcefrag.FRAG_MORE)
+    test.assert_eq(a.len(), 504)
+
+@test
+fn test_a_sample_in_many_small_pieces_is_joined() [io]
+    let sample = [1, 2, 3, 0, 5, 6, 7, 8, 9, 10, 0, 12]
+    let run = fragments_of(data_submessage(sample), 5, 7)
+    test.assert_eq(list.len(run), 4)
+    var a: Vec[u8; 2048] = Vec.new()
+    var state = xrcefrag.reassembly(100)
+    var last = xrcefrag.event(state, xrcefrag.FRAG_NONE)
+    for msg in run
+        var m = vec_of(msg)
+        last = xrcefrag.push(var m, state, var a)
+        state = last.assembly
+    test.assert_eq(last.code, xrcefrag.FRAG_DONE)
+    test.assert_eq(last.sample.length, 12)
+    test.assert_eq(joined_list(var a), sample)
+
+@test
+fn test_a_sample_exactly_as_long_as_allowed_is_taken_and_one_byte_more_is_not() [io]
+    let run = recorded_run(0)
+
+    test.case("1,008 bytes of sample fit a limit of 1,008")
+    var a: Vec[u8; 2048] = Vec.new()
+    var state = xrcefrag.reassembly(1008)
+    var done = xrcefrag.event(state, xrcefrag.FRAG_NONE)
+    for msg in run
+        var m = vec_of(msg)
+        done = xrcefrag.push(var m, state, var a)
+        state = done.assembly
+    test.assert_eq(done.code, xrcefrag.FRAG_DONE)
+
+    test.case("and not 1,007")
+    var b: Vec[u8; 2048] = Vec.new()
+    var tight = xrcefrag.reassembly(1007)
+    var codes: [Int] = []
+    for msg in run
+        var m = vec_of(msg)
+        let ev = xrcefrag.push(var m, tight, var b)
+        tight = ev.assembly
+        codes = list.push(codes, ev.code)
+    // Two pieces fit and the third, which is the last, does not.
+    test.assert_eq(codes, [xrcefrag.FRAG_MORE, xrcefrag.FRAG_MORE, xrcefrag.FRAG_TOO_LONG])
+    test.assert_eq(b.len(), 0)
+    test.assert(not tight.dropping)
+
+@test
+fn test_a_sample_that_does_not_fit_is_dropped_with_all_its_pieces_and_the_next_is_not_lost() [io]
+    let run = recorded_run(0)
+    var a: Vec[u8; 2048] = Vec.new()
+    var state = xrcefrag.reassembly(100)
+
+    test.case("the first piece already is too long, and says so once")
+    var m0 = vec_of(run[0])
+    let e0 = xrcefrag.push(var m0, state, var a)
+    test.assert_eq(e0.code, xrcefrag.FRAG_TOO_LONG)
+    test.assert_eq(a.len(), 0)
+    test.assert(e0.assembly.dropping)
+
+    test.case("the rest of the pieces are dropped without a word")
+    var m1 = vec_of(run[1])
+    let e1 = xrcefrag.push(var m1, e0.assembly, var a)
+    test.assert_eq(e1.code, xrcefrag.FRAG_MORE)
+    test.assert_eq(a.len(), 0)
+    test.assert(e1.assembly.dropping)
+    var m2 = vec_of(run[2])
+    let e2 = xrcefrag.push(var m2, e1.assembly, var a)
+    test.assert_eq(e2.code, xrcefrag.FRAG_MORE)
+    test.assert(not e2.assembly.dropping)
+
+    test.case("after the last piece the next sample is joined, and a small one fits")
+    let small = fragments_of(data_submessage([1, 2, 3, 4]), 504, 3)
+    var s0 = vec_of(small[0])
+    let ok = xrcefrag.push(var s0, e2.assembly, var a)
+    test.assert_eq(ok.code, xrcefrag.FRAG_DONE)
+    test.assert_eq(joined_list(var a), [1, 2, 3, 4])
+
+@test
+fn test_pieces_that_are_not_one_data_are_dropped_as_bad() [io]
+    let state = xrcefrag.reassembly(100)
+
+    test.case("a header that is not a DATA")
+    var a: Vec[u8; 2048] = Vec.new()
+    var wrong = vec_of(fragment_message(0, true, [0x08, 0x01, 0x08, 0x00, 0, 5, 0, 0x16, 1, 2, 3, 4]))
+    test.assert_eq(xrcefrag.push(var wrong, state, var a).code, xrcefrag.FRAG_BAD)
+    test.assert_eq(a.len(), 0)
+
+    test.case("a length that does not account for every byte")
+    var short = vec_of(fragment_message(0, true, [0x09, 0x01, 0x09, 0x00, 0, 5, 0, 0x16, 1, 2, 3, 4]))
+    test.assert_eq(xrcefrag.push(var short, state, var a).code, xrcefrag.FRAG_BAD)
+    test.assert_eq(a.len(), 0)
+
+    test.case("a format that is not the DATA format")
+    var format = vec_of(fragment_message(0, true, [0x09, 0x03, 0x08, 0x00, 0, 5, 0, 0x16, 1, 2, 3, 4]))
+    test.assert_eq(xrcefrag.push(var format, state, var a).code, xrcefrag.FRAG_BAD)
+    test.assert_eq(a.len(), 0)
+
+    test.case("fewer bytes than a DATA's header and ids")
+    var tiny = vec_of(fragment_message(0, true, [0x09, 0x01, 0x00, 0x00]))
+    test.assert_eq(xrcefrag.push(var tiny, state, var a).code, xrcefrag.FRAG_BAD)
+    test.assert_eq(a.len(), 0)
+
+    test.case("two samples run together, because a piece in the middle was given up")
+    // The first sample's first piece, then a whole other sample's pieces.
+    let run = recorded_run(0)
+    var p0 = vec_of(run[0])
+    let wide = xrcefrag.reassembly(2040)
+    let started = xrcefrag.push(var p0, wide, var a)
+    test.assert_eq(started.code, xrcefrag.FRAG_MORE)
+    var again = vec_of(recorded_last())
+    test.assert_eq(xrcefrag.push(var again, started.assembly, var a).code, xrcefrag.FRAG_BAD)
+    test.assert_eq(a.len(), 0)
+
+@test
+fn test_a_message_without_a_fragment_changes_nothing() [io]
+    var a: Vec[u8; 2048] = Vec.new()
+    let _ = a.push(9)
+    let state = xrcefrag.reassembly(100)
+    var m = vec_of(data_reliable(0, 1))
+    let ev = xrcefrag.push(var m, state, var a)
+    test.assert_eq(ev.code, xrcefrag.FRAG_NONE)
+    test.assert_eq(a.len(), 1)
+    test.assert_eq(ev.assembly.limit, state.limit)
+
+@test
+fn test_a_sample_in_one_message_is_held_like_a_joined_one() [io]
+    let sample = xrcewire.XrceSample { found: true, request: 5, object: 0x16, start: 12, length: 4 }
+    var m = vec_of(data_best_effort())
+
+    test.case("it is copied to the start of the buffer, and the state keeps it until the next poll")
+    var a: Vec[u8; 2048] = Vec.new()
+    let ev = xrcefrag.keep_sample(var m, sample, xrcefrag.reassembly(100), var a)
+    test.assert_eq(ev.code, xrcefrag.FRAG_DONE)
+    test.assert_eq(ev.sample.object, 0x16)
+    test.assert_eq(ev.sample.request, 5)
+    test.assert_eq(ev.sample.start, 0)
+    test.assert_eq(ev.sample.length, 4)
+    test.assert_eq(joined_list(var a), [7, 0, 0, 0])
+    test.assert(ev.assembly.finished)
+
+    test.case("a poll that has not finished a sample leaves the buffer alone")
+    let kept = xrcefrag.begin(xrcefrag.reassembly(100), var a)
+    test.assert_eq(a.len(), 4)
+    test.assert(not kept.finished)
+    test.assert_eq(xrcefrag.begin(ev.assembly, var a).limit, 108)
+    test.assert_eq(a.len(), 0)
+
+    test.case("one longer than the limit is dropped, as a joined one would be")
+    let big = xrcefrag.keep_sample(var m, sample, xrcefrag.reassembly(3), var a)
+    test.assert_eq(big.code, xrcefrag.FRAG_TOO_LONG)
+    test.assert_eq(a.len(), 0)
+    test.assert(not big.sample.found)
+
+// ── rostransport.poll_long, over a pipe that is a table ──────────────
+
+// What the agent says next, one message to each receive, and what the node
+// said back.
+var g_sent: [[Int]]  = []
+var g_queue: [Bytes] = []
+
+struct RecPipe
+    id: Int
+
+impl RosTransport[mutate] for RecPipe
+    fn ros_send(self, frame: Bytes) -> Bool [mutate]
+        var xs: [Int] = []
+        for i in 0..bytes.len(frame)
+            xs = list.push(xs, bytes.byte_at(frame, i) ?? 0)
+        g_sent = list.push(g_sent, xs)
+        true
+
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
+        if list.len(g_queue) == 0
+            return None
+        let first = g_queue[0]
+        g_queue = list.drop(g_queue, 1)
+        Some(first)
+
+    fn ros_is_open(self) -> Bool [mutate]
+        true
+
+    fn ros_close(self) [mutate]
+        ()
+
+    fn ros_mtu(self) -> Int
+        512
+
+fn pipe_reset() [mutate]
+    g_sent = []
+    g_queue = []
+
+fn agent_says(xs: [Int]) [mutate]
+    g_queue = list.push(g_queue, bytes.from_byte_list(xs))
+
+// The bytes of a payload, as a list.
+fn payload_list(m: RosMessage) -> [Int]
+    let p = rosmsg.payload(m)
+    var xs: [Int] = []
+    for i in 0..bytes.len(p)
+        xs = list.push(xs, bytes.byte_at(p, i) ?? 0)
+    xs
+
+@test
+fn test_the_host_poll_joins_a_long_sample_and_acknowledges_every_piece() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = rostransport.session_silent(an_open_session(), 300)
+    var h = xrcestream.history()
+    var a: Vec[u8; 2048] = Vec.new()
+    let run = recorded_run(0)
+    pipe_reset()
+    agent_says(run[0])
+    agent_says(run[1])
+    agent_says(run[2])
+
+    test.case("the first two pieces are takes that did not finish, which is not an error")
+    let first = rostransport.poll_long(pipe, up, xrcestream.rel_stream(), xrcefrag.reassembly(2040),
+                                       var h, var a, 77, 0)
+    test.assert_eq(first.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(first.stream.in_handled, 0)
+    test.assert_eq(first.session.silent_ms, 0)
+    let second = rostransport.poll_long(pipe, up, first.stream, first.assembly, var h, var a, 77, 0)
+    test.assert_eq(second.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(a.len(), 1008)
+
+    test.case("the last piece gives the whole sample, as the same RosMessage a short one is")
+    let third = rostransport.poll_long(pipe, up, second.stream, second.assembly, var h, var a, 77, 0)
+    test.assert_eq(third.code, rosret.ROS_RET_OK)
+    test.assert_eq(third.object, 0x16)
+    test.assert_eq(rosmsg.payload_length(third.message), 1008)
+    test.assert_eq(payload_list(third.message), whole_string())
+    test.assert_eq(third.message.type_id, 77)
+    test.assert_eq(third.message.encapsulation, rosmsg.ROS_CDR_LE)
+    test.assert_eq(third.stream.in_handled, 2)
+
+    test.case("every piece was acknowledged with the next number, so the agent sends none again")
+    test.assert_eq(g_sent, [acknack_message(1, 0), acknack_message(2, 0), acknack_message(3, 0)])
+
+@test
+fn test_a_piece_taken_twice_is_joined_once_and_a_lost_piece_is_asked_for() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = an_open_session()
+    var h = xrcestream.history()
+    var a: Vec[u8; 2048] = Vec.new()
+    let run = recorded_run(0)
+    pipe_reset()
+
+    test.case("the first piece, and the same piece again")
+    agent_says(run[0])
+    agent_says(run[0])
+    let one = rostransport.poll_long(pipe, up, xrcestream.rel_stream(), xrcefrag.reassembly(2040),
+                                     var h, var a, 1, 0)
+    let again = rostransport.poll_long(pipe, up, one.stream, one.assembly, var h, var a, 1, 0)
+    test.assert_eq(again.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(a.len(), 504)
+    test.assert_eq(g_sent, [acknack_message(1, 0), acknack_message(1, 0)])
+
+    test.case("the last piece before the second: it is not joined, and the ACKNACK asks for the second")
+    pipe_reset()
+    agent_says(run[2])
+    let gap = rostransport.poll_long(pipe, up, again.stream, again.assembly, var h, var a, 1, 0)
+    test.assert_eq(gap.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(a.len(), 504)
+    test.assert_eq(g_sent, [acknack_message(1, 3)])
+
+    test.case("the agent sends the second and the third again, and the sample is whole")
+    pipe_reset()
+    agent_says(run[1])
+    agent_says(run[2])
+    let two = rostransport.poll_long(pipe, up, gap.stream, gap.assembly, var h, var a, 1, 0)
+    let done = rostransport.poll_long(pipe, up, two.stream, two.assembly, var h, var a, 1, 0)
+    test.assert_eq(done.code, rosret.ROS_RET_OK)
+    test.assert_eq(payload_list(done.message), whole_string())
+
+@test
+fn test_the_host_poll_drops_a_sample_longer_than_it_allows_and_says_so_once() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = an_open_session()
+    var h = xrcestream.history()
+    var a: Vec[u8; 2048] = Vec.new()
+    let run = recorded_run(0)
+    pipe_reset()
+    agent_says(run[0])
+    agent_says(run[1])
+    agent_says(run[2])
+    let small = rostransport.session_silent(up, 50)
+
+    test.case("the first piece is the call that answers ROS_RET_BAD_ALLOC")
+    let first = rostransport.poll_long(pipe, small, xrcestream.rel_stream(), xrcefrag.reassembly(100),
+                                       var h, var a, 1, 0)
+    test.assert_eq(first.code, rosret.ROS_RET_BAD_ALLOC)
+    test.assert(rosret.ros_ret_is_error(first.code))
+    test.assert_eq(first.session.silent_ms, 0)
+
+    test.case("the other pieces are taken and not reported")
+    let second = rostransport.poll_long(pipe, up, first.stream, first.assembly, var h, var a, 1, 0)
+    test.assert_eq(second.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    let third = rostransport.poll_long(pipe, up, second.stream, second.assembly, var h, var a, 1, 0)
+    test.assert_eq(third.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(a.len(), 0)
+
+    test.case("every piece was acknowledged, so the agent does not send them again")
+    test.assert_eq(g_sent, [acknack_message(1, 0), acknack_message(2, 0), acknack_message(3, 0)])
+
+    test.case("the next sample, which fits, arrives")
+    pipe_reset()
+    agent_says(data_reliable(3, 11))
+    let next = rostransport.poll_long(pipe, up, third.stream, third.assembly, var h, var a, 1, 0)
+    test.assert_eq(next.code, rosret.ROS_RET_OK)
+    test.assert_eq(payload_list(next.message), [11, 0, 0, 0])
+
+@test
+fn test_the_host_poll_takes_a_short_sample_the_way_poll_does() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = rostransport.session_silent(an_open_session(), 300)
+    var h = xrcestream.history()
+    var a: Vec[u8; 2048] = Vec.new()
+    let state = xrcefrag.reassembly(100)
+
+    test.case("a session that was never opened takes nothing")
+    pipe_reset()
+    agent_says(data_best_effort())
+    test.assert_eq(rostransport.poll_long(pipe, rostransport.session(1, 512), xrcestream.rel_stream(),
+                                          state, var h, var a, 1, 0).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+    test.case("nothing on the pipe is a take that failed, and the silence is kept")
+    pipe_reset()
+    let quiet = rostransport.poll_long(pipe, up, xrcestream.rel_stream(), state, var h, var a, 1, 0)
+    test.assert_eq(quiet.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(quiet.session.silent_ms, 300)
+
+    test.case("RECORDED DATA on the best-effort stream, and nothing is acknowledged")
+    pipe_reset()
+    agent_says(data_best_effort())
+    let got = rostransport.poll_long(pipe, up, xrcestream.rel_stream(), state, var h, var a, 1, 0)
+    test.assert_eq(got.code, rosret.ROS_RET_OK)
+    test.assert_eq(got.object, 0x16)
+    test.assert_eq(payload_list(got.message), [7, 0, 0, 0])
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("RECORDED DATA on the reliable stream is acknowledged")
+    pipe_reset()
+    agent_says(data_reliable(0, 11))
+    let rel = rostransport.poll_long(pipe, up, xrcestream.rel_stream(), got.assembly, var h, var a,
+                                     1, 0)
+    test.assert_eq(rel.code, rosret.ROS_RET_OK)
+    test.assert_eq(payload_list(rel.message), [11, 0, 0, 0])
+    test.assert_eq(g_sent, [acknack_message(1, 0)])
+
+    test.case("a sample longer than the limit that came in one message is dropped too")
+    pipe_reset()
+    agent_says(data_reliable(1, 12))
+    let big = rostransport.poll_long(pipe, up, rel.stream, xrcefrag.reassembly(3), var h, var a, 1, 0)
+    test.assert_eq(big.code, rosret.ROS_RET_BAD_ALLOC)
+
+    test.case("a STATUS that is not OK is an error with the number, and one that is OK is not")
+    pipe_reset()
+    agent_says(status_message(5, 0x16, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let refused = rostransport.poll_long(pipe, up, xrcestream.rel_stream(), state, var h, var a, 1, 0)
+    test.assert_eq(refused.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(refused.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+    agent_says(status_message(5, 0x16, 0))
+    test.assert_eq(rostransport.poll_long(pipe, up, xrcestream.rel_stream(), state, var h, var a,
+                                          1, 0).code,
+                   rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+
+// ── rosuart.poll_long, over a fake UART ──────────────────────────────
+
+// The fake UART's state: a module-level variable each, because the trait's
+// methods take `self` by value, and fixed-capacity buffers because the
+// functions under test are `@no_alloc`.  The inbox holds the three frames of
+// a long sample.
+var u_inbox: Vec[u8; 2600]  = Vec.new()
+var u_cursor                = 0
+var u_outbox: Vec[u8; 1100] = Vec.new()
+
+struct FakeUart
+    id: Int
+
+impl XrceUart[mutate] for FakeUart
+    fn uart_put(self, byte: Int) -> Bool [mutate]
+        match u_outbox.push(byte as u8)
+            Ok(_)  => true
+            Err(_) => false
+
+    fn uart_get(self) -> Int [mutate]
+        if u_cursor < u_inbox.len()
+            u_cursor = u_cursor + 1
+            return u_inbox[u_cursor - 1] as Int
+        0 - 1
+
+    fn uart_pause_ms(self, ms: Int) [mutate]
+        ()
+
+fn clear_line() [mutate]
+    u_inbox.clear()
+    u_cursor = 0
+    u_outbox.clear()
+
+// The frame an agent sends, appended to what is waiting on the line.
+fn agent_sends(payload: [Int]) [mutate]
+    var p = vec_of(payload)
+    var f: Vec[u8; 1037] = Vec.new()
+    let _ = xrceframe.encode(var f, var p, xrceframe.XRCE_ADDR_AGENT,
+                             xrceframe.XRCE_ADDR_CLIENT)
+    for b in f
+        let _ = u_inbox.push(b)
+
+// Every frame the device has put on the line, taken out of its framing.
+fn on_the_line() -> [[Int]]
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var out: [[Int]] = []
+    for b in u_outbox
+        if xrceframe.push_byte(var d, b as Int) == xrceframe.XRCE_PUSH_FRAME
+            var p: [Int] = []
+            // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+            for x in d.payload
+                let wide = x as Int
+                p = list.push(p, wide)
+            out = list.push(out, p)
+    out
+
+@test
+fn test_the_device_joins_a_long_sample_in_a_buffer_it_does_not_allocate() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    var a: Vec[u8; 2048] = Vec.new()
+    let up = rostransport.session_silent(an_open_session(), 300)
+    let run = recorded_run(0)
+    clear_line()
+    for msg in run
+        agent_sends(msg)
+
+    test.case("two pieces are takes that did not finish")
+    let first = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, xrcestream.rel_stream(),
+                                  xrcefrag.reassembly(2040), 3)
+    test.assert_eq(first.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    let second = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, first.stream,
+                                   first.assembly, 3)
+    test.assert_eq(second.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(a.len(), 1008)
+
+    test.case("the last gives the sample, from the first byte of the caller's buffer")
+    let third = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, second.stream,
+                                  second.assembly, 3)
+    test.assert_eq(third.code, rosret.ROS_RET_OK)
+    test.assert(third.sample.found)
+    test.assert_eq(third.sample.object, 0x16)
+    test.assert_eq(third.sample.start, 0)
+    test.assert_eq(third.sample.length, 1008)
+    test.assert_eq(joined_list(var a), whole_string())
+    test.assert_eq(third.session.silent_ms, 0)
+
+    test.case("every piece was acknowledged")
+    test.assert_eq(on_the_line(), [acknack_message(1, 0), acknack_message(2, 0), acknack_message(3, 0)])
+
+@test
+fn test_the_device_drops_a_sample_longer_than_it_allows_and_takes_the_next() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    var a: Vec[u8; 2048] = Vec.new()
+    let up = an_open_session()
+    let run = recorded_run(0)
+    clear_line()
+    for msg in run
+        agent_sends(msg)
+
+    test.case("the first piece answers ROS_RET_BAD_ALLOC, the others nothing")
+    let first = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, xrcestream.rel_stream(),
+                                  xrcefrag.reassembly(100), 3)
+    test.assert_eq(first.code, rosret.ROS_RET_BAD_ALLOC)
+    let second = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, first.stream,
+                                   first.assembly, 3)
+    test.assert_eq(second.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    let third = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, second.stream,
+                                  second.assembly, 3)
+    test.assert_eq(third.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(a.len(), 0)
+    test.assert_eq(on_the_line(), [acknack_message(1, 0), acknack_message(2, 0), acknack_message(3, 0)])
+
+    test.case("the next sample, which fits, arrives")
+    clear_line()
+    agent_sends(data_reliable(3, 11))
+    let next = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, third.stream,
+                                 third.assembly, 3)
+    test.assert_eq(next.code, rosret.ROS_RET_OK)
+    test.assert_eq(joined_list(var a), [11, 0, 0, 0])
+
+@test
+fn test_the_device_poll_of_a_short_sample_and_of_everything_else() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    var a: Vec[u8; 2048] = Vec.new()
+    let up = rostransport.session_silent(an_open_session(), 300)
+    let state = xrcefrag.reassembly(100)
+
+    test.case("a session never opened takes nothing")
+    clear_line()
+    agent_sends(data_best_effort())
+    test.assert_eq(rosuart.poll_long(u, var d, var m, var f, var h, var a,
+                                     rostransport.session(1, 512), xrcestream.rel_stream(), state,
+                                     0).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+    test.case("an empty line is a take that failed, and the silence is kept")
+    clear_line()
+    let quiet = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, xrcestream.rel_stream(),
+                                  state, 3)
+    test.assert_eq(quiet.code, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)
+    test.assert_eq(quiet.session.silent_ms, 300)
+
+    test.case("RECORDED DATA on the best-effort stream is in the caller's buffer, and the message buffer holds the frame")
+    clear_line()
+    agent_sends(data_best_effort())
+    let got = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, xrcestream.rel_stream(),
+                                state, 3)
+    test.assert_eq(got.code, rosret.ROS_RET_OK)
+    test.assert_eq(got.sample.object, 0x16)
+    test.assert_eq(joined_list(var a), [7, 0, 0, 0])
+    test.assert_eq(list_of(var m), data_best_effort())
+    test.assert_eq(list.len(on_the_line()), 0)
+
+    test.case("a sample longer than the limit that came in one frame is dropped too")
+    clear_line()
+    agent_sends(data_reliable(0, 11))
+    let big = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, xrcestream.rel_stream(),
+                                xrcefrag.reassembly(3), 3)
+    test.assert_eq(big.code, rosret.ROS_RET_BAD_ALLOC)
+
+    test.case("a refused request comes back as an error with the number, an OK status does not")
+    clear_line()
+    agent_sends(status_message(5, 0x16, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let refused = rosuart.poll_long(u, var d, var m, var f, var h, var a, up, xrcestream.rel_stream(),
+                                    state, 3)
+    test.assert_eq(refused.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(refused.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+    clear_line()
+    agent_sends(status_message(5, 0x16, 0))
+    test.assert_eq(rosuart.poll_long(u, var d, var m, var f, var h, var a, up, xrcestream.rel_stream(),
+                                     state, 3).code,
+                   rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED)

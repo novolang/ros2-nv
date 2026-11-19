@@ -36,6 +36,7 @@
 use std.list
 use rosmsg
 use rosret
+use xrcefrag
 use xrcestream
 use xrcewire
 
@@ -762,6 +763,29 @@ fn reliable_tick<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStrea
         let _sent = t.ros_send(wire_bytes(var m))
         return xrcestream.out_heartbeat_sent(q)
 
+// Send what a received message asks of this side of the reliable stream: the
+// ACKNACK for the input side, and the messages of the history that an
+// ACKNACK from the agent names.
+//
+// Built in a message of its own, so the message that was received is left
+// as it is.
+@tier(system)
+fn answer_stream<T: RosTransport[e]>(t: T, var h: Vec[u8; 2056], ev: xrcestream.RelEvent) [e]
+    system
+        var a: Vec[u8; 512] = Vec.new()
+        if ev.ack
+            let _built = xrcewire.acknack(var a, xrcestream.in_first(ev.stream),
+                                          xrcestream.in_bitmap(ev.stream),
+                                          xrcewire.XRCE_STREAM_RELIABLE)
+            let _sent = t.ros_send(wire_bytes(var a))
+        if ev.resend
+            for j in 0..xrcestream.XRCE_ACKNACK_SPAN
+                if xrcestream.out_resend(ev.stream, ev.resend_first, ev.resend_bitmap, j)
+                    let n = xrcestream.history_load(var h, xrcestream.seq_add(ev.resend_first, j),
+                                                    var a)
+                    if n > 0
+                        let _again = t.ros_send(wire_bytes(var a))
+
 // Take the next message from the agent and act on it.
 //
 // Waits up to `timeout_ms` for one message and runs it through
@@ -788,18 +812,7 @@ fn poll<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
         let reply = xrcewire.read_reply(var m)
         let ev = xrcestream.receive(var m, r)
         let heard = session_heard(s)
-        if ev.ack
-            let _built = xrcewire.acknack(var m, xrcestream.in_first(ev.stream),
-                                          xrcestream.in_bitmap(ev.stream),
-                                          xrcewire.XRCE_STREAM_RELIABLE)
-            let _sent = t.ros_send(wire_bytes(var m))
-        if ev.resend
-            for j in 0..xrcestream.XRCE_ACKNACK_SPAN
-                if xrcestream.out_resend(ev.stream, ev.resend_first, ev.resend_bitmap, j)
-                    let n = xrcestream.history_load(var h, xrcestream.seq_add(ev.resend_first, j),
-                                                    var m)
-                    if n > 0
-                        let _again = t.ros_send(wire_bytes(var m))
+        answer_stream(t, var h, ev)
         if ev.sample.found
             let body = bytes.slice(raw, ev.sample.start, ev.sample.start + ev.sample.length)
             return RosTaken { session: heard, stream: ev.stream, code: rosret.ROS_RET_OK,
@@ -809,6 +822,107 @@ fn poll<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
             return taken_none(heard, ev.stream, rosret.ROS_RET_ERROR, reply.status, type_id)
         return taken_none(heard, ev.stream, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1,
                           type_id)
+
+// What `poll_long` took from the pipe.
+//
+// A PLAIN STRUCT, because the message holds a `Bytes`.
+pub struct RosLongTaken
+    // The session after the call. Any message from the agent clears its
+    // silence.
+    session: RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // The reassembly after the call; pass it to the next `poll_long`.
+    assembly: xrcefrag.FragState
+    // `ROS_RET_OK` when `message` is a sample, whole or joined from pieces;
+    // `ROS_RET_SUBSCRIPTION_TAKE_FAILED` when nothing arrived, or what
+    // arrived was a piece of a sample not yet whole, or held no sample, which
+    // is not an error; `ROS_RET_BAD_ALLOC` when a sample is longer than the
+    // reassembly allows and was dropped; `ROS_RET_NOT_INIT` for a session
+    // that is not established; `ROS_RET_ERROR` when the agent answered a
+    // request with a status that is not OK, and `status` has the number.
+    code: Int
+    // The agent's status number when `code` is `ROS_RET_ERROR`, else -1.
+    status: Int
+    // The data reader's object id the sample belongs to, else 0.
+    object: Int
+    // The sample, as `poll` answers it.
+    message: RosMessage
+
+// A `RosLongTaken` that took no sample.
+@tier(system)
+fn long_none(s: RosSession, r: xrcestream.RelStream, state: xrcefrag.FragState, code: Int,
+             status: Int, type_id: Int) -> RosLongTaken
+    RosLongTaken { session: s, stream: r, assembly: state, code: code, status: status,
+                   object: 0, message: rosmsg.message(bytes.zeros(0), type_id) }
+
+// The bytes the reassembly buffer holds, as a `Bytes`.
+@tier(system)
+fn long_bytes(var a: Vec[u8; 2048]) -> Bytes
+    system
+        var xs: [Int] = []
+        // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+        for x in a
+            let wide = x as Int
+            xs = list.push(xs, wide)
+        return bytes.from_byte_list(xs)
+
+// Take the next message from the agent and act on it, joining a sample the
+// agent sent in pieces.
+//
+// `poll` for samples longer than one message. The agent cuts a sample that
+// does not fit in 512 bytes into FRAGMENT submessages on the reliable
+// stream, so the samples are asked for on that stream (`request_data` with
+// `xrcewire.XRCE_STREAM_RELIABLE`). `a` is the buffer the pieces are joined
+// in, and `state` the reassembly that says how large a sample it will take
+// (`xrcefrag.reassembly`); the caller keeps both between calls and passes the
+// `assembly` of the result to the next one. One message per call: a call
+// that took a piece answers `ROS_RET_SUBSCRIPTION_TAKE_FAILED`, and the call
+// that took the last one answers the whole sample as `message`, a sample
+// that came in one message as well. A sample longer than the reassembly
+// allows is dropped, with the rest of its pieces, and the call that met its
+// first piece answers `ROS_RET_BAD_ALLOC`. Acknowledgements, retransmissions and
+// the status of a refused request are handled as `poll` handles them.
+pub @tier(system)
+fn poll_long<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
+                                 state: xrcefrag.FragState, var h: Vec[u8; 2056],
+                                 var a: Vec[u8; 2048], type_id: Int,
+                                 timeout_ms: Int) -> RosLongTaken [e]
+    system
+        // A sample read after the last call is cleared out first, so that a
+        // caller looking at the buffer sees one sample.
+        let st = xrcefrag.begin(state, var a)
+        if not session_is_ready(s)
+            return long_none(s, r, st, rosret.ROS_RET_NOT_INIT, 0 - 1, type_id)
+        let answer = t.ros_recv(timeout_ms)
+        if answer == None
+            return long_none(s, r, st, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1, type_id)
+        var m: Vec[u8; 512] = Vec.new()
+        wire_read(var m, answer ?? bytes.zeros(0))
+        let reply = xrcewire.read_reply(var m)
+        let ev = xrcestream.receive(var m, r)
+        let heard = session_heard(s)
+        // A sample in one message, or a piece of one, joined before the
+        // acknowledgement is built.
+        var joined = xrcefrag.event(st, xrcefrag.FRAG_NONE)
+        if ev.sample.found
+            joined = xrcefrag.keep_sample(var m, ev.sample, st, var a)
+        else if xrcestream.delivers(var m, r)
+            joined = xrcefrag.push(var m, st, var a)
+        answer_stream(t, var h, ev)
+        if joined.code == xrcefrag.FRAG_DONE
+            return RosLongTaken { session: heard, stream: ev.stream, assembly: joined.assembly,
+                                  code: rosret.ROS_RET_OK, status: 0 - 1,
+                                  object: joined.sample.object,
+                                  message: rosmsg.message(long_bytes(var a), type_id) }
+        if joined.code == xrcefrag.FRAG_TOO_LONG
+            return long_none(heard, ev.stream, joined.assembly, rosret.ROS_RET_BAD_ALLOC, 0 - 1,
+                             type_id)
+        if reply.kind == xrcewire.XRCE_REPLY_STATUS and not xrcewire.status_is_ok(reply.status)
+            return long_none(heard, ev.stream, joined.assembly, rosret.ROS_RET_ERROR,
+                             reply.status, type_id)
+        return long_none(heard, ev.stream, joined.assembly,
+                         rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1, type_id)
 
 // Count `elapsed_ms` of silence, and send a ping if the agent has been
 // quiet long enough to be asked.

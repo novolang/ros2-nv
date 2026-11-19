@@ -1,0 +1,244 @@
+// xrcefrag.nv: a sample longer than one message, joined from the FRAGMENT
+// submessages the agent sends it in.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it, with no allocation.
+// The pieces are joined in a `Vec[u8; XRCE_REASSEMBLY_BYTES]` that the caller
+// owns and passes by `var`, and the state is a `@value` of three small fields, so a
+// device holds both beside its session and a host holds the same.
+//
+// WHY THERE ARE FRAGMENTS.  A message is no longer than the MTU the client
+// named when it opened the session, and this package names 512.  The agent
+// writes what DDS delivers as one DATA submessage, and a DATA longer than
+// the room in one message is cut into pieces: the agent serialises the
+// whole submessage, header included, and sends it as a run of messages on
+// the reliable stream, each holding one FRAGMENT submessage whose payload
+// is the next piece (Micro-XRCE-DDS-Agent, `ReliableOutputStream::
+// push_submessage`).  The last piece has bit 1 of its flags set.  A
+// best-effort stream has no fragments: a DATA that does not fit is not sent,
+// so a node that wants samples longer than one message asks for them on
+// the reliable stream.
+//
+// WHAT THIS MODULE DOES.  `push` takes one received message.  The reliable
+// stream delivers messages in order (`xrcestream.delivers`), so the pieces
+// arrive in order and a piece is appended to the buffer.  At the last
+// piece the buffer holds one DATA submessage: its header, the request id
+// and the object id, and the sample.  `push` checks that, moves the sample
+// to the start of the buffer, and answers it as an `XrceSample` whose
+// `start` is 0 and whose `length` is the buffer's length.
+//
+// A SAMPLE THAT DOES NOT FIT IS DROPPED, AND SAID SO.  The caller names the
+// largest sample it will take, at most `XRCE_REASSEMBLY_MAX_SAMPLE`.  A
+// piece that would take the buffer past it answers `FRAG_TOO_LONG` once,
+// and the rest of that sample is dropped without a word until its last
+// piece, so the next sample is joined from its own first piece.  A sample
+// that came whole in one message is held to the same limit, so a node's
+// answer to a sample does not depend on how the agent happened to send it.
+//
+// THE BUFFER HOLDS THE LAST SAMPLE UNTIL THE NEXT CALL.  A finished sample
+// stays in the buffer for the caller to read, and `begin`, which every poll
+// calls first, clears it.
+//
+// WHAT IT DOES NOT DO.  The agent can give up on messages it no longer
+// holds, and a HEARTBEAT that says so moves the input side past them
+// (`xrcestream.in_heartbeat`).  If that falls in the middle of a sample the
+// pieces joined so far and the pieces of the next sample are joined into
+// one, which is not a DATA, and `push` answers `FRAG_BAD` and starts over.
+// That costs the two samples and is not mistaken for either.
+
+use xrcewire
+
+// The bytes of the buffer a caller passes: 2048.
+//
+// What the agent sends is the DATA submessage, so the buffer holds its four
+// bytes of header, four bytes of request and object ids, and the sample.
+pub const XRCE_REASSEMBLY_BYTES = 2048
+
+// The largest sample a buffer holds: 2040, the buffer less the eight bytes
+// in front of the sample.
+pub const XRCE_REASSEMBLY_MAX_SAMPLE = 2040
+
+// The bytes in front of a sample in a DATA: the submessage header (4) and
+// the request id and the object id (2 each).
+const DATA_FRONT = 8
+
+// The message held no FRAGMENT: the buffer and the state are as they were.
+pub const FRAG_NONE = 0
+// A piece was kept and more are to come, or a piece of a sample already
+// dropped was dropped as well.
+pub const FRAG_MORE = 1
+// The last piece was kept: the sample is in the buffer, from its first byte.
+pub const FRAG_DONE = 2
+// The sample is longer than the caller allowed, and is dropped.
+pub const FRAG_TOO_LONG = 3
+// The pieces joined were not one DATA, and are dropped.
+pub const FRAG_BAD = 4
+
+// What the reassembly has decided about the sample in progress.
+//
+// A `@value` of a number and two flags.  The pieces themselves are in the caller's
+// buffer, whose length is how much has been joined.
+pub @value
+struct FragState
+    // The most bytes of a DATA the buffer is to hold, from 8 to
+    // `XRCE_REASSEMBLY_BYTES`.
+    limit: Int
+    // Whether the rest of the sample in progress is being dropped, because
+    // it did not fit.
+    dropping: Bool
+    // Whether the buffer holds a finished sample that `begin` is to clear.
+    finished: Bool
+
+// What `push` did with one message.
+pub @value
+struct FragEvent
+    // The state after the message.
+    assembly: FragState
+    // One of `FRAG_*`.
+    code: Int
+    // The sample, when `code` is `FRAG_DONE`: `found`, the request id, the
+    // data reader's object id, `start` 0 and `length` the sample's length in
+    // the buffer.  Otherwise `found` is false.
+    sample: xrcewire.XrceSample
+
+// A reassembly that takes samples of at most `max_sample` bytes.
+//
+// A number above `XRCE_REASSEMBLY_MAX_SAMPLE` is taken as that, and a
+// number below 0 as 0, so the limit is never more than the buffer holds.
+//
+// ```novo
+// use xrcefrag
+//
+// fn main() [io]
+//     println("${xrcefrag.reassembly(1000).limit}")   // 1008
+//     println("${xrcefrag.reassembly(5000).limit}")   // 2048
+// ```
+pub @tier(embedded)
+@no_alloc
+fn reassembly(max_sample: Int) -> FragState []
+    var limit = max_sample + DATA_FRONT
+    if limit > XRCE_REASSEMBLY_BYTES
+        limit = XRCE_REASSEMBLY_BYTES
+    if limit < DATA_FRONT
+        limit = DATA_FRONT
+    FragState { limit: limit, dropping: false, finished: false }
+
+// An event with this code and no sample.
+pub @tier(embedded)
+@no_alloc
+fn event(state: FragState, code: Int) -> FragEvent []
+    FragEvent { assembly: state, code: code,
+                sample: xrcewire.XrceSample { found: false, request: 0, object: 0, start: 0,
+                                              length: 0 } }
+
+// The state at the start of a poll: a finished sample from the last poll is
+// cleared out of the buffer, and the state forgets it.
+//
+// Call it before anything else in a poll, so that a caller reading the
+// buffer after the poll sees one sample and not two.
+pub @tier(embedded)
+@no_alloc
+fn begin(state: FragState, var a: Vec[u8; 2048]) -> FragState []
+    if not state.finished
+        return state
+    a.clear()
+    FragState { limit: state.limit, dropping: state.dropping, finished: false }
+
+// Take a sample that came whole in one message, and hold it in the buffer
+// as a joined one is.
+//
+// `sample` is what `xrcewire.read_sample` found in `m`.  It is copied to the
+// start of the buffer, and the answer is `FRAG_DONE`, or `FRAG_TOO_LONG`
+// when it is longer than `state.limit` allows, in which case the buffer stays
+// empty.  This is what makes the buffer the one place a caller reads a
+// sample from, whether it came in one message or in ten.
+pub @tier(embedded)
+@no_alloc
+fn keep_sample(var m: Vec[u8; 512], sample: xrcewire.XrceSample, state: FragState,
+               var a: Vec[u8; 2048]) -> FragEvent []
+    a.clear()
+    if sample.length + DATA_FRONT > state.limit
+        return event(state, FRAG_TOO_LONG)
+    for i in 0..sample.length
+        let _ = a.push(m[sample.start + i])
+    FragEvent { assembly: FragState { limit: state.limit, dropping: false, finished: true },
+                code: FRAG_DONE,
+                sample: xrcewire.XrceSample { found: true, request: sample.request,
+                                              object: sample.object, start: 0,
+                                              length: sample.length } }
+
+// Move the sample of a joined DATA to the start of the buffer and read
+// it, or answer `found = false` when the buffer is not one DATA.
+//
+// A DATA is its header (id 9, a flags byte whose bits 1 to 3 are the data
+// format, a 16-bit length) and then that many bytes: the request id, the
+// object id and the sample.  The format must be `XRCE_FORMAT_DATA`, the one
+// `read_data` asks for, and the length must account for every byte joined.
+@tier(embedded)
+@no_alloc
+fn take_data(var a: Vec[u8; 2048]) -> xrcewire.XrceSample []
+    let none = xrcewire.XrceSample { found: false, request: 0, object: 0, start: 0, length: 0 }
+    if a.len() < DATA_FRONT
+        return none
+    let length = a[2] as Int + a[3] as Int * 256
+    if a[0] as Int != xrcewire.XRCE_SUB_DATA or length != a.len() - 4
+        return none
+    if (a[1] as Int & xrcewire.XRCE_FORMAT_MASK) != xrcewire.XRCE_FORMAT_DATA
+        return none
+    let request = a[4] as Int * 256 + a[5] as Int
+    let object = a[6] as Int * 256 + a[7] as Int
+    let n = a.len() - DATA_FRONT
+    for i in 0..n
+        a[i] = a[i + DATA_FRONT]
+    for _k in 0..DATA_FRONT
+        let _ = a.pop()
+    xrcewire.XrceSample { found: true, request: request, object: object, start: 0, length: n }
+
+// Take one received message, and join its piece if it holds one.
+//
+// `m` is the message, `state` the state and `a` the buffer, empty before the
+// first piece of a sample.  Call it for a message the reliable stream
+// delivered in order (`xrcestream.delivers`); a message that holds no
+// FRAGMENT answers `FRAG_NONE` and changes nothing.  Otherwise:
+//
+//   - `FRAG_MORE`: the piece is kept, and more are to come.
+//   - `FRAG_DONE`: the last piece is kept and `sample` says where the sample
+//     is: `a[0]` to `a[sample.length - 1]`.  The buffer is left as it is for
+//     the caller to read, and `begin` clears it at the next poll.
+//   - `FRAG_TOO_LONG`: the sample is longer than `state.limit` allows, the
+//     buffer is cleared, and the rest of this sample is dropped.
+//   - `FRAG_BAD`: the pieces were not one DATA, and the buffer is cleared.
+//
+// ```novo
+// use xrcefrag
+// use xrcewire
+//
+// fn main() [io]
+//     var m: Vec[u8; 512] = Vec.new()
+//     var a: Vec[u8; 2048] = Vec.new()
+//     let ev = xrcefrag.push(var m, xrcefrag.reassembly(100), var a)
+//     println("${ev.code}")   // 0, because the message holds no fragment
+// ```
+pub @tier(embedded)
+@no_alloc
+fn push(var m: Vec[u8; 512], state: FragState, var a: Vec[u8; 2048]) -> FragEvent []
+    let frag = xrcewire.read_fragment(var m)
+    if not frag.found
+        return event(state, FRAG_NONE)
+    if state.dropping
+        // The rest of a sample that did not fit, up to its last piece.
+        return event(FragState { limit: state.limit, dropping: not frag.last, finished: false },
+                     FRAG_MORE)
+    if a.len() + frag.length > state.limit
+        a.clear()
+        return event(FragState { limit: state.limit, dropping: not frag.last, finished: false },
+                     FRAG_TOO_LONG)
+    for i in 0..frag.length
+        let _ = a.push(m[frag.start + i])
+    if not frag.last
+        return event(state, FRAG_MORE)
+    let sample = take_data(var a)
+    if not sample.found
+        a.clear()
+        return event(state, FRAG_BAD)
+    FragEvent { assembly: FragState { limit: state.limit, dropping: false, finished: true },
+                code: FRAG_DONE, sample: sample }

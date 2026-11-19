@@ -373,6 +373,19 @@ fn in_bitmap(r: RelStream) -> Int []
 
 // ── A received message ───────────────────────────────────────────────
 
+// Whether a received message is one the session acts on: it is on the
+// reliable stream and in order, or it is on another stream.
+//
+// `receive` hands up a sample only for such a message, and `xrcefrag` joins
+// a fragment only for one, because the agent sends a message that was
+// missed again and a fragment taken twice would be joined twice.
+pub @tier(embedded)
+@no_alloc
+fn delivers(var m: Vec[u8; 512], r: RelStream) -> Bool []
+    if xrcewire.message_stream(var m) >= xrcewire.XRCE_STREAM_RELIABLE
+        return in_verdict(r, xrcewire.message_seq(var m)) == REL_DELIVER
+    true
+
 // What a received message asks of the session, and the stream after it.
 //
 // A message on a reliable stream is run through the input side whatever
@@ -387,11 +400,9 @@ pub @tier(embedded)
 fn receive(var m: Vec[u8; 512], r: RelStream) -> RelEvent []
     var st = r
     var ack = false
-    var deliver = true
+    let deliver = delivers(var m, r)
     if xrcewire.message_stream(var m) >= xrcewire.XRCE_STREAM_RELIABLE
-        let seq = xrcewire.message_seq(var m)
-        deliver = in_verdict(st, seq) == REL_DELIVER
-        st = in_receive(st, seq)
+        st = in_receive(st, xrcewire.message_seq(var m))
         ack = true
     var sample = xrcewire.XrceSample { found: false, request: 0, object: 0, start: 0, length: 0 }
     if deliver
