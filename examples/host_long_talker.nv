@@ -1,0 +1,154 @@
+// host_long_talker.nv — a micro-ROS node on a workstation that publishes texts
+// longer than one message: it opens a session with a Micro XRCE-DDS Agent over
+// TCP or UDP, creates a participant, the topic /novo_text of type
+// std_msgs/msg/String, a publisher and a data writer, and publishes a text of
+// 1,000 characters, then one of 2,000 and one of 2,040.
+//
+// Run it with an agent listening, then watch it from ROS 2:
+//
+//   MicroXRCEAgent tcp4 --port 2018 -v 6
+//   ros2 topic echo /novo_text std_msgs/msg/String
+//   novo run examples/host_long_talker.nv
+//
+// It takes the agent's host and port and the transport from its arguments:
+//
+//   novo run examples/host_long_talker.nv 127.0.0.1 2018 udp
+//
+// The transport is `tcp`, the default, or `udp`, which reaches an agent started
+// with `MicroXRCEAgent udp4 --port 2018`.
+//
+// A SAMPLE LONGER THAN ONE MESSAGE GOES OUT IN PIECES, on the reliable stream.
+// `write_sample_long` cuts it into FRAGMENT submessages of up to 504 bytes, each
+// a reliable message with a sequence number of its own and a slot of the history,
+// and the agent joins them. The history holds four messages, so one call puts
+// at most four pieces on the line, 2,016 bytes with the WRITE_DATA's front, and
+// the outcome's `at` says how much of the sample is written. The texts of 1,000
+// and 2,000 characters are one call each. The text of 2,040 is 2,045 bytes of
+// CDR and five pieces: the program polls until the agent has acknowledged some,
+// and calls again with the same `at`.
+//
+// The names and the CDR of a String are those `examples/host_listener.nv`
+// explains: the DDS topic of the ROS topic /novo_text is `rt/novo_text`, and a
+// sample is a 32-bit length that counts the closing zero, the characters and
+// the zero.
+
+use std.env
+use std.list
+use std.str
+use std.time
+use rosagent
+use rostransport
+use xrcestream
+use xrcewire
+
+// The DDS domain id the participant joins: ROS_DOMAIN_ID, 0 by default.
+const DOMAIN = 0
+
+// The four entities and the ids they are created with.
+const PARTICIPANT = 0x11
+const TOPIC = 0x12
+const PUBLISHER = 0x13
+const DATAWRITER = 0x15
+
+const TOPIC_NAME = "rt/novo_text"
+const TYPE_NAME = "std_msgs::msg::dds_::String_"
+
+fn say_status(what: Str, out: RosOutcome) [io]
+    println("${what}: code ${out.code}, agent status ${out.status} (${xrcewire.status_name(out.status)})")
+
+fn main() [net, io, time]
+    let args = env.args()
+    var host = "127.0.0.1"
+    var port = 2018
+    // args[0] is the program itself.
+    if list.len(args) > 1
+        host = args[1]
+    if list.len(args) > 2
+        port = str.to_int(args[2]) ?? 2018
+    if list.len(args) > 3 and args[3] == "udp"
+        match rosagent.connect_udp(host, port)
+            None       => println("no UDP socket for ${host}:${port}")
+            Some(link) =>
+                talk(link)
+                rosagent.disconnect_udp(link)
+    else
+        match rosagent.connect(host, port)
+            None       => println("no agent at ${host}:${port}")
+            Some(link) =>
+                talk(link)
+                rosagent.disconnect(link)
+
+// The CDR of a std_msgs/msg/String of `n` characters, which run from `a` to
+// `z` and round again: the length with the closing zero, the characters, the
+// zero.
+fn text_of(n: Int) -> Bytes
+    var xs: [Int] = []
+    for i in 0..n
+        xs = list.push(xs, 97 + i % 26)
+    bytes.concat([bytes.u32_le(n + 1), bytes.from_byte_list(xs), bytes.zeros(1)])
+
+fn talk<T: RosTransport[e]>(link: T) [e, io, time]
+    var s = rostransport.session(0xAABBCCDD, rosagent.ROS_AGENT_MTU)
+    s = rostransport.open_session(link, s, 2000)
+    println("session: ${rostransport.session_state_name(s.state)}")
+    if not rostransport.session_is_ready(s)
+        return
+
+    let participant = rostransport.create_entity(link, s, PARTICIPANT,
+        xrcewire.XRCE_KIND_PARTICIPANT, DOMAIN,
+        "<dds><participant><rtps><name>novo_long_talker</name></rtps></participant></dds>", 2000)
+    say_status("participant", participant)
+    let topic = rostransport.create_entity(link, participant.session, TOPIC,
+        xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
+        "<dds><topic><name>${TOPIC_NAME}</name><dataType>${TYPE_NAME}</dataType></topic></dds>", 2000)
+    say_status("topic", topic)
+    let publisher = rostransport.create_entity(link, topic.session, PUBLISHER,
+        xrcewire.XRCE_KIND_PUBLISHER, PARTICIPANT, "", 2000)
+    say_status("publisher", publisher)
+    let writer = rostransport.create_entity(link, publisher.session, DATAWRITER,
+        xrcewire.XRCE_KIND_DATAWRITER, PUBLISHER,
+        "<dds><data_writer><topic><kind>NO_KEY</kind><name>${TOPIC_NAME}</name><dataType>${TYPE_NAME}</dataType></topic></data_writer></dds>", 2000)
+    say_status("datawriter", writer)
+    if writer.code != 0
+        return
+
+    s = writer.session
+    var rel = xrcestream.rel_stream()
+    var hist = xrcestream.history()
+    // A pause for a subscriber to find the agent's writer before the first
+    // sample (README, "What a first sample needs").
+    time.sleep(1.0)
+    var lengths = [1000, 2000, 2040]
+    for n in lengths
+        let sample = text_of(n)
+        var at = 0
+        var calls = 0
+        var last = time.now()
+        // Write, then poll for the agent's acknowledgements, until the whole
+        // sample is out. The bound is a sample that never gets through.
+        while at < bytes.len(sample) and calls < 50
+            let out = rostransport.write_sample_long(link, s, rel, var hist, DATAWRITER,
+                                                     sample, at)
+            s = out.session
+            rel = out.stream
+            at = out.at
+            calls = calls + 1
+            println("text of ${n} characters: call ${calls}, code ${out.code}, ${out.at} of ${bytes.len(sample)} bytes written")
+            let until = time.now() + 0.3
+            while time.now() < until
+                let taken = rostransport.poll(link, s, rel, var hist, 0, 100)
+                s = taken.session
+                let now = time.now()
+                rel = rostransport.reliable_tick(link, s, taken.stream,
+                                                 ((now - last) * 1000.0) as Int)
+                last = now
+        println("  ${xrcestream.out_in_flight(rel)} unacknowledged")
+        time.sleep(1.0)
+    // Acknowledgements for the last of them.
+    let until = time.now() + 1.0
+    while time.now() < until
+        let taken = rostransport.poll(link, s, rel, var hist, 0, 100)
+        s = taken.session
+        rel = taken.stream
+    println("${xrcestream.out_in_flight(rel)} unacknowledged at the end")
+    s = rostransport.close_session(link, s)

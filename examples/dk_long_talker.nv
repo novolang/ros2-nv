@@ -1,0 +1,149 @@
+// dk_long_talker.nv — a micro-ROS node on a microcontroller that publishes
+// texts longer than one message: it opens a session with a Micro XRCE-DDS Agent
+// over the board's UART, creates a participant, the topic /novo_text of type
+// std_msgs/msg/String, a publisher and a data writer, and publishes a text of
+// 1,000 characters, then one of 2,000 and one of 2,040, every three seconds in
+// turn.
+//
+// Built for the nRF52840-DK, whose UARTE0 is the J-Link's virtual COM port, with
+// the console on the UART rather than on RTT:
+//
+//   novo build --target=nrf52840-dk --hci-uart=physical examples/dk_long_talker.nv
+//
+// and run against an agent on the PC end of that port:
+//
+//   MicroXRCEAgent serial --dev /dev/serial/by-id/usb-SEGGER_J-Link_<serial>-if00 -b 115200
+//   ros2 topic echo /novo_text std_msgs/msg/String
+//
+// The wire carries the agent's frames and nothing else, so this program prints
+// nothing. `examples/uart_stdio_long.nv` is the same code run on a PC, and its
+// header explains how the texts are cut: `rosuart.write_sample_long` writes up to
+// four FRAGMENT submessages of 504 bytes per call, and the text of 2,040 is five.
+// The sample is a `Vec[u8; 2048]`, 2,056 bytes of the stack.
+
+use rosret
+use rosuart
+use rostransport
+use xrceframe
+use xrcestream
+use xrcewire
+
+// The ids the four entities are created with.
+const PARTICIPANT = 0x11
+const TOPIC = 0x12
+const PUBLISHER = 0x13
+const DATAWRITER = 0x15
+
+// One create request, and whether the agent accepted it.
+fn created(out: rostransport.RosOutcome) -> Bool
+    out.code == 0
+
+// Open a session and create the four entities.  Answers the session,
+// established with the writer in place, or closed.
+fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                            var f: Vec[u8; 1037]) -> rostransport.RosSession [e]
+    let s = rosuart.open(u, var d, var m, var f, rostransport.session(0xAABBCCDD, 512), 1000)
+    if not rostransport.session_is_ready(s)
+        return s
+    let participant = rosuart.create(u, var d, var m, var f, s, PARTICIPANT,
+                                     xrcewire.XRCE_KIND_PARTICIPANT, 0,
+                                     "<dds><participant><rtps><name>novo_dk</name></rtps></participant></dds>",
+                                     1000)
+    let topic = rosuart.create(u, var d, var m, var f, participant.session, TOPIC,
+                               xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
+                               "<dds><topic><name>rt/novo_text</name><dataType>std_msgs::msg::dds_::String_</dataType></topic></dds>",
+                               1000)
+    let publisher = rosuart.create(u, var d, var m, var f, topic.session, PUBLISHER,
+                                   xrcewire.XRCE_KIND_PUBLISHER, PARTICIPANT, "", 1000)
+    let writer = rosuart.create(u, var d, var m, var f, publisher.session, DATAWRITER,
+                                xrcewire.XRCE_KIND_DATAWRITER, PUBLISHER,
+                                "<dds><data_writer><topic><kind>NO_KEY</kind><name>rt/novo_text</name><dataType>std_msgs::msg::dds_::String_</dataType></topic></data_writer></dds>",
+                                1000)
+    if created(participant) and created(topic) and created(publisher) and created(writer)
+        return writer.session
+    rostransport.session_with_state(writer.session, rostransport.ROS_SESSION_CLOSED)
+
+// Publish a text of `n` characters, which run from `a` to `z` and round again, as
+// a CDR string: its length with the closing zero, the characters, the zero.
+// Writes, polls for the agent's acknowledgements for 300 ms, and writes on from
+// the place the outcome gives, until the sample is all out; the bound is a
+// sample that never gets through. Then it goes on polling for `rest` rounds of
+// up to 100 ms, which is where the last acknowledgements are read and the agent is
+// pinged. Answers the session and the stream after it, and `done`.
+@tier(embedded)
+@no_alloc
+fn publish_text<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                                var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                                var sample: Vec[u8; 2048], s: rostransport.RosSession,
+                                r: xrcestream.RelStream, n: Int,
+                                rest: Int) -> rostransport.RosLongSent [e, hw]
+    sample.clear()
+    let counted = n + 1
+    let _l0 = sample.push((counted & 0xFF) as u8)
+    let _l1 = sample.push(((counted >>> 8) & 0xFF) as u8)
+    let _l2 = sample.push(0)
+    let _l3 = sample.push(0)
+    for i in 0..n
+        let _c = sample.push((97 + i % 26) as u8)
+    let _z = sample.push(0)
+    var st = s
+    var rel = r
+    var at = 0
+    var last = hal.timer.ticks_us() / 1000
+    for _try in 0..50
+        if at < sample.len()
+            let out = rosuart.write_sample_long(u, var m, var f, var h, st, rel, DATAWRITER,
+                                                var sample, at)
+            st = out.session
+            rel = out.stream
+            at = out.at
+            for _k in 0..3
+                let got = rosuart.poll(u, var d, var m, var f, var h, st, rel, 100)
+                // The time that passed, which is less than the wait when a
+                // frame came early.
+                let now = hal.timer.ticks_us() / 1000
+                rel = rosuart.reliable_tick(u, var m, var f, got.session, got.stream, now - last)
+                st = rosuart.keepalive(u, var m, var f, got.session, now - last)
+                last = now
+    for _round in 0..rest
+        let got = rosuart.poll(u, var d, var m, var f, var h, st, rel, 100)
+        let now = hal.timer.ticks_us() / 1000
+        rel = rosuart.reliable_tick(u, var m, var f, got.session, got.stream, now - last)
+        st = rosuart.keepalive(u, var m, var f, got.session, now - last)
+        last = now
+    rostransport.RosLongSent { session: st, stream: rel, code: rosret.ROS_RET_OK, at: at,
+                               done: at == sample.len(), request: 0 }
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 115200 baud, the rate the agent is told with `-b 115200`.
+    hal.uart.init(115200)
+    let u = rosuart.console_uart()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    var sample: Vec[u8; 2048] = Vec.new()
+    var rel = xrcestream.rel_stream()
+    var s = rostransport.session(0xAABBCCDD, 512)
+    var turn = 0
+    loop
+        // Without a session, try again once a second.
+        if not rostransport.session_is_ready(s)
+            s = bring_up(u, var d, var m, var f)
+            // A new session numbers its stream from 0 again.
+            rel = xrcestream.rel_stream()
+            h = xrcestream.history()
+            // Long enough for the agent's writer to find a subscriber.
+            hal.timer.delay_ms(1000)
+        else
+            var n = 1000
+            if turn % 3 == 1
+                n = 2000
+            if turn % 3 == 2
+                n = 2040
+            let out = publish_text(u, var d, var m, var f, var h, var sample, s, rel, n, 20)
+            s = out.session
+            rel = out.stream
+            turn = turn + 1

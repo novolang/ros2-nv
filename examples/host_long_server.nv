@@ -1,0 +1,226 @@
+// host_long_server.nv — a micro-ROS node on a workstation that serves two
+// services whose samples are longer than one message: it opens a session with a
+// Micro XRCE-DDS Agent over TCP or UDP, creates a participant and two repliers,
+// asks the agent for the requests, and answers each.
+//
+//   /long_reply    std_srvs/srv/Trigger          a request of one byte, a reply of
+//                                                a success flag and a text of N
+//                                                characters
+//   /long_request  rcl_interfaces/srv/GetParameters
+//                                                a request that names parameters,
+//                                                as long as the caller likes, and a
+//                                                reply of an empty list
+//
+// Run it with an agent listening, then call it from ROS 2:
+//
+//   MicroXRCEAgent tcp4 --port 2018 -v 6
+//   novo run examples/host_long_server.nv
+//   ros2 service call /long_reply std_srvs/srv/Trigger
+//   ros2 service call /long_request rcl_interfaces/srv/GetParameters "{names: ['<1,000 characters>']}"
+//
+// It takes the agent's host and port, how many seconds to serve, the transport
+// and the length of the text in the reply, from its arguments:
+//
+//   novo run examples/host_long_server.nv 127.0.0.1 2018 60 tcp 2000
+//
+// The transport is `tcp`, the default, or `udp`, which reaches an agent started
+// with `MicroXRCEAgent udp4 --port 2018`. The text is 1,000 characters by
+// default and at most 2,000.
+//
+// THE REPLY IS CUT, AND THE REQUEST IS JOINED.  A Trigger reply of 1,000
+// characters is 1,009 bytes of CDR, and with the request's identity and the front
+// of the WRITE_DATA it is three messages; `send_reply_long` writes as many as the
+// history holds and the loop below goes on from the place it says (`at`) when the
+// agent's acknowledgements have come in, which `take_request_long` and
+// `reliable_tick` read. A long request arrives in pieces too, and
+// `take_request_long` joins them in the buffer this program owns.
+//
+// THE NAMES.  A service is two DDS topics and two types, as `host_server.nv`
+// explains: `rq/long_replyRequest` carries
+// `std_srvs::srv::dds_::Trigger_Request_` and `rr/long_replyReply`
+// `std_srvs::srv::dds_::Trigger_Response_`.
+//
+// THE SAMPLES ARE CDR WRITTEN BY HAND.  A Trigger reply is a boolean, three bytes
+// of padding, and a string: its length with the closing zero, the characters and
+// the zero. A GetParameters reply is a sequence of values, and an empty one is
+// the number 0 in four bytes.
+
+use std.env
+use std.list
+use std.str
+use std.time
+use rosagent
+use rosname
+use rosret
+use rostransport
+use xrcefrag
+use xrcestream
+use xrcewire
+
+// The DDS domain id the participant joins: ROS_DOMAIN_ID, 0 by default.
+const DOMAIN = 0
+
+// The three entities and the ids they are created with.
+const PARTICIPANT = 0x11
+const TRIGGER = 0x18
+const PARAMETERS = 0x28
+
+fn say_status(what: Str, out: RosOutcome) [io]
+    println("${what}: code ${out.code}, agent status ${out.status} (${xrcewire.status_name(out.status)})")
+
+fn main() [net, io, time]
+    let args = env.args()
+    var host = "127.0.0.1"
+    var port = 2018
+    var seconds = 60
+    var chars = 1000
+    // args[0] is the program itself.
+    if list.len(args) > 1
+        host = args[1]
+    if list.len(args) > 2
+        port = str.to_int(args[2]) ?? 2018
+    if list.len(args) > 3
+        seconds = str.to_int(args[3]) ?? 60
+    if list.len(args) > 5
+        chars = str.to_int(args[5]) ?? 1000
+    if chars > 2000
+        chars = 2000
+    if list.len(args) > 4 and args[4] == "udp"
+        match rosagent.connect_udp(host, port)
+            None       => println("no UDP socket for ${host}:${port}")
+            Some(link) =>
+                serve(link, seconds, chars)
+                rosagent.disconnect_udp(link)
+    else
+        match rosagent.connect(host, port)
+            None       => println("no agent at ${host}:${port}")
+            Some(link) =>
+                serve(link, seconds, chars)
+                rosagent.disconnect(link)
+
+// The CDR of a Trigger reply: success, and a message of `n` characters that run
+// from `a` to `z` and round again.
+fn trigger_reply(n: Int) -> Bytes
+    var xs: [Int] = []
+    for i in 0..n
+        xs = list.push(xs, 97 + i % 26)
+    bytes.concat([bytes.from_byte_list([1, 0, 0, 0]), bytes.u32_le(n + 1),
+                  bytes.from_byte_list(xs), bytes.zeros(1)])
+
+// What a GetParameters request says, in a line: how many names, and the length
+// of the first.
+fn describe(request: Bytes) -> Str
+    let count = bytes.u32_le_at(request, 0) ?? 0
+    let first = (bytes.u32_le_at(request, 4) ?? 1) - 1
+    "${bytes.len(request)} bytes, ${count} name(s), the first of ${first} characters"
+
+// Create a replier for a service, and wait for its status.
+fn replier_for<T: RosTransport[e]>(link: T, s: RosSession, id: Int, service: Str, name: Str,
+                                   request_type: Str, reply_type: Str) -> RosOutcome [e, io]
+    let request_topic = rosname.dds_request_name(service)
+    let reply_topic = rosname.dds_reply_name(service)
+    let out = rostransport.create_replier(link, s, id, PARTICIPANT,
+        "<dds><replier profile_name=\"${name}\" service_name=\"${name}\" request_type=\"${request_type}\" reply_type=\"${reply_type}\"><request_topic_name>${request_topic}</request_topic_name><reply_topic_name>${reply_topic}</reply_topic_name></replier></dds>",
+        2000)
+    say_status("replier ${service}", out)
+    out
+
+fn serve<T: RosTransport[e]>(link: T, seconds: Int, chars: Int) [e, io, time]
+    var s = rostransport.session(0xAABBCCDD, rosagent.ROS_AGENT_MTU)
+    s = rostransport.open_session(link, s, 2000)
+    println("session: ${rostransport.session_state_name(s.state)}")
+    if not rostransport.session_is_ready(s)
+        return
+
+    let participant = rostransport.create_entity(link, s, PARTICIPANT,
+        xrcewire.XRCE_KIND_PARTICIPANT, DOMAIN,
+        "<dds><participant><rtps><name>novo_long_server</name></rtps></participant></dds>", 2000)
+    say_status("participant", participant)
+    let first = replier_for(link, participant.session, TRIGGER, "/long_reply", "long_reply",
+                            "std_srvs::srv::dds_::Trigger_Request_",
+                            "std_srvs::srv::dds_::Trigger_Response_")
+    let second = replier_for(link, first.session, PARAMETERS, "/long_request", "long_request",
+                             "rcl_interfaces::srv::dds_::GetParameters_Request_",
+                             "rcl_interfaces::srv::dds_::GetParameters_Response_")
+    if first.code != 0 or second.code != 0
+        return
+
+    s = second.session
+    // The requests come on the reliable stream, without a limit.
+    let asked_first = rostransport.request_data(link, s, TRIGGER, xrcewire.XRCE_STREAM_RELIABLE,
+                                                xrcewire.XRCE_SAMPLES_UNLIMITED)
+    let asked_second = rostransport.request_data(link, asked_first.session, PARAMETERS,
+                                                 xrcewire.XRCE_STREAM_RELIABLE,
+                                                 xrcewire.XRCE_SAMPLES_UNLIMITED)
+    s = asked_second.session
+    println("requests: codes ${asked_first.code} and ${asked_second.code}")
+
+    var rel = xrcestream.rel_stream()
+    var hist = xrcestream.history()
+    // The buffer a long request is joined in, and the most bytes of request the
+    // reassembly takes.
+    var joined: Vec[u8; 2048] = Vec.new()
+    var assembly = xrcefrag.reassembly(xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE)
+    // The reply being written, when one is not yet all out: the replier's id,
+    // the request's identity, the bytes and the place reached.
+    var pending = false
+    var pending_object = 0
+    var pending_identity = xrcewire.no_identity()
+    var pending_bytes = bytes.zeros(0)
+    var pending_at = 0
+    var served = 0
+    var last = time.now()
+    let end = last + seconds
+    while time.now() < end
+        // A reply not yet all written goes on first, as the history frees.
+        if pending
+            let more = rostransport.send_reply_long(link, s, rel, var hist, pending_object,
+                                                    pending_identity, pending_bytes, pending_at)
+            s = more.session
+            rel = more.stream
+            pending_at = more.at
+            pending = not more.done
+            if more.done
+                println("  reply written: ${more.at} bytes")
+        let got = rostransport.take_request_long(link, s, rel, assembly, var hist, var joined, 200)
+        s = got.session
+        rel = got.stream
+        assembly = got.assembly
+        if got.code == rosret.ROS_RET_BAD_ALLOC
+            println("a request longer than ${xrcefrag.XRCE_REASSEMBLY_MAX_SAMPLE} bytes was dropped")
+        if got.code == rosret.ROS_RET_ERROR
+            println("agent refused the request: status ${got.status} (${xrcewire.status_name(got.status)})")
+            return
+        if got.code == rosret.ROS_RET_OK and not pending
+            var reply = bytes.u32_le(0)
+            if got.object == TRIGGER
+                reply = trigger_reply(chars)
+                println("request ${served}: /long_reply, ${bytes.len(got.payload)} bytes; reply of ${chars} characters, ${bytes.len(reply)} bytes")
+            else
+                println("request ${served}: /long_request, ${describe(got.payload)}")
+            let sent = rostransport.send_reply_long(link, s, rel, var hist, got.object,
+                                                    got.identity, reply, 0)
+            s = sent.session
+            rel = sent.stream
+            println("  reply: code ${sent.code}, ${sent.at} of ${bytes.len(reply)} bytes written")
+            pending = not sent.done
+            pending_object = got.object
+            pending_identity = got.identity
+            pending_bytes = reply
+            pending_at = sent.at
+            served = served + 1
+        else if got.code == rosret.ROS_RET_OK
+            // One reply is written at a time, so a request that comes while
+            // one is going out is not answered; the caller calls again.
+            println("a request arrived while a reply was being written, and is not answered")
+        let now = time.now()
+        let elapsed = ((now - last) * 1000.0) as Int
+        rel = rostransport.reliable_tick(link, s, rel, elapsed)
+        s = rostransport.keepalive(link, s, elapsed)
+        last = now
+        if not rostransport.session_is_ready(s)
+            println("session: ${rostransport.session_state_name(s.state)}")
+            return
+    let stopped = rostransport.request_data(link, s, TRIGGER, xrcewire.XRCE_STREAM_RELIABLE, 0)
+    s = rostransport.close_session(link, stopped.session)
+    println("served ${served} request(s)")
