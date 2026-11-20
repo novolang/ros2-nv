@@ -639,6 +639,21 @@ fn test_a_write_in_pieces_is_refused_or_cut_short_where_it_should_be() [io, muta
     test.assert_eq(finish.code, rosret.ROS_RET_AGENT_UNREACHABLE)
     test.assert(finish.done)
 
+@test
+fn test_an_outcome_is_done_only_when_every_byte_is_written_and_the_pipe_took_it() [io]
+    let s = an_open_session()
+    let r = stream_at(0)
+
+    test.case("all written, with the pipe's help or without it, is done")
+    test.assert(rostransport.long_sent(s, r, rosret.ROS_RET_OK, 10, 10, 5).done)
+    test.assert(rostransport.long_sent(s, r, rosret.ROS_RET_AGENT_UNREACHABLE, 10, 10, 5).done)
+
+    test.case("some written, a full history or a refusal of the call is not")
+    test.assert(not rostransport.long_sent(s, r, rosret.ROS_RET_OK, 9, 10, 5).done)
+    test.assert(not rostransport.long_sent(s, r, rosret.ROS_RET_BAD_ALLOC, 10, 10, 0).done)
+    test.assert(not rostransport.long_sent(s, r, rosret.ROS_RET_INVALID_ARGUMENT, 10, 10, 0).done)
+    test.assert_eq(rostransport.long_sent(s, r, rosret.ROS_RET_OK, 9, 10, 5).request, 5)
+
 // ── rostransport: taking a long request or reply ─────────────────────
 
 @test
