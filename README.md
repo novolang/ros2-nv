@@ -675,6 +675,17 @@ sample that belongs to another entity, and a refused request.
 `tests/embedded_probe.nv` is the microcontroller program described
 above.
 
+`tests/interop/run.sh` is the interoperability suite. It starts a Micro
+XRCE-DDS Agent on a free port, over TCP and then over UDP, and runs
+`examples/host_talker.nv` against an rclpy subscription, an rclpy publisher
+against `examples/host_listener.nv` (an integer and a String of 1,000
+characters), `ros2 service call` against `examples/host_server.nv`, and
+`examples/host_client.nv` against an rclpy server, under ROS 2 Jazzy. It
+compares the integers, the text and the sums with what was sent and exits
+non-zero on a mismatch. The agent and ROS 2 Jazzy have to be installed;
+`tests/interop/build_agent.sh` builds the agent. `.github/workflows/interop.yml`
+runs the script on every push.
+
 ## Licence
 
 Apache-2.0.  See `LICENSE`.

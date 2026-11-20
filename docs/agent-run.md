@@ -12,6 +12,22 @@ The agent is either `MicroXRCEAgent`, eProsima's Micro XRCE-DDS Agent, or
 `micro-ros-agent`, the same agent with micro-ROS's message types built
 in. The commands below work with either; the name is the only difference.
 
+## The interop suite
+
+The dated runs below were made by hand, each with the commands it lists. The
+suite repeats the ones that cross between this package and ROS 2 on every push:
+`tests/interop/run.sh` starts a fresh agent for each leg, over TCP and over UDP,
+and checks the talker (the run of 2026-11-10), the subscription and the long
+sample (the runs of 2026-11-19) and both directions of the service (the run of
+2026-11-20, "Services"). `.github/workflows/interop.yml` runs it on Ubuntu 24.04
+with ROS 2 Jazzy, and `bash tests/interop/run.sh` runs it on a machine with the
+agent and Jazzy installed; the header of the script lists the variables it
+reads. A leg that fails is repeated with a fresh agent up to three times, for
+the reason the section "The first samples and a reader that is not there yet"
+gives, and the line of a leg that needed a second attempt says so. The serial
+legs, the lossy relay and the board runs need a pseudoterminal pair or hardware
+and are not in the suite.
+
 ## Which program, which agent
 
 | The node reaches the agent by | Program | Start the agent with |

@@ -1,0 +1,133 @@
+# interop.yml -- the interoperability suite: a node built on ros2-nv and a ROS 2
+# node, talking to each other through a Micro XRCE-DDS Agent, under ROS 2 Jazzy.
+#
+# tests/interop/run.sh does the work. It runs five legs over TCP and again over
+# UDP: examples/host_talker.nv heard by an rclpy subscription, an rclpy
+# publisher heard by examples/host_listener.nv (an integer and a String of 1,000
+# characters), `ros2 service call` answered by examples/host_server.nv, and
+# examples/host_client.nv answered by an rclpy server. This file installs what
+# the script needs and calls it.
+#
+# The runner is Ubuntu 24.04 because ROS 2 Jazzy's packages are built for it.
+# The agent is in neither Ubuntu's nor the ROS apt repository for Jazzy, so
+# tests/interop/build_agent.sh builds release v2.4.3 from source and the build is
+# cached under the script's own hash and the agent version.
+#
+# The novo toolchain comes from the STABLE channel, not a pinned version, as in
+# check.yml: the examples have to build with the compiler a user has.
+
+name: interop
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  XRCE_AGENT_VERSION: v2.4.3
+  XRCE_AGENT_PREFIX: /opt/xrce-agent
+
+jobs:
+  interop:
+    name: ROS 2 Jazzy, ${{ matrix.transport }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [tcp, udp]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: clang is new enough
+        # novo compiles through LLVM and shells out to clang; clang 14 rejects
+        # the first opaque-pointer declaration it emits.
+        run: |
+          set -eu
+          major=$(clang --version | head -1 | sed -n 's/.*[Vv]ersion \([0-9][0-9]*\)\..*/\1/p')
+          echo "clang major: $major"
+          if [ -z "$major" ] || [ "$major" -lt 16 ]; then
+            echo "::error::this runner's clang is $major; novo needs 16 or newer"
+            exit 1
+          fi
+
+      - name: Install the stable novo toolchain
+        run: |
+          set -eu
+          curl -fsSL https://novo-lang.org/releases/install.sh \
+            | NOVO_NO_MODIFY_PATH=1 sh
+          echo "$HOME/.novo/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain version
+        # Printed into the log so a failure below can be read against the
+        # release it happened on.
+        run: novo --version
+
+      - name: ROS 2 apt repository
+        # The package ROS 2's installation guide names: it adds the repository
+        # and its signing key.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y curl software-properties-common
+          sudo add-apt-repository -y universe
+          version=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+          codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+          curl -fsSL -o /tmp/ros2-apt-source.deb \
+            "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${version}/ros2-apt-source_${version}.${codename}_all.deb"
+          sudo dpkg -i /tmp/ros2-apt-source.deb
+
+      - name: ROS 2 Jazzy and the agent's build tools
+        # example_interfaces is where AddTwoInts is defined; ros-base brings
+        # rclpy, std_msgs and the ros2 command. libtinyxml2-dev is a build
+        # dependency of the agent's Fast DDS.
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y ros-jazzy-ros-base ros-jazzy-example-interfaces \
+            cmake git libtinyxml2-dev
+
+      - name: Cache of the agent
+        id: agent-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.XRCE_AGENT_PREFIX }}
+          key: xrce-agent-${{ env.XRCE_AGENT_VERSION }}-ubuntu-24.04-${{ hashFiles('tests/interop/build_agent.sh') }}
+
+      - name: Build the agent
+        if: steps.agent-cache.outputs.cache-hit != 'true'
+        # ROS 2 is not sourced in this step, so Fast DDS does not find its
+        # copy of Fast CDR and Fast DDS before the ones the agent's own build
+        # makes.
+        run: |
+          set -eu
+          sudo mkdir -p "$XRCE_AGENT_PREFIX"
+          sudo chown "$(id -u):$(id -g)" "$XRCE_AGENT_PREFIX"
+          bash tests/interop/build_agent.sh "$XRCE_AGENT_PREFIX" "$XRCE_AGENT_VERSION"
+
+      - name: Interop suite
+        env:
+          AGENT: ${{ env.XRCE_AGENT_PREFIX }}/bin/MicroXRCEAgent
+          TRANSPORTS: ${{ matrix.transport }}
+        run: bash tests/interop/run.sh
+
+      - name: Logs of the run
+        if: failure()
+        # run.sh keeps the logs of a failed run in a directory under TMPDIR.
+        run: |
+          for d in "${TMPDIR:-/tmp}"/ros2-nv-interop.*; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*/*.log; do
+              echo "::group::$f"
+              tail -n 60 "$f"
+              echo "::endgroup::"
+            done
+          done
