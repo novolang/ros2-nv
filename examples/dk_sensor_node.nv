@@ -1,10 +1,11 @@
 // dk_sensor_node.nv — a micro-ROS node on the nRF52840-DK that publishes
-// the chip's die temperature and takes a command for its LEDs.
+// the chip's die temperature, takes a command for its LEDs and adds two
+// numbers on request.
 //
 // It opens a session with a Micro XRCE-DDS Agent over the board's UART,
-// creates a participant, two topics, a publisher with a data writer and a
-// subscriber with a data reader, and then does two things in one loop:
-//
+// creates a participant, two topics, a publisher with a data writer, a
+// subscriber with a data reader and a replier, and then does three things in
+// one loop:
 //   /dk/temperature  std_msgs/msg/Int32  out, once a second: the die
 //                    temperature of the nRF52840's TEMP peripheral in
 //                    hundredths of a degree Celsius, 2,550 for 25.50 C.
@@ -25,13 +26,17 @@
 //   MicroXRCEAgent serial --dev /dev/serial/by-id/usb-SEGGER_J-Link_<serial>-if00 -b 115200
 //   ros2 topic echo /dk/temperature std_msgs/msg/Int32
 //   ros2 topic pub --once /dk/led std_msgs/msg/Int32 "{data: 2}"
+//   ros2 service call /dk/add_two_ints example_interfaces/srv/AddTwoInts "{a: 2, b: 3}"
 //
 // The wire carries the agent's frames and nothing else, so this program
 // prints nothing.
 //
 // The names are the ones `examples/host_talker.nv` explains: the DDS topic
 // of the ROS topic /dk/temperature is `rt/dk/temperature`, and the DDS type
-// of std_msgs/msg/Int32 is `std_msgs::msg::dds_::Int32_`.
+// of std_msgs/msg/Int32 is `std_msgs::msg::dds_::Int32_`. The service
+// /dk/add_two_ints is the DDS topic `rq/dk/add_two_intsRequest` carrying
+// `example_interfaces::srv::dds_::AddTwoInts_Request_` and the topic
+// `rr/dk/add_two_intsReply` carrying `AddTwoInts_Response_`.
 //
 // WHY INT32 AND NOT FLOAT32.  `rosuart` publishes an Int32 sample
 // (`publish_i32`) and reads one (`xrcewire.sample_i32`), and nothing in the
@@ -60,6 +65,8 @@ const SUBSCRIBER = 0x14
 const DATAWRITER = 0x15
 const DATAREADER = 0x16
 const TOPIC_LED = 0x22
+// Id 1 of the kind replier.
+const REPLIER = 0x18
 
 // The TEMP peripheral of the nRF52840.
 const TEMP_TASKS_START = 0x4000C000
@@ -117,8 +124,23 @@ fn set_leds(cmd: Int) [hw]
         hal.gpio.set(bsp.board.led3(), led_level(cmd, 3))
         hal.gpio.set(bsp.board.led4(), led_level(cmd, 4))
 
-// Open a session and create the seven entities. Answers the session,
-// established with the writer and the reader in place, or closed.
+// Answer one request of /dk/add_two_ints, which `m` holds at `request.start`:
+// two 64-bit integers, and the reply is their sum. `p` is the buffer the reply
+// is built in.
+@tier(embedded)
+@no_alloc
+fn answer<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                          var p: Vec[u8; 512], s: rostransport.RosSession,
+                          r: xrcestream.RelStream,
+                          request: xrcewire.XrceRequest) -> rostransport.RosRelOutcome [e]
+    let a = xrcewire.i64_at(var m, request.start)
+    let b = xrcewire.i64_at(var m, request.start + 8)
+    p.clear()
+    let _ = xrcewire.put_sample_i64(var p, a + b, 0)
+    rosuart.send_reply(u, var m, var f, var h, s, r, REPLIER, request.identity, var p)
+
+// Open a session and create the eight entities. Answers the session,
+// established with the writer, the reader and the replier in place, or closed.
 @tier(embedded)
 @no_alloc
 fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
@@ -150,15 +172,23 @@ fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 
                                 xrcewire.XRCE_KIND_DATAREADER, SUBSCRIBER,
                                 "<dds><data_reader><topic><kind>NO_KEY</kind><name>rt/dk/led</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></data_reader></dds>",
                                 1000)
+    let replier = rosuart.create_replier(u, var d, var m, var f, reader.session, REPLIER,
+                                         PARTICIPANT,
+                                         "<dds><replier profile_name=\"dk_add_two_ints\" service_name=\"dk/add_two_ints\" request_type=\"example_interfaces::srv::dds_::AddTwoInts_Request_\" reply_type=\"example_interfaces::srv::dds_::AddTwoInts_Response_\"><request_topic_name>rq/dk/add_two_intsRequest</request_topic_name><reply_topic_name>rr/dk/add_two_intsReply</reply_topic_name></replier></dds>",
+                                         1000)
     if created(participant) and created(temperature) and created(led) and created(publisher)
-       and created(writer) and created(subscriber) and created(reader)
+       and created(writer) and created(subscriber) and created(reader) and created(replier)
         // Ask for the commands, without a limit and on the best-effort
-        // stream.
-        let asked = rosuart.request_data(u, var m, var f, reader.session, DATAREADER,
+        // stream, and for the requests, without a limit and on the reliable
+        // one.
+        let asked = rosuart.request_data(u, var m, var f, replier.session, DATAREADER,
                                          xrcewire.XRCE_STREAM_BEST_EFFORT,
                                          xrcewire.XRCE_SAMPLES_UNLIMITED)
-        return asked.session
-    rostransport.session_with_state(reader.session, rostransport.ROS_SESSION_CLOSED)
+        let served = rosuart.request_data(u, var m, var f, asked.session, REPLIER,
+                                          xrcewire.XRCE_STREAM_RELIABLE,
+                                          xrcewire.XRCE_SAMPLES_UNLIMITED)
+        return served.session
+    rostransport.session_with_state(replier.session, rostransport.ROS_SESSION_CLOSED)
 
 @tier(rt)
 fn main() [hw]
@@ -176,6 +206,7 @@ fn main() [hw]
     var m: Vec[u8; 512] = Vec.new()
     var f: Vec[u8; 1037] = Vec.new()
     var h = xrcestream.history()
+    var p: Vec[u8; 512] = Vec.new()
     var rel = xrcestream.rel_stream()
     var s = rostransport.session(0xAABBCCDD, 512)
     var last_sample = hal.timer.ticks_us() / 1000
@@ -186,16 +217,26 @@ fn main() [hw]
         // library's.
         if not rostransport.session_is_ready(s)
             s = bring_up(u, var d, var m, var f)
+            // A new session is a new stream: the agent numbers from 0 again.
+            rel = xrcestream.rel_stream()
+            h = xrcestream.history()
             hal.timer.delay_ms(1000)
             last_sample = hal.timer.ticks_us() / 1000
             last_turn = last_sample
         else
-            // A command, if one arrives within 20 ms.
+            // A command or a request, if one arrives within 20 ms. A request
+            // is a sample of the replier, a command one of the data reader.
             let got = rosuart.poll(u, var d, var m, var f, var h, s, rel, 20)
             s = got.session
             rel = got.stream
             if got.code == 0
-                set_leds(xrcewire.sample_i32(var m, got.sample))
+                let request = xrcewire.request_of(var m, got.sample)
+                if request.found
+                    let sent = answer(u, var m, var f, var h, var p, s, rel, request)
+                    s = sent.session
+                    rel = sent.stream
+                else
+                    set_leds(xrcewire.sample_i32(var m, got.sample))
             let now = hal.timer.ticks_us() / 1000
             if now - last_sample >= PERIOD_MS
                 let out = rosuart.publish_i32(u, var m, var f, s, DATAWRITER, die_temperature())
@@ -203,6 +244,9 @@ fn main() [hw]
                 last_sample = last_sample + PERIOD_MS
             // The silence is counted in the time that passed. A restarted
             // agent is noticed here, and nowhere else: the session becomes
-            // lost and the next turn opens a new one.
+            // lost and the next turn opens a new one. The reliable stream
+            // counts the same time, and announces a reply the agent has not
+            // acknowledged.
+            rel = rosuart.reliable_tick(u, var m, var f, s, rel, now - last_turn)
             s = rosuart.keepalive(u, var m, var f, s, now - last_turn)
             last_turn = now

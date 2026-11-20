@@ -1,0 +1,113 @@
+// uart_stdio_server.nv — the device's service server, run on a PC.
+//
+// The serving counterpart of `uart_stdio.nv` and `uart_stdio_listener.nv`:
+// the same device code (`ConsoleUart`, the serial framing, `rosuart`), with a
+// host `main`. On a host `hal.uart` is the process's standard input and
+// output, so give those two descriptors a serial line to an agent and the
+// agent sees the framed bytes a board's UART would send:
+//
+//   socat pty,raw,echo=0,link=ttyAGENT pty,raw,echo=0,link=ttyBOARD
+//   MicroXRCEAgent serial --dev ttyAGENT -b 115200 -v 6
+//   novo build examples/uart_stdio_server.nv -o uart_stdio_server
+//   ./uart_stdio_server 40 <>ttyBOARD >&0
+//   ros2 service call /add_two_ints example_interfaces/srv/AddTwoInts "{a: 2, b: 3}"
+//
+// The argument is how many seconds to serve, 30 by default.
+//
+// The service is /add_two_ints of `examples/host_server.nv`, with the same
+// names and the same hand-written CDR: a request is two 64-bit integers, a
+// reply one. Nothing here allocates. The request is read in place in the
+// message buffer with `xrcewire.i64_at`, and the reply is built in a buffer of
+// its own with `xrcewire.put_sample_i64`.
+//
+// Nothing may print to standard output, because the agent would read it as
+// bytes; the program reports on standard error.
+
+use std.env
+use std.str
+use std.time
+use rosret
+use rosuart
+use rostransport
+use xrceframe
+use xrcestream
+use xrcewire
+
+// The ids the two entities are created with: id 1 of the kind participant, and
+// id 1 of the kind replier.
+const PARTICIPANT = 0x11
+const REPLIER = 0x18
+
+// One create request, and whether the agent accepted it.
+fn created(out: rostransport.RosOutcome) -> Bool
+    out.code == 0
+
+// Open a session and create the participant and the replier. Answers the
+// session, established with the replier in place, or closed.
+fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                            var f: Vec[u8; 1037]) -> rostransport.RosSession [e]
+    let s = rosuart.open(u, var d, var m, var f, rostransport.session(0xAABBCCDD, 512), 1000)
+    if not rostransport.session_is_ready(s)
+        return s
+    let participant = rosuart.create(u, var d, var m, var f, s, PARTICIPANT,
+                                     xrcewire.XRCE_KIND_PARTICIPANT, 0,
+                                     "<dds><participant><rtps><name>novo_dk</name></rtps></participant></dds>",
+                                     1000)
+    let replier = rosuart.create_replier(u, var d, var m, var f, participant.session, REPLIER,
+                                         PARTICIPANT,
+                                         "<dds><replier profile_name=\"dk_add_two_ints\" service_name=\"add_two_ints\" request_type=\"example_interfaces::srv::dds_::AddTwoInts_Request_\" reply_type=\"example_interfaces::srv::dds_::AddTwoInts_Response_\"><request_topic_name>rq/add_two_intsRequest</request_topic_name><reply_topic_name>rr/add_two_intsReply</reply_topic_name></replier></dds>",
+                                         1000)
+    if created(participant) and created(replier)
+        return replier.session
+    rostransport.session_with_state(replier.session, rostransport.ROS_SESSION_CLOSED)
+
+fn main() [hw, io, time]
+    let args = env.args()
+    var seconds = 30
+    // args[0] is the program itself.
+    if list.len(args) > 1
+        seconds = str.to_int(args[1]) ?? 30
+    let u = rosuart.console_uart()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    var p: Vec[u8; 512] = Vec.new()
+    var rel = xrcestream.rel_stream()
+    var s = bring_up(u, var d, var m, var f)
+    if not rostransport.session_is_ready(s)
+        eprintln("no session: the agent did not answer, or refused an entity")
+        return
+    // The requests come on the reliable stream, without a limit.
+    let asked = rosuart.request_data(u, var m, var f, s, REPLIER, xrcewire.XRCE_STREAM_RELIABLE,
+                                     xrcewire.XRCE_SAMPLES_UNLIMITED)
+    s = asked.session
+    var served = 0
+    var last = time.now()
+    let end = last + seconds
+    while time.now() < end
+        let got = rosuart.take_request(u, var d, var m, var f, var h, s, rel, 200)
+        s = got.session
+        rel = got.stream
+        if got.code == rosret.ROS_RET_ERROR
+            eprintln("agent refused the request: status ${got.status}")
+            return
+        if got.code == rosret.ROS_RET_OK
+            let a = xrcewire.i64_at(var m, got.request.start)
+            let b = xrcewire.i64_at(var m, got.request.start + 8)
+            p.clear()
+            let _ = xrcewire.put_sample_i64(var p, a + b, 0)
+            let sent = rosuart.send_reply(u, var m, var f, var h, s, rel, REPLIER,
+                                          got.request.identity, var p)
+            s = sent.session
+            rel = sent.stream
+            eprintln("request ${served}: ${a} + ${b} = ${a + b}, reply code ${sent.code}")
+            served = served + 1
+        // The silence and the reliable stream's quiet are counted in the time
+        // that passed, which is less than the wait when a frame came early.
+        let now = time.now()
+        let elapsed = ((now - last) * 1000.0) as Int
+        rel = rosuart.reliable_tick(u, var m, var f, s, rel, elapsed)
+        s = rosuart.keepalive(u, var m, var f, s, elapsed)
+        last = now
+    eprintln("served ${served} request(s), silence ${s.silent_ms} ms")

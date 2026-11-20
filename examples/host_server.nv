@@ -1,0 +1,152 @@
+// host_server.nv — a micro-ROS node on a workstation that serves a service:
+// it opens a session with a Micro XRCE-DDS Agent over TCP or UDP, creates a
+// participant and a replier for /add_two_ints (example_interfaces/srv/
+// AddTwoInts), asks the agent for the requests, and answers each with the sum.
+//
+// Run it with an agent listening, then call it from ROS 2:
+//
+//   MicroXRCEAgent tcp4 --port 2018 -v 6
+//   novo run examples/host_server.nv
+//   ros2 service call /add_two_ints example_interfaces/srv/AddTwoInts "{a: 2, b: 3}"
+//
+// It takes the agent's host and port, how many seconds to serve and the
+// transport, from its arguments:
+//
+//   novo run examples/host_server.nv 127.0.0.1 2018 60 tcp
+//
+// The transport is `tcp`, the default, or `udp`, which reaches an agent started
+// with `MicroXRCEAgent udp4 --port 2018`.
+//
+// THE NAMES.  A service is two DDS topics and two types.  The ROS service
+// /add_two_ints is the topic `rq/add_two_intsRequest` carrying
+// `example_interfaces::srv::dds_::AddTwoInts_Request_` and the topic
+// `rr/add_two_intsReply` carrying `example_interfaces::srv::dds_::
+// AddTwoInts_Response_`; `rosname.dds_request_name` and `dds_reply_name` build
+// the topic names.  The replier's XML carries all four.
+//
+// THE SAMPLES ARE CDR WRITTEN BY HAND.  AddTwoInts is `int64 a`, `int64 b`
+// and, in the response, `int64 sum`, so a request is sixteen bytes and a reply
+// eight, each number least significant byte first with no padding, because
+// every field is already at a multiple of eight.  The agent puts the
+// representation header in front of both.
+//
+// THE LOOP IS THE REPLIER'S.  `take_request` takes one message, which is a
+// request or nothing; the request's `identity` is what `send_reply` has to
+// carry back, because it is what the client that asked finds its answer by.
+// The requests come on the reliable stream, so the program spends its waits
+// in `take_request` and `reliable_tick`, which read the acknowledgements and
+// repeat what the agent did not get.
+
+use std.env
+use std.str
+use std.time
+use rosagent
+use rosname
+use rosret
+use rostransport
+use xrcestream
+use xrcewire
+
+// The DDS domain id the participant joins: ROS_DOMAIN_ID, 0 by default.
+const DOMAIN = 0
+
+// The two entities and the ids they are created with: id 1 of the kind
+// participant, and id 1 of the kind replier.
+const PARTICIPANT = 0x11
+const REPLIER = 0x18
+
+const SERVICE = "/add_two_ints"
+const REQUEST_TYPE = "example_interfaces::srv::dds_::AddTwoInts_Request_"
+const REPLY_TYPE = "example_interfaces::srv::dds_::AddTwoInts_Response_"
+
+fn say_status(what: Str, out: RosOutcome) [io]
+    println("${what}: code ${out.code}, agent status ${out.status} (${xrcewire.status_name(out.status)})")
+
+fn main() [net, io, time]
+    let args = env.args()
+    var host = "127.0.0.1"
+    var port = 2018
+    var seconds = 60
+    // args[0] is the program itself.
+    if list.len(args) > 1
+        host = args[1]
+    if list.len(args) > 2
+        port = str.to_int(args[2]) ?? 2018
+    if list.len(args) > 3
+        seconds = str.to_int(args[3]) ?? 60
+    if list.len(args) > 4 and args[4] == "udp"
+        match rosagent.connect_udp(host, port)
+            None       => println("no UDP socket for ${host}:${port}")
+            Some(link) =>
+                serve(link, seconds)
+                rosagent.disconnect_udp(link)
+    else
+        match rosagent.connect(host, port)
+            None       => println("no agent at ${host}:${port}")
+            Some(link) =>
+                serve(link, seconds)
+                rosagent.disconnect(link)
+
+// The signed 64-bit integer at byte `at` of a request.
+fn i64_of(payload: Bytes, at: Int) -> Int
+    bytes.u64_le_at(payload, at) ?? 0
+
+fn serve<T: RosTransport[e]>(link: T, seconds: Int) [e, io, time]
+    var s = rostransport.session(0xAABBCCDD, rosagent.ROS_AGENT_MTU)
+    s = rostransport.open_session(link, s, 2000)
+    println("session: ${rostransport.session_state_name(s.state)}")
+    if not rostransport.session_is_ready(s)
+        return
+
+    let participant = rostransport.create_entity(link, s, PARTICIPANT,
+        xrcewire.XRCE_KIND_PARTICIPANT, DOMAIN,
+        "<dds><participant><rtps><name>novo_server</name></rtps></participant></dds>", 2000)
+    say_status("participant", participant)
+    let request_topic = rosname.dds_request_name(SERVICE)
+    let reply_topic = rosname.dds_reply_name(SERVICE)
+    let replier = rostransport.create_replier(link, participant.session, REPLIER, PARTICIPANT,
+        "<dds><replier profile_name=\"novo_add_two_ints\" service_name=\"add_two_ints\" request_type=\"${REQUEST_TYPE}\" reply_type=\"${REPLY_TYPE}\"><request_topic_name>${request_topic}</request_topic_name><reply_topic_name>${reply_topic}</reply_topic_name></replier></dds>",
+        2000)
+    say_status("replier", replier)
+    if replier.code != 0
+        return
+
+    s = replier.session
+    // The requests come on the reliable stream, without a limit.
+    let asked = rostransport.request_data(link, s, REPLIER, xrcewire.XRCE_STREAM_RELIABLE,
+                                          xrcewire.XRCE_SAMPLES_UNLIMITED)
+    s = asked.session
+    println("request: code ${asked.code}")
+
+    var rel = xrcestream.rel_stream()
+    var hist = xrcestream.history()
+    var served = 0
+    var last = time.now()
+    let end = last + seconds
+    while time.now() < end
+        let got = rostransport.take_request(link, s, rel, var hist, 200)
+        s = got.session
+        rel = got.stream
+        if got.code == rosret.ROS_RET_ERROR
+            println("agent refused the request: status ${got.status} (${xrcewire.status_name(got.status)})")
+            return
+        if got.code == rosret.ROS_RET_OK
+            let a = i64_of(got.payload, 0)
+            let b = i64_of(got.payload, 8)
+            let sent = rostransport.send_reply(link, s, rel, var hist, REPLIER, got.identity,
+                                               bytes.u64_le(a + b))
+            s = sent.session
+            rel = sent.stream
+            println("request ${served}: ${a} + ${b} = ${a + b}, reply code ${sent.code}")
+            served = served + 1
+        let now = time.now()
+        let elapsed = ((now - last) * 1000.0) as Int
+        rel = rostransport.reliable_tick(link, s, rel, elapsed)
+        s = rostransport.keepalive(link, s, elapsed)
+        last = now
+        if not rostransport.session_is_ready(s)
+            println("session: ${rostransport.session_state_name(s.state)}")
+            return
+    let stopped = rostransport.request_data(link, s, REPLIER, xrcewire.XRCE_STREAM_RELIABLE, 0)
+    s = rostransport.close_session(link, stopped.session)
+    println("served ${served} request(s)")
