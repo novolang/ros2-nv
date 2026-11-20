@@ -307,6 +307,49 @@ fn service_score() -> Int
         n = n + 1
     n
 
+// A sample cut into pieces and written: the FRAGMENT built and finished, the
+// pieces of 700 bytes and of a reply, the history that keeps them, and the
+// place a second call goes on from.  Six checks.
+@tier(embedded)
+@no_alloc
+fn long_score() -> Int
+    var n = 0
+    var m: Vec[u8; 512] = Vec.new()
+    if xrcewire.begin_fragment(var m, 3) and xrcewire.put_write_front(var m, 700, 5, 0x15)
+        and m.len() == 16 and xrcefrag.piece_room(var m) == 496
+        n = n + 1
+    if xrcewire.finish_fragment(var m, true) == 8 and m[5] == 3 and m[6] == 8
+        n = n + 1
+
+    let u = EmptyUart { id: 1 }
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    let up = rostransport.session_established(rostransport.session(1, 512),
+                                              xrcewire.XRCE_SESSION_ID)
+    var payload: Vec[u8; 2048] = Vec.new()
+    for k in 0..700
+        let _p = payload.push((k % 251) as u8)
+    let w = rosuart.write_sample_long(u, var m, var f, var h, up, xrcestream.rel_stream(), 0x15,
+                                      var payload, 0)
+    if w.code == rosret.ROS_RET_OK and w.done and w.at == 700
+        n = n + 1
+    if xrcestream.out_in_flight(w.stream) == 2 and w.request == 1
+        n = n + 1
+
+    // A sample the window cannot hold at once is written as far as it goes.
+    for k in 700..2040
+        let _q = payload.push((k % 251) as u8)
+    var h2 = xrcestream.history()
+    let part = rosuart.send_reply_long(u, var m, var f, var h2, up, xrcestream.rel_stream(), 0x18,
+                                       xrcewire.no_identity(), var payload, 0)
+    if not part.done and part.at == 1984
+        n = n + 1
+    let blocked = rosuart.send_request_long(u, var m, var f, var h2, up, part.stream, 0x17,
+                                            var payload, part.at)
+    if blocked.code == rosret.ROS_RET_BAD_ALLOC
+        n = n + 1
+    n
+
 // The agent's DATA carrying the integer 7, as recorded.
 const A_DATA = [0x81, 0x01, 0x04, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16,
                 0x07, 0x00, 0x00, 0x00]
@@ -569,16 +612,16 @@ fn score() -> Int
     if rosexec.spin_wait_ms(rosexec.set_timeout(e, 100), early) == 60
         n = n + 1
 
-    n + wire_score() + stream_score() + frag_score() + service_score()
+    n + wire_score() + stream_score() + frag_score() + service_score() + long_score()
 
 @tier(rt)
 fn main() [hw]
     bsp.board.init()
-    // 121 is the number of checks in `score`, `wire_score`, `stream_score`, `frag_score` and `service_score`.  The count is printed on a
+    // 135 is the number of checks in `score`, `wire_score`, `stream_score`, `frag_score`, `service_score` and `long_score`.  The count is printed on a
     // failure rather than only compared, so a device that disagrees with
     // the host says HOW MANY it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 129
+    if n == 135
         hal.uart.write("PASS: ros2-embedded\n")
     else
         hal.uart.write("FAIL: ros2-embedded score=")

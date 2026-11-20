@@ -1,5 +1,5 @@
 // xrcefrag.nv: a sample longer than one message, joined from the FRAGMENT
-// submessages the agent sends it in.
+// submessages the agent sends it in, and cut into the same pieces to be sent.
 //
 // `[]` THROUGHOUT and `@tier(embedded)` on all of it, with no allocation.
 // The pieces are joined in a `Vec[u8; XRCE_REASSEMBLY_BYTES]` that the caller
@@ -38,6 +38,23 @@
 // stays in the buffer for the caller to read, and `begin`, which every poll
 // calls first, clears it.
 //
+// THE OTHER DIRECTION IS CUT, NOT JOINED.  A sample a node writes that does not
+// fit one message goes out as the same run of messages on the reliable
+// stream, each holding one FRAGMENT whose bytes are the next piece of the
+// WRITE_DATA, header included, and the last with bit 1 of its flags set
+// (`piece_begin` starts a piece and `xrcewire.finish_fragment` ends it; the
+// session modules loop).  Each piece takes a sequence number and a slot of
+// the history, so the HEARTBEAT and the ACKNACK cover it as they cover a
+// whole message.  A piece holds up to `XRCE_PIECE_BYTES` and the history holds
+// `xrcestream.XRCE_HISTORY` messages, so a write puts at most four pieces on
+// the line before the agent acknowledges one: 2,016 bytes of WRITE_DATA, a
+// sample of 2,008.  A longer sample is written in turns, with the caller's
+// `at` saying how far it got.  The history is not grown, so a node that
+// writes long samples pays no RAM for it; what it pays is one wait for an
+// acknowledgement, a HEARTBEAT period, in the middle of a sample longer
+// than 2,008 bytes.  The largest sample is `XRCE_LONG_MAX_SAMPLE`, 2,048,
+// the size of the buffer a device holds it in.
+//
 // WHAT IT DOES NOT DO.  The agent can give up on messages it no longer
 // holds, and a HEARTBEAT that says so moves the input side past them
 // (`xrcestream.in_heartbeat`).  If that falls in the middle of a sample the
@@ -56,6 +73,14 @@ pub const XRCE_REASSEMBLY_BYTES = 2048
 // The largest sample a buffer holds: 2040, the buffer less the eight bytes
 // in front of the sample.
 pub const XRCE_REASSEMBLY_MAX_SAMPLE = 2040
+
+// The most bytes of one piece: 504, the message's 512 less the message header
+// (4) and the FRAGMENT's submessage header (4).
+pub const XRCE_PIECE_BYTES = 504
+
+// The largest sample a node writes in pieces: 2048, the size of the buffer a
+// device holds it in. A longer one is refused with `ROS_RET_INVALID_ARGUMENT`.
+pub const XRCE_LONG_MAX_SAMPLE = 2048
 
 // The bytes in front of a sample in a DATA: the submessage header (4) and
 // the request id and the object id (2 each).
@@ -242,3 +267,48 @@ fn push(var m: Vec[u8; 512], state: FragState, var a: Vec[u8; 2048]) -> FragEven
         return event(state, FRAG_BAD)
     FragEvent { assembly: FragState { limit: state.limit, dropping: false, finished: true },
                 code: FRAG_DONE, sample: sample }
+
+// ── Writing in pieces ────────────────────────────────────────────────
+
+// Start the message of the next piece of a sample, and answer whether it
+// fitted.
+//
+// `seq` is the sequence number the message takes and `at` how many bytes of
+// the sample are already written; `length` is the sample's length, `request`
+// the id of the write and `object` the writer's, or for a reply the replier's.
+// A piece at `at` 0 is the first, and begins with the WRITE_DATA's front, for a
+// reply with `reply` true and the request's `identity` after the ids (see
+// `xrcewire.put_write_front`); any other piece is sample bytes alone. The
+// caller appends `xrcefrag.piece_room` bytes at most, and ends the message with
+// `xrcewire.finish_fragment`, naming the piece last when it wrote the rest.
+pub @tier(embedded)
+@no_alloc
+fn piece_begin(var m: Vec[u8; 512], seq: Int, at: Int, length: Int, request: Int, object: Int,
+               reply: Bool, identity: xrcewire.XrceIdentity) -> Bool []
+    var ok = xrcewire.begin_fragment(var m, seq)
+    if at > 0
+        return ok
+    if reply
+        return ok and xrcewire.put_reply_front(var m, length, request, object, identity)
+    ok and xrcewire.put_write_front(var m, length, request, object)
+
+// How many more bytes a piece message takes.
+pub @tier(embedded)
+@no_alloc
+fn piece_room(var m: Vec[u8; 512]) -> Int []
+    512 - m.len()
+
+// Copy the first `n` bytes of the joined sample into `m`, replacing what it
+// held, or all of them when there are fewer. Answers how many were copied.
+//
+// A request's identity and a reply's request id are read out of the first
+// bytes of a sample by `xrcewire.request_of` and `xrcewire.response_of`, which
+// read a message, so a long sample's first bytes are put in one to be read.
+pub @tier(embedded)
+@no_alloc
+fn copy_head(var a: Vec[u8; 2048], var m: Vec[u8; 512], n: Int) -> Int []
+    m.clear()
+    for i in 0..n
+        if i < a.len()
+            let _ = m.push(a[i])
+    m.len()

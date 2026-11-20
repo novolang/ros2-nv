@@ -558,6 +558,60 @@ fn finish_write_data(var m: Vec[u8; 512]) -> Int []
     m[7] = ((length >>> 8) & 0xFF) as u8
     length
 
+// ── A write cut into pieces ──────────────────────────────────────────
+
+// Start a message that holds one FRAGMENT of the reliable stream, replacing
+// what `m` held.
+//
+// The message header, with the reliable stream and the sequence number `seq`,
+// and a FRAGMENT's submessage header with no length and no flags but the byte
+// order. The caller appends the piece's bytes with `put_sample_byte` and
+// finishes with `finish_fragment`. This is how the eProsima client sends a
+// WRITE_DATA that does not fit one message (Micro-XRCE-DDS-Client,
+// `uxr_prepare_reliable_buffer_to_write`): the WRITE_DATA's own submessage
+// header, with the length of the whole, is the first bytes of the first
+// piece, and the pieces joined are the submessage.
+pub @tier(embedded)
+@no_alloc
+fn begin_fragment(var m: Vec[u8; 512], seq: Int) -> Bool []
+    m.clear()
+    put_message_header(var m, XRCE_SESSION_ID, XRCE_STREAM_RELIABLE, seq)
+        and put_submessage_header(var m, XRCE_SUB_FRAGMENT, 0, 0)
+
+// Fix the length of a FRAGMENT after its piece is in, and mark the last piece.
+//
+// Answers the submessage's length, the piece's bytes.
+pub @tier(embedded)
+@no_alloc
+fn finish_fragment(var m: Vec[u8; 512], last: Bool) -> Int []
+    let length = m.len() - 8
+    m[6] = (length & 0xFF) as u8
+    m[7] = ((length >>> 8) & 0xFF) as u8
+    if last
+        m[5] = ((m[5] as Int) | XRCE_FLAG_LAST_FRAGMENT) as u8
+    length
+
+// Append the front of a WRITE_DATA for a sample of `sample_length` bytes: the
+// submessage header, whose length is the whole submessage's, and the request
+// and object ids. The sample's bytes follow, in this piece and in the pieces
+// after it.
+pub @tier(embedded)
+@no_alloc
+fn put_write_front(var m: Vec[u8; 512], sample_length: Int, request: Int, writer: Int) -> Bool []
+    put_submessage_header(var m, XRCE_SUB_WRITE_DATA, 0, 4 + sample_length)
+        and put_object(var m, request) and put_object(var m, writer)
+
+// Append the front of a WRITE_DATA that writes a reply: as `put_write_front`,
+// and then the sample identity of the request it answers.
+pub @tier(embedded)
+@no_alloc
+fn put_reply_front(var m: Vec[u8; 512], sample_length: Int, request: Int, replier: Int,
+                   identity: XrceIdentity) -> Bool []
+    put_submessage_header(var m, XRCE_SUB_WRITE_DATA, 0,
+                          4 + XRCE_IDENTITY_BYTES + sample_length)
+        and put_object(var m, request) and put_object(var m, replier)
+        and put_identity(var m, identity)
+
 // The sample identity of a request: the writer GUID and the sequence number
 // DDS gave it, as six little-endian 32-bit words.
 //

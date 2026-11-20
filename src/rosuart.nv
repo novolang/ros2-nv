@@ -743,3 +743,227 @@ fn take_request<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[
         code = rosret.ROS_RET_SERVICE_TAKE_FAILED
     RosRequestPoll { session: got.session, stream: got.stream, code: code, status: got.status,
                      sample: got.sample, request: request }
+
+// ── Samples longer than one message ──────────────────────────────────
+
+// Write the bytes of `payload` from `at` on as pieces of a WRITE_DATA, as many
+// as the history has room for.
+//
+// The rules are those of `rostransport.write_in_pieces`. The sample is the
+// caller's `Vec[u8; 2048]`, which holds `xrcefrag.XRCE_LONG_MAX_SAMPLE` bytes
+// and so cannot be longer than the largest sample; `m` is the scratch each
+// message is built in, and `f` the frame.
+@tier(embedded)
+@no_alloc
+fn write_in_pieces<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                                   var h: Vec[u8; 2056], s: rostransport.RosSession,
+                                   r: xrcestream.RelStream, object: Int, reply: Bool,
+                                   identity: xrcewire.XrceIdentity, var payload: Vec[u8; 2048],
+                                   at: Int) -> rostransport.RosLongSent [e]
+    let length = payload.len()
+    if not rostransport.session_is_ready(s)
+        return rostransport.long_sent(s, r, rosret.ROS_RET_NOT_INIT, at, length, 0)
+    if at < 0 or at > length
+        return rostransport.long_sent(s, r, rosret.ROS_RET_INVALID_ARGUMENT, at, length, 0)
+    var front = xrcewire.XRCE_SAMPLE_START
+    if reply
+        front = xrcewire.XRCE_REPLY_START
+    if at == 0 and front + length <= 512
+        // One message, built as `send_request` and `send_reply` build it.
+        if not xrcestream.out_can_write(r)
+            return rostransport.long_sent(s, r, rosret.ROS_RET_BAD_ALLOC, 0, length, 0)
+        let request = s.next_request
+        let sent = rostransport.session_next_request(s)
+        if reply
+            let _begun = xrcewire.begin_write_reply(var m, xrcewire.XRCE_STREAM_RELIABLE,
+                                                    r.out_next, request, object, identity)
+        else
+            let _begun = xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_RELIABLE,
+                                                   r.out_next, request, object)
+        for i in 0..length
+            let _put = xrcewire.put_sample_byte(var m, payload[i] as Int)
+        let _len = xrcewire.finish_write_data(var m)
+        let _kept = xrcestream.history_store(var h, r.out_next, var m)
+        let after = xrcestream.out_wrote(r)
+        if not send(u, var m, var f)
+            return rostransport.long_sent(sent, after, rosret.ROS_RET_AGENT_UNREACHABLE, length,
+                                          length, request)
+        return rostransport.long_sent(sent, after, rosret.ROS_RET_OK, length, length, request)
+    var sess = s
+    var st = r
+    var pos = at
+    var request = 0
+    var code = rosret.ROS_RET_OK
+    if pos < length and not xrcestream.out_can_write(st)
+        code = rosret.ROS_RET_BAD_ALLOC
+    for _p in 0..xrcestream.XRCE_HISTORY
+        if code == rosret.ROS_RET_OK and pos < length and xrcestream.out_can_write(st)
+            let id = sess.next_request
+            let _begun = xrcefrag.piece_begin(var m, st.out_next, pos, length, id, object, reply,
+                                              identity)
+            var n = length - pos
+            if n > xrcefrag.piece_room(var m)
+                n = xrcefrag.piece_room(var m)
+            for i in 0..n
+                let _put = xrcewire.put_sample_byte(var m, payload[pos + i] as Int)
+            if pos == 0
+                sess = rostransport.session_next_request(sess)
+                request = id
+            pos = pos + n
+            let _len = xrcewire.finish_fragment(var m, pos == length)
+            let _kept = xrcestream.history_store(var h, st.out_next, var m)
+            st = xrcestream.out_wrote(st)
+            if not send(u, var m, var f)
+                code = rosret.ROS_RET_AGENT_UNREACHABLE
+    rostransport.long_sent(sess, st, code, pos, length, request)
+
+// Write one sample to a data writer on the reliable stream, in pieces if it
+// does not fit one message.
+//
+// `payload` holds the sample in CDR without the representation header, from its
+// first byte, and `at` is 0 for the first call; `m` is the scratch each message
+// is built in. The rules and the outcome are those of
+// `rostransport.write_sample_long`: a sample of up to 500 bytes is one message,
+// a longer one goes out as FRAGMENT submessages kept in the history `h`, a call
+// writes at most `xrcestream.XRCE_HISTORY` of them, and the caller polls and
+// calls again with the outcome's `at` until `done`. The 2,056 bytes of `payload`
+// are the cost of a node that writes long samples; a node that also joins them
+// can pass its reassembly buffer, once it has read what it joined.
+pub @tier(embedded)
+@no_alloc
+fn write_sample_long<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                                     var h: Vec[u8; 2056], s: rostransport.RosSession,
+                                     r: xrcestream.RelStream, writer: Int,
+                                     var payload: Vec[u8; 2048],
+                                     at: Int) -> rostransport.RosLongSent [e]
+    write_in_pieces(u, var m, var f, var h, s, r, writer, false, xrcewire.no_identity(),
+                    var payload, at)
+
+// Send a request to a requester, in pieces if it does not fit one message.
+//
+// `send_request` for a request of up to 2,048 bytes, with the rules of
+// `write_sample_long`. The outcome's `request` is the id the reply quotes, set by
+// the call that wrote the first piece.
+pub @tier(embedded)
+@no_alloc
+fn send_request_long<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                                     var h: Vec[u8; 2056], s: rostransport.RosSession,
+                                     r: xrcestream.RelStream, requester: Int,
+                                     var payload: Vec[u8; 2048],
+                                     at: Int) -> rostransport.RosLongSent [e]
+    write_in_pieces(u, var m, var f, var h, s, r, requester, false, xrcewire.no_identity(),
+                    var payload, at)
+
+// Send the reply to a request, in pieces if it does not fit one message.
+//
+// `send_reply` for a reply of up to 2,048 bytes, with the rules of
+// `write_sample_long`; the sample identity of the request goes in the first
+// piece, in front of the reply's bytes.
+pub @tier(embedded)
+@no_alloc
+fn send_reply_long<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                                   var h: Vec[u8; 2056], s: rostransport.RosSession,
+                                   r: xrcestream.RelStream, replier: Int,
+                                   identity: xrcewire.XrceIdentity,
+                                   var payload: Vec[u8; 2048],
+                                   at: Int) -> rostransport.RosLongSent [e]
+    write_in_pieces(u, var m, var f, var h, s, r, replier, true, identity, var payload, at)
+
+// What `take_reply_long` took from the UART.
+pub @value
+struct RosLongReplyPoll
+    // The session after the call. Any message from the agent clears its
+    // silence.
+    session: rostransport.RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // The reassembly after the call; pass it to the next call.
+    assembly: xrcefrag.FragState
+    // As for `RosReplyPoll`, and `ROS_RET_BAD_ALLOC` for a reply longer than the
+    // reassembly allows, which was dropped.
+    code: Int
+    // The agent's status number when `code` is `ROS_RET_ERROR`, else -1.
+    status: Int
+    // The sample the call completed, found or not; its bytes are `a[0]` to
+    // `a[sample.length - 1]` of the caller's reassembly buffer, and
+    // `sample.object` is the entity it belongs to.
+    sample: xrcewire.XrceSample
+    // The reply, and where its bytes are in the reassembly buffer.
+    reply: xrcewire.XrceResponse
+
+// Take the next frame from the agent and, if it completes a reply, read it.
+//
+// `take_reply` over `poll_long`: a reply the agent sent in pieces is joined in
+// `a`, which the caller keeps between calls with the `assembly` of the result.
+// The reply's bytes are `a[reply.start]` for `reply.length` bytes, and
+// `reply.request` is the id of the call it answers. A call that took a piece
+// answers `ROS_RET_CLIENT_TAKE_FAILED`. `m` is scratch: it holds the first
+// bytes of the sample when the call returns, which is where
+// `xrcewire.response_of` reads the request id.
+pub @tier(embedded)
+@no_alloc
+fn take_reply_long<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                                   var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                                   var a: Vec[u8; 2048], s: rostransport.RosSession,
+                                   r: xrcestream.RelStream, state: xrcefrag.FragState,
+                                   timeout_ms: Int) -> RosLongReplyPoll [e]
+    let got = poll_long(u, var d, var m, var f, var h, var a, s, r, state, timeout_ms)
+    let _head = xrcefrag.copy_head(var a, var m, 4)
+    let reply = xrcewire.response_of(var m, got.sample)
+    if reply.found
+        return RosLongReplyPoll { session: got.session, stream: got.stream,
+                                  assembly: got.assembly, code: rosret.ROS_RET_OK, status: 0 - 1,
+                                  sample: got.sample, reply: reply }
+    var code = got.code
+    if code == rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED or code == rosret.ROS_RET_OK
+        code = rosret.ROS_RET_CLIENT_TAKE_FAILED
+    RosLongReplyPoll { session: got.session, stream: got.stream, assembly: got.assembly,
+                       code: code, status: got.status, sample: got.sample, reply: reply }
+
+// What `take_request_long` took from the UART.
+pub @value
+struct RosLongRequestPoll
+    // The session after the call. Any message from the agent clears its
+    // silence.
+    session: rostransport.RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // The reassembly after the call; pass it to the next call.
+    assembly: xrcefrag.FragState
+    // As for `RosRequestPoll`, and `ROS_RET_BAD_ALLOC` for a request longer than
+    // the reassembly allows, which was dropped.
+    code: Int
+    // The agent's status number when `code` is `ROS_RET_ERROR`, else -1.
+    status: Int
+    // The sample the call completed, found or not; its bytes are `a[0]` to
+    // `a[sample.length - 1]` of the caller's reassembly buffer, and
+    // `sample.object` is the entity it belongs to.
+    sample: xrcewire.XrceSample
+    // The request, its identity, and where its bytes are in the reassembly
+    // buffer.
+    request: xrcewire.XrceRequest
+
+// Take the next frame from the agent and, if it completes a request, read it.
+//
+// `take_request` over `poll_long`, with the rules of `take_reply_long`. The
+// request's bytes are `a[request.start]` for `request.length` bytes, and
+// `request.identity` goes to `send_reply_long`.
+pub @tier(embedded)
+@no_alloc
+fn take_request_long<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                                     var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                                     var a: Vec[u8; 2048], s: rostransport.RosSession,
+                                     r: xrcestream.RelStream, state: xrcefrag.FragState,
+                                     timeout_ms: Int) -> RosLongRequestPoll [e]
+    let got = poll_long(u, var d, var m, var f, var h, var a, s, r, state, timeout_ms)
+    let _head = xrcefrag.copy_head(var a, var m, xrcewire.XRCE_IDENTITY_BYTES)
+    let request = xrcewire.request_of(var m, got.sample)
+    if request.found
+        return RosLongRequestPoll { session: got.session, stream: got.stream,
+                                    assembly: got.assembly, code: rosret.ROS_RET_OK,
+                                    status: 0 - 1, sample: got.sample, request: request }
+    var code = got.code
+    if code == rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED or code == rosret.ROS_RET_OK
+        code = rosret.ROS_RET_SERVICE_TAKE_FAILED
+    RosLongRequestPoll { session: got.session, stream: got.stream, assembly: got.assembly,
+                         code: code, status: got.status, sample: got.sample, request: request }
