@@ -292,6 +292,90 @@ fn agent_silent() -> ClientPipe
 fn cable_unplugged() -> ClientPipe
     ClientPipe { reply: bytes.zeros(0), answers: false, takes: false }
 
+// A pipe that hands the messages it was given back one to a receive, in
+// order, as a socket does that held several answers before the node read.
+var g_backlog: [Bytes] = []
+
+struct BacklogPipe
+    id: Int
+
+impl RosTransport[mutate] for BacklogPipe
+    fn ros_send(self, frame: Bytes) -> Bool [mutate]
+        true
+
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
+        if list.len(g_backlog) == 0
+            return None
+        let first = g_backlog[0]
+        g_backlog = list.drop(g_backlog, 1)
+        Some(first)
+
+    fn ros_is_open(self) -> Bool [mutate]
+        true
+
+    fn ros_close(self) [mutate]
+        ()
+
+    fn ros_mtu(self) -> Int [mutate]
+        512
+
+// Put the agent's answers in the pipe, in the order it sent them.
+fn backlog_of(answers: [[Int]]) [mutate]
+    g_backlog = []
+    for a in answers
+        g_backlog = list.push(g_backlog, wire_of(a))
+
+@test
+fn test_each_host_call_reads_its_own_answer_from_a_backlog() [io, mutate]
+    let s = rostransport.session(0xAABBCCDD, 512)
+    let open = an_open_session()
+    let markup = "<dds><topic><name>t</name><dataType>T</dataType></topic></dds>"
+    let pipe = BacklogPipe { id: 1 }
+
+    test.case("an open reads past answers that are not a STATUS_AGENT")
+    backlog_of([status_message(1, 0x12, 0), info_message(), status_agent_message(0)])
+    test.assert(rostransport.session_is_ready(rostransport.open_session(pipe, s, 100)))
+    test.assert_eq(list.len(g_backlog), 0)
+
+    test.case("seven answers ahead are read past and eight are too many")
+    backlog_of([info_message(), info_message(), info_message(), info_message(),
+                info_message(), info_message(), info_message(), status_agent_message(0)])
+    test.assert(rostransport.session_is_ready(rostransport.open_session(pipe, s, 100)))
+    backlog_of([info_message(), info_message(), info_message(), info_message(),
+                info_message(), info_message(), info_message(), info_message(),
+                status_agent_message(0)])
+    test.assert(not rostransport.session_is_ready(rostransport.open_session(pipe, s, 100)))
+
+    test.case("a refusal behind a stale answer is a refusal")
+    backlog_of([info_message(), status_agent_message(0x83)])
+    test.assert(not rostransport.session_is_ready(rostransport.open_session(pipe, s, 100)))
+
+    test.case("a create reads past the statuses of earlier requests")
+    backlog_of([status_message(4, 0x12, 0), info_message(), status_message(1, 0x12, 0)])
+    let behind = rostransport.create_entity(pipe, open, 0x12, xrcewire.XRCE_KIND_TOPIC, 0x11,
+                                            markup, 100)
+    test.assert_eq(behind.code, rosret.ROS_RET_OK)
+    test.assert_eq(behind.session.next_request, 2)
+
+    test.case("a refusal behind a stale status is a refusal")
+    backlog_of([status_message(4, 0x12, 0), status_message(1, 0x12, 0x84)])
+    test.assert_eq(rostransport.create_entity(pipe, open, 0x12, xrcewire.XRCE_KIND_TOPIC, 0x11,
+                                              markup, 100).code,
+                   rosret.ROS_RET_ERROR)
+
+    test.case("eight stale statuses are read and the ninth is left for the next request")
+    backlog_of([status_message(4, 0x12, 0), status_message(4, 0x12, 0),
+                status_message(4, 0x12, 0), status_message(4, 0x12, 0),
+                status_message(4, 0x12, 0), status_message(4, 0x12, 0),
+                status_message(4, 0x12, 0), status_message(4, 0x12, 0),
+                status_message(1, 0x12, 0)])
+    test.assert_eq(rostransport.create_entity(pipe, open, 0x12, xrcewire.XRCE_KIND_TOPIC, 0x11,
+                                              markup, 100).code,
+                   rosret.ROS_RET_TIMEOUT)
+    test.assert_eq(rostransport.create_entity(pipe, open, 0x12, xrcewire.XRCE_KIND_TOPIC, 0x11,
+                                              markup, 100).code,
+                   rosret.ROS_RET_OK)
+
 @test
 fn test_a_session_opens_only_on_an_ok_status_agent() [io]
     let s = rostransport.session(0xAABBCCDD, 512)

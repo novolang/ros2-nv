@@ -877,7 +877,8 @@ first frame they saw, so the answers they read stayed three behind for as
 long as the node ran.
 
 `rosuart.open` and `rosuart.create` now read past a frame that is not the
-answer, up to `ROS_UART_STALE_FRAMES`, 8. With that, the same arrangement
+answer, up to `rostransport.ROS_STALE_FRAMES`, 8, and so do the host's
+`rostransport.open_session` and `rostransport.create_entity`. With that, the same arrangement
 (node started eight seconds before the agent) created the participant, both
 topics, the publisher, the writer, the subscriber and the reader in 111
 milliseconds, from the first frame the agent saw to the last status, with no second attempt,

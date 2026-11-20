@@ -32,28 +32,35 @@ release is 0.1.4.
 
 ### Fixed
 
-- **`rosuart.open` and `rosuart.create` read past a frame that is not the
-  answer they wait for.** Each took the first frame that arrived, and a
-  `create` that found the status of another request ended with
-  `ROS_RET_TIMEOUT` and left the right status on the line for the next
+- **`open_session`, `create_entity` and their `rosuart` forms read past a
+  message that is not the answer they wait for.** Each took the first message
+  that arrived, and a `create` that found the status of another request ended
+  with `ROS_RET_TIMEOUT` and left the right status on the link for the next
   request. A node that starts before its agent sends an open request each
-  second; the serial port holds them, and the agent answers all of them in
-  a burst when it opens the port. On the nRF52840-DK, started eight seconds
+  second; a serial port holds them, and the agent answers all of them in a
+  burst when it opens the port. On the nRF52840-DK, started eight seconds
   before the agent, the node read three of those answers in place of the
   statuses of its first three creates, every create after them took the
   status of the request three before it. Every create ended with
   `ROS_RET_TIMEOUT` although the agent had created all seven entities, the
   example's bring-up answered a closed session, and the node opened another
-  a second later and did the same again, for as long as it ran. Both functions now read and drop up to
-  `ROS_UART_STALE_FRAMES`, 8, frames that are not the answer, and end with the
-  codes they ended with before when none of them is. The first bring-up of
-  the same board then created all seven entities at once. `rosclient_tests`
-  has the cases: a stale status, an INFO and a status ahead of the answer,
-  seven frames ahead and eight, and a refusal behind a stale status.
-  The host functions `rostransport.open_session` and
-  `rostransport.create_entity` read one frame and are unchanged; a TCP
-  stream is in order, and a UDP datagram that arrives late is the case they
-  still end with `ROS_RET_TIMEOUT` for.
+  a second later and did the same again, for as long as it ran. Both
+  `rosuart.open` and `rosuart.create` and the host's
+  `rostransport.open_session` and `rostransport.create_entity` now read and
+  drop up to `rostransport.ROS_STALE_FRAMES`, 8, messages that are not the
+  answer, and end with the codes they ended with before when none of them
+  is. The first bring-up of the same board then created all seven entities at
+  once. `rosclient_tests` has the cases for both sides: a stale status, an
+  INFO and a status ahead of the answer, seven messages ahead and eight, and
+  a refusal behind a stale one; the host cases replay the backlog through a
+  pipe that hands one message to each receive. The host case was not
+  reproduced against an agent: a TCP connection is refused until the agent
+  listens, and a UDP datagram sent before the agent binds its port is
+  dropped, so a host node's open requests are not held for the agent the way
+  a serial port holds them. A host node meets the same defect when the agent
+  answers an open request later than the node waited for it. Over UDP,
+  `examples/host_talker.nv` still created its four entities and published ten
+  samples against an agent 2.4.3 after the change.
 
 ### Changed
 

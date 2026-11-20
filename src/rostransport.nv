@@ -220,6 +220,18 @@ pub const ROS_HEARTBEAT_MS = 100
 // session lost, in milliseconds: 1000.
 pub const ROS_SESSION_TIMEOUT_MS = 1000
 
+// How many messages that are not the awaited answer `open_session`,
+// `create_entity` and their `rosuart` forms read and drop before they give
+// up: 8.
+//
+// The agent answers a request whenever it gets to it, and the link holds
+// what it sent while the node was not reading. A node that starts before
+// its agent sends an open request each second, the serial port or the
+// socket may hold them, and the agent answers all of them in a burst. Read
+// one answer per request, the node would be a few answers behind for as
+// long as it ran, every create taking the status of an earlier one.
+pub const ROS_STALE_FRAMES = 8
+
 // The session after the agent acknowledged it.
 pub @tier(embedded)
 @no_alloc
@@ -455,14 +467,20 @@ fn open_session<T: RosTransport[e]>(t: T, s: RosSession, timeout_ms: Int) -> Ros
         let _built = xrcewire.create_client(var m, s.client_key, mtu)
         if not t.ros_send(wire_bytes(var m))
             return session_with_state(s, ROS_SESSION_CLOSED)
-        let status = t.ros_recv(timeout_ms)
-        if status == None
-            return session_with_state(s, ROS_SESSION_CLOSED)
-        wire_read(var m, status ?? bytes.zeros(0))
-        let reply = xrcewire.read_reply(var m)
-        if reply.kind == xrcewire.XRCE_REPLY_STATUS_AGENT
-            and xrcewire.status_is_ok(reply.status)
-            return session_established(s, xrcewire.XRCE_SESSION_ID)
+        // A message that is not a STATUS_AGENT, an answer to an earlier
+        // request that arrived late, is read past; any STATUS_AGENT is
+        // the answer, since the agent sends the same one to every
+        // CREATE_CLIENT.
+        for _i in 0..ROS_STALE_FRAMES
+            let status = t.ros_recv(timeout_ms)
+            if status == None
+                return session_with_state(s, ROS_SESSION_CLOSED)
+            wire_read(var m, status ?? bytes.zeros(0))
+            let reply = xrcewire.read_reply(var m)
+            if reply.kind == xrcewire.XRCE_REPLY_STATUS_AGENT
+                if xrcewire.status_is_ok(reply.status)
+                    return session_established(s, xrcewire.XRCE_SESSION_ID)
+                return session_with_state(s, ROS_SESSION_CLOSED)
         return session_with_state(s, ROS_SESSION_CLOSED)
 
 // Tell the agent the session is over.
@@ -502,16 +520,19 @@ fn create_entity<T: RosTransport[e]>(t: T, s: RosSession, object: Int, kind: Int
             return outcome(s, rosret.ROS_RET_INVALID_ARGUMENT, 0 - 1)
         if not t.ros_send(wire_bytes(var m))
             return outcome(s, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
-        let answer = t.ros_recv(timeout_ms)
-        if answer == None
-            return outcome(sent, rosret.ROS_RET_TIMEOUT, 0 - 1)
-        wire_read(var m, answer ?? bytes.zeros(0))
-        let reply = xrcewire.read_reply(var m)
-        if reply.kind != xrcewire.XRCE_REPLY_STATUS or reply.request != request
-            return outcome(sent, rosret.ROS_RET_TIMEOUT, 0 - 1)
-        if xrcewire.status_is_ok(reply.status)
-            return outcome(session_heard(sent), rosret.ROS_RET_OK, reply.status)
-        return outcome(session_heard(sent), rosret.ROS_RET_ERROR, reply.status)
+        // A message that is not this request's status, an answer to an
+        // earlier request that arrived late, is read past.
+        for _i in 0..ROS_STALE_FRAMES
+            let answer = t.ros_recv(timeout_ms)
+            if answer == None
+                return outcome(sent, rosret.ROS_RET_TIMEOUT, 0 - 1)
+            wire_read(var m, answer ?? bytes.zeros(0))
+            let reply = xrcewire.read_reply(var m)
+            if reply.kind == xrcewire.XRCE_REPLY_STATUS and reply.request == request
+                if xrcewire.status_is_ok(reply.status)
+                    return outcome(session_heard(sent), rosret.ROS_RET_OK, reply.status)
+                return outcome(session_heard(sent), rosret.ROS_RET_ERROR, reply.status)
+        return outcome(sent, rosret.ROS_RET_TIMEOUT, 0 - 1)
 
 // Write one sample to a data writer.
 //
