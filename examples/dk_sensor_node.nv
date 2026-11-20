@@ -130,8 +130,7 @@ fn set_leds(cmd: Int) [hw]
 @tier(embedded)
 @no_alloc
 fn answer<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037], var h: Vec[u8; 2056],
-                          var p: Vec[u8; 512], s: rostransport.RosSession,
-                          r: xrcestream.RelStream,
+                          var p: Vec[u8; 512], s: rostransport.RosSession, r: xrcestream.RelStream,
                           request: xrcewire.XrceRequest) -> rostransport.RosRelOutcome [e]
     let a = xrcewire.i64_at(var m, request.start)
     let b = xrcewire.i64_at(var m, request.start + 8)

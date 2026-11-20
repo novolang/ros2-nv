@@ -82,9 +82,7 @@ fn main() [net, io, time]
 // `z` and round again: the length with the closing zero, the characters, the
 // zero.
 fn text_of(n: Int) -> Bytes
-    var xs: [Int] = []
-    for i in 0..n
-        xs = list.push(xs, 97 + i % 26)
+    let xs = list.map(list.range(0, n), i => 97 + i % 26)
     bytes.concat([bytes.u32_le(n + 1), bytes.from_byte_list(xs), bytes.zeros(1)])
 
 fn talk<T: RosTransport[e]>(link: T) [e, io, time]

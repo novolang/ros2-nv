@@ -35,28 +35,15 @@ fn vec_of(xs: [Int]) -> Vec[u8; 512]
     m
 
 fn list_of(var m: Vec[u8; 512]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in m
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(m.to_list(), x => x as Int)
 
 // The reassembly buffer's bytes, as a list.
 fn joined_list(var a: Vec[u8; 2048]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in a
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(a.to_list(), x => x as Int)
 
 // A `Bytes` as a list.
 fn bytes_list(b: Bytes) -> [Int]
-    var out: [Int] = []
-    for i in 0..bytes.len(b)
-        out = list.push(out, bytes.byte_at(b, i) ?? 0)
-    out
+    list.map(bytes.to_byte_list(b), x => x as Int)
 
 // A list as the payload buffer of the device.
 fn payload_of(xs: [Int]) -> Vec[u8; 2048]
@@ -70,16 +57,12 @@ fn payload_of(xs: [Int]) -> Vec[u8; 2048]
 // zero.
 fn text_cdr(n: Int) -> [Int]
     var xs: [Int] = [(n + 1) & 0xFF, (n + 1) >>> 8, 0x00, 0x00]
-    for i in 0..n
-        xs = list.push(xs, 97 + i % 26)
+    xs = list.concat(xs, list.map(list.range(0, n), i => 97 + i % 26))
     list.push(xs, 0x00)
 
 // `n` bytes counting up from 0 and round again at 256.
 fn ramp(n: Int) -> [Int]
-    var xs: [Int] = []
-    for i in 0..n
-        xs = list.push(xs, i % 256)
-    xs
+    list.map(list.range(0, n), i => i % 256)
 
 // The same as a `Bytes`.
 fn text_bytes(n: Int) -> Bytes
@@ -115,13 +98,16 @@ fn fragments_of(data: [Int], size: Int, first_seq: Int) -> [[Int]]
 fn write_submessage(request: Int, writer: Int, sample: [Int]) -> [Int]
     let n = list.len(sample) + 4
     list.concat([0x07, 0x01, n & 0xFF, n >>> 8, request >>> 8, request & 0xFF, writer >>> 8,
-                 writer & 0xFF], sample)
+                 writer & 0xFF],
+                 sample)
 
 // The WRITE_DATA of a reply: the identity of the request in front of the sample.
 fn reply_submessage(request: Int, replier: Int, sample: [Int]) -> [Int]
     let n = list.len(sample) + 28
     list.concat(list.concat([0x07, 0x01, n & 0xFF, n >>> 8, request >>> 8, request & 0xFF,
-                             replier >>> 8, replier & 0xFF], identity_bytes()), sample)
+                             replier >>> 8, replier & 0xFF],
+                             identity_bytes()),
+                             sample)
 
 // RECORDED.  The sample identity of a request.
 fn identity_bytes() -> [Int]
@@ -144,14 +130,16 @@ fn same(a: xrcewire.XrceIdentity, b: xrcewire.XrceIdentity) -> Bool
 fn reply_data_submessage(request: Int, sample: [Int]) -> [Int]
     let n = list.len(sample) + 8
     list.concat([0x09, 0x01, n & 0xFF, n >>> 8, 0x00, 0x03, 0x00, 0x17, request >>> 8,
-                 request & 0xFF, 0x00, 0x17], sample)
+                 request & 0xFF, 0x00, 0x17],
+                 sample)
 
 // The DATA the agent serialises for a request at a server: the ids of the READ_DATA
 // (request 3, replier 0x18), the identity, then the request.
 fn request_data_submessage(sample: [Int]) -> [Int]
     let n = list.len(sample) + 28
     list.concat(list.concat([0x09, 0x01, n & 0xFF, n >>> 8, 0x00, 0x03, 0x00, 0x18],
-                            identity_bytes()), sample)
+                            identity_bytes()),
+                            sample)
 
 // The DATA for data reader 0x16 and request 5, with this sample after the ids.
 fn reader_data_submessage(sample: [Int]) -> [Int]
@@ -283,11 +271,11 @@ fn test_a_piece_begins_with_the_front_only_at_the_start() [io]
 // ── rostransport: over a pipe that records ───────────────────────────
 
 // Every frame the pipe is handed, as a list of bytes.
-var g_sent: [[Int]]  = []
+var g_sent: [[Int]] = []
 // What the agent says next, one message to each receive.
 var g_queue: [Bytes] = []
 // Whether the pipe takes what it is handed.
-var g_takes          = true
+var g_takes = true
 
 struct RecPipe
     id: Int
@@ -296,10 +284,7 @@ impl RosTransport[mutate] for RecPipe
     fn ros_send(self, frame: Bytes) -> Bool [mutate]
         if not g_takes
             return false
-        var xs: [Int] = []
-        for i in 0..bytes.len(frame)
-            xs = list.push(xs, bytes.byte_at(frame, i) ?? 0)
-        g_sent = list.push(g_sent, xs)
+        g_sent = list.push(g_sent, list.map(bytes.to_byte_list(frame), x => x as Int))
         true
 
     fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
@@ -835,12 +820,7 @@ fn on_the_line() -> [[Int]]
     var out: [[Int]] = []
     for b in u_outbox
         if xrceframe.push_byte(var d, b as Int) == xrceframe.XRCE_PUSH_FRAME
-            var p: [Int] = []
-            // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-            for x in d.payload
-                let wide = x as Int
-                p = list.push(p, wide)
-            out = list.push(out, p)
+            out = list.push(out, list.map(d.payload.to_list(), x => x as Int))
     out
 
 @test

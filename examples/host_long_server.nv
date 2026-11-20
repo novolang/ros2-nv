@@ -101,9 +101,7 @@ fn main() [net, io, time]
 // The CDR of a Trigger reply: success, and a message of `n` characters that run
 // from `a` to `z` and round again.
 fn trigger_reply(n: Int) -> Bytes
-    var xs: [Int] = []
-    for i in 0..n
-        xs = list.push(xs, 97 + i % 26)
+    let xs = list.map(list.range(0, n), i => 97 + i % 26)
     bytes.concat([bytes.from_byte_list([1, 0, 0, 0]), bytes.u32_le(n + 1),
                   bytes.from_byte_list(xs), bytes.zeros(1)])
 

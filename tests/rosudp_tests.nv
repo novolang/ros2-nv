@@ -41,7 +41,7 @@ fn test_a_datagram_goes_out_and_comes_back_with_its_zero_bytes() [io, net]
                     test.case("a message is one datagram, with nothing in front of it")
                     test.assert(link.ros_send(a_datagram()))
                     match net.udp_recv_from(agent, 2048)
-                        None           => test.fail("the agent's socket got nothing")
+                        None              => test.fail("the agent's socket got nothing")
                         Some((got, from)) =>
                             test.assert_eq(bytes.len(bytes.from_str(got)), 14)
                             test.assert(bytes.from_str(got) == a_datagram())
@@ -139,7 +139,7 @@ fn test_a_session_opens_over_a_datagram_link() [io, net]
                             let s1 = rostransport.open_session(link, s0, 1000)
                             test.assert_eq(s1.state, rostransport.ROS_SESSION_ESTABLISHED)
                             match net.udp_recv_from(agent, 64)
-                                None           => test.fail("CREATE_CLIENT did not arrive")
+                                None              => test.fail("CREATE_CLIENT did not arrive")
                                 Some((create, _)) =>
                                     test.assert_eq(bytes.len(bytes.from_str(create)), 24)
                     rosagent.disconnect_udp(link)

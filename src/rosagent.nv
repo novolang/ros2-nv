@@ -339,7 +339,8 @@ impl RosTransport[net] for RosUdpLink
             // sender that is not the agent is dropped, and the caller asks
             // again.
             match net.udp_recv_from(self.sock, self.mtu)
-                None => return None
+                None               =>
+                    return None
                 Some((data, from)) =>
                     if from != self.peer
                         return None
@@ -396,7 +397,8 @@ fn connect_udp_with_mtu(host: Str, port: Int, mtu: Int) -> ?RosUdpLink [net]
             return None
         match net.udp_socket()
             // cov: skip — the system refuses a socket only when it is out of descriptors
-            None       => return None
+            None       =>
+                return None
             Some(sock) =>
                 return Some(RosUdpLink {
                     sock: sock,

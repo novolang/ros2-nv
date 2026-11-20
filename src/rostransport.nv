@@ -403,12 +403,7 @@ struct RosOutcome
 @tier(system)
 fn wire_bytes(var m: Vec[u8; 512]) -> Bytes
     system
-        var xs: [Int] = []
-        // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-        for x in m
-            let wide = x as Int
-            xs = list.push(xs, wide)
-        return bytes.from_byte_list(xs)
+        return bytes.from_byte_list(list.map(m.to_list(), x => x as Int))
 
 // A received `Bytes`, copied into a buffer.  A message longer than the
 // buffer is cut at its end; the reply reader then finds no status.
@@ -819,8 +814,8 @@ fn answer_stream<T: RosTransport[e]>(t: T, var h: Vec[u8; 2056], ev: xrcestream.
 // `ROS_RET_ERROR` with the number. One message per call: a program drains
 // the pipe by calling it until it answers `ROS_RET_SUBSCRIPTION_TAKE_FAILED`.
 pub @tier(system)
-fn poll<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
-                            var h: Vec[u8; 2056], type_id: Int, timeout_ms: Int) -> RosTaken [e]
+fn poll<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream, var h: Vec[u8; 2056],
+                            type_id: Int, timeout_ms: Int) -> RosTaken [e]
     system
         if not session_is_ready(s)
             return taken_none(s, r, rosret.ROS_RET_NOT_INIT, 0 - 1, type_id)
@@ -881,12 +876,7 @@ fn long_none(s: RosSession, r: xrcestream.RelStream, state: xrcefrag.FragState, 
 @tier(system)
 fn long_bytes(var a: Vec[u8; 2048]) -> Bytes
     system
-        var xs: [Int] = []
-        // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-        for x in a
-            let wide = x as Int
-            xs = list.push(xs, wide)
-        return bytes.from_byte_list(xs)
+        return bytes.from_byte_list(list.map(a.to_list(), x => x as Int))
 
 // Take the next message from the agent and act on it, joining a sample the
 // agent sent in pieces.
@@ -988,8 +978,8 @@ fn create_requester<T: RosTransport[e]>(t: T, s: RosSession, requester: Int, par
 // The arguments and the rules are those of `create_requester`, with the kind
 // `xrcewire.XRCE_KIND_REPLIER`.
 pub @tier(system)
-fn create_replier<T: RosTransport[e]>(t: T, s: RosSession, replier: Int, participant: Int,
-                                      xml: Str, timeout_ms: Int) -> RosOutcome [e]
+fn create_replier<T: RosTransport[e]>(t: T, s: RosSession, replier: Int, participant: Int, xml: Str,
+                                      timeout_ms: Int) -> RosOutcome [e]
     create_entity(t, s, replier, xrcewire.XRCE_KIND_REPLIER, participant, xml, timeout_ms)
 
 // What `send_request` did.
@@ -1378,8 +1368,7 @@ pub struct RosLongServed
 pub @tier(system)
 fn take_reply_long<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
                                        state: xrcefrag.FragState, var h: Vec[u8; 2056],
-                                       var a: Vec[u8; 2048],
-                                       timeout_ms: Int) -> RosLongReplied [e]
+                                       var a: Vec[u8; 2048], timeout_ms: Int) -> RosLongReplied [e]
     system
         let taken = poll_long(t, s, r, state, var h, var a, 0, timeout_ms)
         var m: Vec[u8; 512] = Vec.new()
@@ -1408,8 +1397,7 @@ fn take_reply_long<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStr
 pub @tier(system)
 fn take_request_long<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStream,
                                          state: xrcefrag.FragState, var h: Vec[u8; 2056],
-                                         var a: Vec[u8; 2048],
-                                         timeout_ms: Int) -> RosLongServed [e]
+                                         var a: Vec[u8; 2048], timeout_ms: Int) -> RosLongServed [e]
     system
         let taken = poll_long(t, s, r, state, var h, var a, 0, timeout_ms)
         var m: Vec[u8; 512] = Vec.new()

@@ -588,7 +588,7 @@ fn finish_fragment(var m: Vec[u8; 512], last: Bool) -> Int []
     m[6] = (length & 0xFF) as u8
     m[7] = ((length >>> 8) & 0xFF) as u8
     if last
-        m[5] = ((m[5] as Int) | XRCE_FLAG_LAST_FRAGMENT) as u8
+        m[5] = (m[5] as Int | XRCE_FLAG_LAST_FRAGMENT) as u8
     length
 
 // Append the front of a WRITE_DATA for a sample of `sample_length` bytes: the
@@ -873,7 +873,7 @@ fn find_submessage(var m: Vec[u8; 512], id: Int) -> XrceSub []
         at = (at + 3) / 4 * 4
         if not done and at + 4 <= m.len()
             let length = m[at + 2] as Int + m[at + 3] as Int * 256
-            if m[at] as Int == id and at + 4 + length <= m.len()
+            if (m[at] as Int) == id and at + 4 + length <= m.len()
                 out = XrceSub { id: id, flags: m[at + 1] as Int, body: at + 4, length: length }
                 done = true
             else

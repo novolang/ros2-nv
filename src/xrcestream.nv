@@ -260,7 +260,7 @@ fn history() -> Vec[u8; 2056] []
 @tier(embedded)
 @no_alloc
 fn slot_at(seq: Int) -> Int []
-    (seq % XRCE_HISTORY) * XRCE_SLOT_BYTES
+    seq % XRCE_HISTORY * XRCE_SLOT_BYTES
 
 // Keep the message in `m` in the slot of the sequence number `seq`.
 //

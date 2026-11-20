@@ -21,12 +21,7 @@ fn payload_of(xs: [Int]) -> Vec[u8; 512]
 
 // The bytes of a frame as a list, for comparison with a derivation.
 fn wire_of(var frame: Vec[u8; 1037]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in frame
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(frame.to_list(), x => x as Int)
 
 // A frame from address 1 to address 0, as a list.
 fn framed(xs: [Int]) -> [Int]
@@ -45,12 +40,7 @@ fn feed_all(var d: xrceframe.XrceDeframer, xs: [Int]) -> Int
 
 // The payload a de-framer holds, as a list.
 fn held(var d: xrceframe.XrceDeframer) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in d.payload
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(d.payload.to_list(), x => x as Int)
 
 @test
 fn test_the_crc_is_the_clients() [io]

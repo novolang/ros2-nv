@@ -29,12 +29,7 @@ fn vec_of(xs: [Int]) -> Vec[u8; 512]
     m
 
 fn list_of(var m: Vec[u8; 512]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in m
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(m.to_list(), x => x as Int)
 
 // RECORDED.  The agent's DATA on the best-effort stream carrying the
 // integer 7, and on the reliable stream at `seq` carrying `value`.
@@ -121,11 +116,11 @@ fn history_of(first: Int, next: Int) -> Vec[u8; 2056]
 // ── rostransport: over a pipe that records ───────────────────────────
 
 // Every frame the pipe is handed, as a list of bytes.
-var g_sent: [[Int]]  = []
+var g_sent: [[Int]] = []
 // What the agent says next, one message to each receive.
 var g_queue: [Bytes] = []
 // Whether the pipe takes what it is handed.
-var g_takes          = true
+var g_takes = true
 
 struct RecPipe
     id: Int
@@ -134,10 +129,7 @@ impl RosTransport[mutate] for RecPipe
     fn ros_send(self, frame: Bytes) -> Bool [mutate]
         if not g_takes
             return false
-        var xs: [Int] = []
-        for i in 0..bytes.len(frame)
-            xs = list.push(xs, bytes.byte_at(frame, i) ?? 0)
-        g_sent = list.push(g_sent, xs)
+        g_sent = list.push(g_sent, list.map(bytes.to_byte_list(frame), x => x as Int))
         true
 
     fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
@@ -511,12 +503,7 @@ fn on_the_line() -> [[Int]]
     var out: [[Int]] = []
     for b in u_outbox
         if xrceframe.push_byte(var d, b as Int) == xrceframe.XRCE_PUSH_FRAME
-            var p: [Int] = []
-            // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-            for x in d.payload
-                let wide = x as Int
-                p = list.push(p, wide)
-            out = list.push(out, p)
+            out = list.push(out, list.map(d.payload.to_list(), x => x as Int))
     out
 
 @test

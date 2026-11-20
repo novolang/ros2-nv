@@ -35,12 +35,7 @@ fn vec_of(xs: [Int]) -> Vec[u8; 512]
 
 // The bytes of a message buffer, as a list.
 fn list_of(var m: Vec[u8; 512]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in m
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(m.to_list(), x => x as Int)
 
 // The bytes of a list, as a `Bytes`.
 fn wire_of(xs: [Int]) -> Bytes
@@ -321,9 +316,7 @@ impl RosTransport[mutate] for BacklogPipe
 
 // Put the agent's answers in the pipe, in the order it sent them.
 fn backlog_of(answers: [[Int]]) [mutate]
-    g_backlog = []
-    for a in answers
-        g_backlog = list.push(g_backlog, wire_of(a))
+    g_backlog = list.map(answers, a => wire_of(a))
 
 @test
 fn test_each_host_call_reads_its_own_answer_from_a_backlog() [io, mutate]
@@ -555,12 +548,7 @@ fn clear_line() [mutate]
 
 // What the device has put on the line, as a list.
 fn on_the_line() -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for b in g_outbox
-        let wide = b as Int
-        out = list.push(out, wide)
-    out
+    list.map(g_outbox.to_list(), x => x as Int)
 
 // The frame an agent sends: source address 0, remote address 1 (the
 // client), the payload and its CRC.
@@ -569,12 +557,7 @@ fn agent_frame(payload: [Int]) -> [Int]
     var f: Vec[u8; 1037] = Vec.new()
     let _ = xrceframe.encode(var f, var p, xrceframe.XRCE_ADDR_AGENT,
                              xrceframe.XRCE_ADDR_CLIENT)
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for b in f
-        let wide = b as Int
-        out = list.push(out, wide)
-    out
+    list.map(f.to_list(), x => x as Int)
 
 // Put the agent's reply on the line.
 fn agent_replies(payload: [Int]) [mutate]
@@ -582,11 +565,7 @@ fn agent_replies(payload: [Int]) [mutate]
 
 // Put several of the agent's replies on the line, in order.
 fn agent_replies_in_order(payloads: [[Int]]) [mutate]
-    var all: [Int] = []
-    for payload in payloads
-        for b in agent_frame(payload)
-            all = list.push(all, b)
-    load_inbox(all)
+    load_inbox(list.flat_map(payloads, payload => agent_frame(payload)))
 
 // The message the device sent last, taken out of the frame on the
 // line: what an agent would have read.
@@ -597,10 +576,7 @@ fn sent_payload() -> [Int]
         r = xrceframe.push_byte(var d, b as Int)
     var out: [Int] = []
     if r == xrceframe.XRCE_PUSH_FRAME
-        // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-        for x in d.payload
-            let wide = x as Int
-            out = list.push(out, wide)
+        out = list.map(d.payload.to_list(), x => x as Int)
     out
 
 @test

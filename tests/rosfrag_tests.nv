@@ -35,21 +35,11 @@ fn vec_of(xs: [Int]) -> Vec[u8; 512]
     m
 
 fn list_of(var m: Vec[u8; 512]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in m
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(m.to_list(), x => x as Int)
 
 // The reassembly buffer's bytes, as a list.
 fn joined_list(var a: Vec[u8; 2048]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in a
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(a.to_list(), x => x as Int)
 
 fn hex_char(d: Int) -> Int
     if d < 10
@@ -61,8 +51,7 @@ fn hex_char(d: Int) -> Int
 // `0123456789abcdef` repeated, the zero, and zeros up to a multiple of four.
 fn string_sample(n: Int) -> [Int]
     var xs: [Int] = [(n + 1) & 0xFF, (n + 1) >>> 8, 0x00, 0x00]
-    for i in 0..n
-        xs = list.push(xs, hex_char(i % 16))
+    xs = list.concat(xs, list.map(list.range(0, n), i => hex_char(i % 16)))
     xs = list.push(xs, 0x00)
     while list.len(xs) % 4 != 0
         xs = list.push(xs, 0x00)
@@ -429,10 +418,7 @@ struct RecPipe
 
 impl RosTransport[mutate] for RecPipe
     fn ros_send(self, frame: Bytes) -> Bool [mutate]
-        var xs: [Int] = []
-        for i in 0..bytes.len(frame)
-            xs = list.push(xs, bytes.byte_at(frame, i) ?? 0)
-        g_sent = list.push(g_sent, xs)
+        g_sent = list.push(g_sent, list.map(bytes.to_byte_list(frame), x => x as Int))
         true
 
     fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
@@ -461,10 +447,7 @@ fn agent_says(xs: [Int]) [mutate]
 // The bytes of a payload, as a list.
 fn payload_list(m: RosMessage) -> [Int]
     let p = rosmsg.payload(m)
-    var xs: [Int] = []
-    for i in 0..bytes.len(p)
-        xs = list.push(xs, bytes.byte_at(p, i) ?? 0)
-    xs
+    list.map(bytes.to_byte_list(p), x => x as Int)
 
 @test
 fn test_the_host_poll_joins_a_long_sample_and_acknowledges_every_piece() [io, mutate]
@@ -678,12 +661,7 @@ fn on_the_line() -> [[Int]]
     var out: [[Int]] = []
     for b in u_outbox
         if xrceframe.push_byte(var d, b as Int) == xrceframe.XRCE_PUSH_FRAME
-            var p: [Int] = []
-            // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-            for x in d.payload
-                let wide = x as Int
-                p = list.push(p, wide)
-            out = list.push(out, p)
+            out = list.push(out, list.map(d.payload.to_list(), x => x as Int))
     out
 
 @test

@@ -18,6 +18,12 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
   `.github/workflows/interop.yml` runs the suite and `.github/workflows/check.yml`
   builds, tests and audits the package, on every push.
 
+### Changed
+
+- The minimum `novo` is 0.26.0, which has `Vec.to_list()`.  The sources and
+  the tests copy a message buffer into a list with it, where a push loop
+  stood in before.  Thirteen files are in the form `novo fmt` prints.
+
 ## 0.1.6 — 2026-11-20
 
 A node writes a sample longer than one message, and takes a long service

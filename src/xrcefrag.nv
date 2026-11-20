@@ -205,7 +205,7 @@ fn take_data(var a: Vec[u8; 2048]) -> xrcewire.XrceSample []
     if a.len() < DATA_FRONT
         return none
     let length = a[2] as Int + a[3] as Int * 256
-    if a[0] as Int != xrcewire.XRCE_SUB_DATA or length != a.len() - 4
+    if (a[0] as Int) != xrcewire.XRCE_SUB_DATA or length != a.len() - 4
         return none
     if (a[1] as Int & xrcewire.XRCE_FORMAT_MASK) != xrcewire.XRCE_FORMAT_DATA
         return none

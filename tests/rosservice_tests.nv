@@ -14,7 +14,6 @@
 use std.list
 use std.str
 use std.test
-use rosmsg
 use rosret
 use rostransport
 use rosuart
@@ -31,26 +30,15 @@ fn vec_of(xs: [Int]) -> Vec[u8; 512]
     m
 
 fn list_of(var m: Vec[u8; 512]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in m
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(m.to_list(), x => x as Int)
 
 // The bytes of a string, as a list.
 fn text_of(s: Str) -> [Int]
-    var out: [Int] = []
-    for i in 0..str.len(s)
-        out = list.push(out, str.byte_at_or(s, i, 0))
-    out
+    list.map(list.range(0, str.len(s)), i => str.byte_at_or(s, i, 0))
 
 // A 64-bit integer, least significant byte first.
 fn le64(v: Int) -> [Int]
-    var out: [Int] = []
-    for i in 0..8
-        out = list.push(out, (v >>> (8 * i)) & 0xFF)
-    out
+    list.map(list.range(0, 8), i => (v >>> (8 * i)) & 0xFF)
 
 // RECORDED.  The sample identity of the request in the first run of the server:
 // the writer's GUID prefix and entity id, and the sequence number 1.
@@ -74,7 +62,8 @@ fn an_identity() -> xrcewire.XrceIdentity
 fn request_data(seq: Int, a: Int, b: Int) -> [Int]
     list.concat(list.concat(
         [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x09, 0x01, 0x2C, 0x00, 0x00, 0x03, 0x00, 0x18],
-        identity_bytes()), list.concat(le64(a), le64(b)))
+        identity_bytes()),
+        list.concat(le64(a), le64(b)))
 
 // RECORDED.  The WRITE_DATA a server wrote on the reliable stream at `seq`:
 // request id `request`, replier 0x18, the identity of the request it answers
@@ -83,7 +72,8 @@ fn reply_write(seq: Int, request: Int, sum: Int) -> [Int]
     list.concat(list.concat(
         [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x07, 0x01, 0x24, 0x00, request >>> 8,
          request & 0xFF, 0x00, 0x18],
-        identity_bytes()), le64(sum))
+        identity_bytes()),
+        le64(sum))
 
 // RECORDED.  The WRITE_DATA a client wrote on the reliable stream at `seq`:
 // request id `request`, requester 0x17, the two numbers.
@@ -286,11 +276,11 @@ fn test_a_request_and_a_reply_are_read_out_of_the_samples_the_agent_delivers() [
 // ── rostransport: over a pipe that records ───────────────────────────
 
 // Every frame the pipe is handed, as a list of bytes.
-var g_sent: [[Int]]  = []
+var g_sent: [[Int]] = []
 // What the agent says next, one message to each receive.
 var g_queue: [Bytes] = []
 // Whether the pipe takes what it is handed.
-var g_takes          = true
+var g_takes = true
 
 struct RecPipe
     id: Int
@@ -299,10 +289,7 @@ impl RosTransport[mutate] for RecPipe
     fn ros_send(self, frame: Bytes) -> Bool [mutate]
         if not g_takes
             return false
-        var xs: [Int] = []
-        for i in 0..bytes.len(frame)
-            xs = list.push(xs, bytes.byte_at(frame, i) ?? 0)
-        g_sent = list.push(g_sent, xs)
+        g_sent = list.push(g_sent, list.map(bytes.to_byte_list(frame), x => x as Int))
         true
 
     fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
@@ -605,12 +592,7 @@ fn on_the_line() -> [[Int]]
     var out: [[Int]] = []
     for b in u_outbox
         if xrceframe.push_byte(var d, b as Int) == xrceframe.XRCE_PUSH_FRAME
-            var p: [Int] = []
-            // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-            for x in d.payload
-                let wide = x as Int
-                p = list.push(p, wide)
-            out = list.push(out, p)
+            out = list.push(out, list.map(d.payload.to_list(), x => x as Int))
     out
 
 // A payload of two 64-bit integers.

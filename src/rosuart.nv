@@ -384,8 +384,8 @@ fn reliable_tick<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037]
 pub @tier(embedded)
 @no_alloc
 fn keepalive<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
-                             s: rostransport.RosSession, elapsed_ms: Int)
-                             -> rostransport.RosSession [e]
+                             s: rostransport.RosSession,
+                             elapsed_ms: Int) -> rostransport.RosSession [e]
     let waited = rostransport.session_silent(s, elapsed_ms)
     if not rostransport.session_is_ready(waited)
         return waited
@@ -436,9 +436,8 @@ fn answer_stream<U: XrceUart[e]>(u: U, var f: Vec[u8; 1037], var h: Vec[u8; 2056
 pub @tier(embedded)
 @no_alloc
 fn poll<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
-                        var f: Vec[u8; 1037], var h: Vec[u8; 2056],
-                        s: rostransport.RosSession, r: xrcestream.RelStream,
-                        timeout_ms: Int) -> RosPoll [e]
+                        var f: Vec[u8; 1037], var h: Vec[u8; 2056], s: rostransport.RosSession,
+                        r: xrcestream.RelStream, timeout_ms: Int) -> RosPoll [e]
     if not rostransport.session_is_ready(s)
         return poll_none(s, r, rosret.ROS_RET_NOT_INIT, 0 - 1)
     if receive(u, var d, var m, timeout_ms) != xrceframe.XRCE_PUSH_FRAME
@@ -501,10 +500,9 @@ fn long_none(s: rostransport.RosSession, r: xrcestream.RelStream, state: xrcefra
 pub @tier(embedded)
 @no_alloc
 fn poll_long<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
-                             var f: Vec[u8; 1037], var h: Vec[u8; 2056],
-                             var a: Vec[u8; 2048], s: rostransport.RosSession,
-                             r: xrcestream.RelStream, state: xrcefrag.FragState,
-                             timeout_ms: Int) -> RosLongPoll [e]
+                             var f: Vec[u8; 1037], var h: Vec[u8; 2056], var a: Vec[u8; 2048],
+                             s: rostransport.RosSession, r: xrcestream.RelStream,
+                             state: xrcefrag.FragState, timeout_ms: Int) -> RosLongPoll [e]
     let st = xrcefrag.begin(state, var a)
     if not rostransport.session_is_ready(s)
         return long_none(s, r, st, rosret.ROS_RET_NOT_INIT, 0 - 1)
@@ -554,8 +552,8 @@ fn create_requester<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: 
 pub @tier(embedded)
 @no_alloc
 fn create_replier<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
-                                  var f: Vec[u8; 1037], s: rostransport.RosSession,
-                                  replier: Int, participant: Int, xml: Str,
+                                  var f: Vec[u8; 1037], s: rostransport.RosSession, replier: Int,
+                                  participant: Int, xml: Str,
                                   timeout_ms: Int) -> rostransport.RosOutcome [e]
     create(u, var d, var m, var f, s, replier, xrcewire.XRCE_KIND_REPLIER, participant, xml,
            timeout_ms)
@@ -625,9 +623,8 @@ fn send_request<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
 // `publish_i32_reliable`.
 pub @tier(embedded)
 @no_alloc
-fn send_reply<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
-                              var h: Vec[u8; 2056], s: rostransport.RosSession,
-                              r: xrcestream.RelStream, replier: Int,
+fn send_reply<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                              s: rostransport.RosSession, r: xrcestream.RelStream, replier: Int,
                               identity: xrcewire.XrceIdentity,
                               var payload: Vec[u8; 512]) -> rostransport.RosRelOutcome [e]
     if not rostransport.session_is_ready(s)
@@ -864,8 +861,7 @@ pub @tier(embedded)
 fn send_reply_long<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
                                    var h: Vec[u8; 2056], s: rostransport.RosSession,
                                    r: xrcestream.RelStream, replier: Int,
-                                   identity: xrcewire.XrceIdentity,
-                                   var payload: Vec[u8; 2048],
+                                   identity: xrcewire.XrceIdentity, var payload: Vec[u8; 2048],
                                    at: Int) -> rostransport.RosLongSent [e]
     write_in_pieces(u, var m, var f, var h, s, r, replier, true, identity, var payload, at)
 
@@ -903,9 +899,9 @@ struct RosLongReplyPoll
 pub @tier(embedded)
 @no_alloc
 fn take_reply_long<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
-                                   var f: Vec[u8; 1037], var h: Vec[u8; 2056],
-                                   var a: Vec[u8; 2048], s: rostransport.RosSession,
-                                   r: xrcestream.RelStream, state: xrcefrag.FragState,
+                                   var f: Vec[u8; 1037], var h: Vec[u8; 2056], var a: Vec[u8; 2048],
+                                   s: rostransport.RosSession, r: xrcestream.RelStream,
+                                   state: xrcefrag.FragState,
                                    timeout_ms: Int) -> RosLongReplyPoll [e]
     let got = poll_long(u, var d, var m, var f, var h, var a, s, r, state, timeout_ms)
     let _head = xrcefrag.copy_head(var a, var m, 4)

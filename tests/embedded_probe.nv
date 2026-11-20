@@ -242,7 +242,8 @@ fn frag_score() -> Int
     if got.code == rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED
         n = n + 1
     let kept = xrcefrag.keep_sample(var p1, xrcewire.XrceSample { found: true, request: 5,
-                                    object: 0x16, start: 16, length: 2 }, state, var a)
+                                    object: 0x16, start: 16, length: 2 },
+                                    state, var a)
     if kept.code == xrcefrag.FRAG_DONE and a.len() == 2
         n = n + 1
     n

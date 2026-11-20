@@ -34,12 +34,7 @@ fn vec_of(xs: [Int]) -> Vec[u8; 512]
 
 // The bytes of a message buffer, as a list.
 fn list_of(var m: Vec[u8; 512]) -> [Int]
-    var out: [Int] = []
-    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
-    for x in m
-        let wide = x as Int
-        out = list.push(out, wide)
-    out
+    list.map(m.to_list(), x => x as Int)
 
 // Whether two streams hold the same numbers.
 fn same(a: xrcestream.RelStream, b: xrcestream.RelStream) -> Bool
@@ -668,7 +663,8 @@ fn receiver_takes(var rx: xrcestream.RelStream, var m: Vec[u8; 512]) -> Vec[u8; 
 
 // The sender takes the receiver's ACKNACK and answers the messages it
 // sends again, from its history.
-fn sender_takes(var tx: xrcestream.RelStream, var h: Vec[u8; 2056], var reply: Vec[u8; 512]) -> [[Int]]
+fn sender_takes(var tx: xrcestream.RelStream, var h: Vec[u8; 2056],
+                var reply: Vec[u8; 512]) -> [[Int]]
     let ev = xrcestream.receive(var reply, tx)
     tx = ev.stream
     var again: [[Int]] = []
