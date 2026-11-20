@@ -682,14 +682,97 @@ on its stack: the message, the frame, the de-framer, the history and the
   the agent's, not the node's, and nothing on the node's side can say so.
 - `ros2 topic echo` missed the first two samples in two runs of the reliable
   talker over UDP, each the first session of a freshly started agent, and
-  printed `data: 2` first. On a later session of the same agent the same
-  command printed `data: 0` to `data: 9`, as did the talker over TCP, with
-  this package and with 0.1.2, and over UDP on the best-effort stream. In both
-  short runs the agent's log has all ten samples written to DDS, one a second
-  and in order, and each acknowledged, so the link delivered them and the
-  ROS side had not matched the new writer yet. The cause was not run down.
-  The examples wait a second after creating the writer, which is not always
-  enough for a fresh agent.
+  printed `data: 2` first. The cause is not in this package: the reader did not
+  exist yet, and the agent's writer keeps one sample for a reader that arrives
+  late. The next section has the runs and the log lines.
+
+## The first samples and a reader that is not there yet, 2026-11-20
+
+Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy on one machine, novo 0.26.0, agent
+verbose level 6, UDP on port 8888, a freshly started agent for every run and
+`examples/host_talker.nv` as built for the runs above (reliable stream, ten
+samples a second apart). The question was whether the first samples are lost
+by the session or by DDS. The board was not involved.
+
+Every run started `ros2 topic echo /novo_counter std_msgs/msg/Int32` and
+counted the samples it printed before the first one it did not miss. The
+machine was idle (load average 2) or loaded with 64 busy loops on its 32
+cores. The samples the echo missed:
+
+| Case | Machine | Runs | Runs with a miss | Samples missed |
+| --- | --- | --- | --- | --- |
+| echo started first, 0 s or 4 s before the talker | idle | 14 | 0 | 0 |
+| echo started right after the talker's first sample | idle | 11 | 0 | 0 |
+| echo started first, 0 s before the talker | loaded | 10 | 6 | 2, 2, 2, 2, 2, 3 (the other four: 0) |
+| echo started right after the talker's first sample | loaded | 6 | 6 | 1 or 2 |
+
+### What the agent's log shows about the session
+
+In every run, with and without a miss, the order on the wire is the one the
+session intends. The agent's log has the STATUS for the CREATE of the data
+writer (`81 01 03 00 05 01 06 00 00 04 00 15 00 00`, result `00 00`, status
+0) sent, and then, a second later, the WRITE_DATA on stream `0x80`
+(`81 80 00 00 07 01 08 00 ...`, sequence 0), `write | [** <<DDS>> **] | len: 4`
+with the four bytes of the number, and the ACKNACK (`... 0A 01 05 00 01 00 00
+00 80`). A WRITE_DATA never reached the agent before the status of the data
+writer, the stream's first sequence number was 0, and each sample was written
+to DDS and acknowledged. The log is the same in a run that lost samples at the
+echo and in a run that lost none.
+
+### What the ROS 2 side does
+
+The agent's writer, as `ros2 topic info -v /novo_counter` shows it, is
+`RELIABLE` and `TRANSIENT_LOCAL`; the command reports its history depth as
+`UNKNOWN`, and the replay below behaves as a depth of one. Two facts follow,
+each seen in a run:
+
+- A reader that matches after a sample was written receives only the newest
+  sample the writer holds. Started 2.5 s after the first sample with
+  `--qos-reliability reliable --qos-durability transient_local`, the echo
+  printed `data: 3` first, with samples 0 to 2 gone; with
+  `--qos-history keep_all --qos-depth 50` and 3.5 s it printed `data: 4`
+  first. Samples 0 to 3 had been written and the writer held only the newest
+  when the reader arrived. With `--qos-durability volatile` it
+  printed the sample written after it matched, `data: 4`, and nothing before.
+- `ros2 topic echo` chooses its own QoS when it creates the subscription, from
+  the publishers it can see at that moment (`ros2topic/verb/echo.py`,
+  `choose_qos`). With none it takes volatile; with the agent's writer it takes
+  transient local. Which of the two it took is the race of the command line
+  with the writer, and the command prints neither.
+
+A subscription is ready after the command has started Python, loaded the
+message package and discovered the agent's participant. On the idle machine
+that took less than a second after the writer existed: with the talker
+writing every 100 ms from the moment the writer was created, five fresh
+agents delivered the first sample 0.202 s later (`data: 2`) every time. The
+talker's second before its first sample covers that. On the loaded machine the
+same start took 3.8 s in two runs measured (from the command's start to its
+first sample), and the echo printed `data: 2`, delivered 0.77 s after the agent
+wrote it, which is the replay of the one retained sample at the match. The
+talker had written samples 0 and 1 to a writer with no reader, and the writer
+held only the newest sample when the reader arrived.
+
+### What the package can and cannot know
+
+The agent does not report that a reader has matched. Its log at level 6 has
+no line for it, and the agent's default middleware (`-m dds`, Fast DDS) creates
+the data writer with no listener (`FastDDSDataWriter::create_by_xml` in
+`middleware/fastdds/FastDDSEntities.cpp`), so there is no callback that could
+tell it. Only the Fast RTPS middleware (`-m rtps`, `middleware/fast`) has an
+`onPublicationMatched`, and it writes a trace line in the agent's log, not a
+message to the client. This run did not use it. `STATUS_OK_MATCHED` (0x01)
+is the answer to a CREATE that found an entity with the same description
+already there, and says nothing about readers. The `GET_INFO` answer for a data
+writer (`DATAWRITER_ActivityInfo`) carries a stream sequence number and a
+sample sequence number and no count of readers, and nothing under the agent's
+`src/cpp` builds an activity info. The XRCE-DDS 1.0 text is not on this machine;
+the types above are the agent's own, generated from the specification's IDL.
+
+So the protocol gives a node no way to ask whether a reader is there. What a
+node can do is wait an interval it chose, which is what the examples do and
+which a loaded machine overruns, or write its first sample again in a later
+cycle. The package does neither for the caller. Sizing the writer's history
+through the XML of `XRCE_KIND_DATAWRITER` was not tried.
 
 ## The board
 

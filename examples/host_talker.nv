@@ -110,8 +110,10 @@ fn talk<T: RosTransport[e]>(link: T, reliable: Bool) [e, io, time]
     s = writer.session
     var rel = xrcestream.rel_stream()
     var hist = xrcestream.history()
-    // Long enough for the agent's writer to find a subscriber before the
-    // first sample, which a best-effort stream does not repeat.
+    // A pause for a subscriber to find the agent's writer before the first
+    // sample. Nothing tells the node that one has: on a machine with every
+    // core busy a second is not enough, and a late subscriber receives only
+    // the newest sample the writer holds (README, "What a first sample needs").
     time.sleep(1.0)
     var n = 0
     let limit = 10

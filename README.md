@@ -336,6 +336,29 @@ stream's job and not the link's.
 Both were run against a Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy;
 `docs/agent-run.md` has the commands and the agent's log.
 
+### What a first sample needs
+
+A sample reaches a ROS 2 subscriber only if the agent's data writer has a
+matched reader when the agent writes it. The agent creates the writer when the
+CREATE is acknowledged, and nothing in the XRCE protocol reports that a reader
+has matched: the agent logs no match, `STATUS_OK_MATCHED` means an entity with
+that description already existed, and the `GET_INFO` answer for a writer
+carries sequence numbers and no count of readers. The package therefore has no
+call that waits for one, and `write_sample` and `write_sample_reliable` answer
+`ROS_RET_OK` when the agent has taken the message, whether or not anybody is
+listening. The reliable stream does not change that, because it
+acknowledges delivery to the agent and not to a subscriber.
+
+The agent's writer is `RELIABLE` and `TRANSIENT_LOCAL`, and a late reader
+receives the newest sample the writer holds and none before it. A subscriber
+started before the node can therefore miss the node's first samples, and the
+count depends on how long the subscriber takes to start. `examples/host_talker.nv`
+waits a second after creating the writer. On an idle machine that covered 25
+of 25 runs with `ros2 topic echo`; with every core busy, 12 of 16 runs lost one
+to three samples at the start. A node whose first samples matter writes them
+again in a later cycle; the section on the first samples in `docs/agent-run.md`
+has the runs and the agent's log.
+
 ## Running on a microcontroller
 
 Nine modules build for a microcontroller with no heap allocator:

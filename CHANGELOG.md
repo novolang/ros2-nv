@@ -5,6 +5,29 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased
+
+Documentation only. No signature, type or behaviour changed.
+
+### Changed
+
+- **The first samples of a freshly started agent.** The 0.1.3 notes recorded
+  that `ros2 topic echo` missed samples 0 and 1 of the first reliable session
+  and that the cause was not run down. It has been run down: the session
+  sends the WRITE_DATA after the agent's STATUS for the data writer, the
+  stream's first sequence number is 0 and each sample is written to DDS and
+  acknowledged, in the runs that lost samples as in those that did not. The
+  loss is on the ROS 2 side. The agent's writer is `TRANSIENT_LOCAL` and
+  keeps the newest sample for a late reader, and on a machine with every core
+  busy `ros2 topic echo` took about 3.8 s to subscribe, so it received the
+  third sample and none before it. On an idle machine 25 runs lost nothing.
+  The README names what a first sample needs, `docs/agent-run.md` has the
+  runs, and the agent's side of the matched-reader question is recorded
+  there: the protocol gives a node no signal for it, so the package offers no
+  call that waits for a reader.
+- **`examples/host_talker.nv`**: the comment on the second's wait no longer
+  says it is long enough for the writer to find a subscriber.
+
 ## 0.1.3 — 2026-11-19
 
 A node can reach an agent over UDP, and can take a sample longer than one
