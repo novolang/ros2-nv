@@ -32,10 +32,10 @@ and are not in the suite.
 
 | The node reaches the agent by | Program | Start the agent with |
 | --- | --- | --- |
-| TCP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, `examples/host_server.nv`, `examples/host_client.nv` | `MicroXRCEAgent tcp4 --port 2018` |
-| UDP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, `examples/host_server.nv`, `examples/host_client.nv`, with `udp` as the last argument | `MicroXRCEAgent udp4 --port 2018` |
-| A serial line, from a board | `examples/dk_talker.nv`, `examples/dk_sensor_node.nv` | `MicroXRCEAgent serial --dev /dev/ttyACM<n> -b 115200` |
-| A serial line, from a PC | `examples/uart_stdio.nv`, `examples/uart_stdio_listener.nv`, `examples/uart_stdio_server.nv` | `MicroXRCEAgent serial --dev <the PC end of the line> -b 115200` |
+| TCP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, `examples/host_server.nv`, `examples/host_client.nv`, `examples/host_long_talker.nv`, `examples/host_long_server.nv` | `MicroXRCEAgent tcp4 --port 2018` |
+| UDP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, `examples/host_server.nv`, `examples/host_client.nv`, `examples/host_long_talker.nv`, `examples/host_long_server.nv`, with `udp` as the transport argument | `MicroXRCEAgent udp4 --port 2018` |
+| A serial line, from a board | `examples/dk_talker.nv`, `examples/dk_sensor_node.nv`, `examples/dk_long_talker.nv` | `MicroXRCEAgent serial --dev /dev/ttyACM<n> -b 115200` |
+| A serial line, from a PC | `examples/uart_stdio.nv`, `examples/uart_stdio_listener.nv`, `examples/uart_stdio_server.nv`, `examples/uart_stdio_long.nv` | `MicroXRCEAgent serial --dev <the PC end of the line> -b 115200` |
 
 The examples use port 2018 for either agent, TCP or UDP.
 `rosagent.ROS_AGENT_DEFAULT_PORT` is 8888, which is the UDP agent's own
@@ -1121,6 +1121,205 @@ The image stays on the board.
   belongs to (`xrcewire.request_of`); `take_request` and `take_reply` do the
   same and report a sample of another entity as a take that failed, with its
   object.
+
+## Long samples, 2026-11-20
+
+A node writes a sample longer than one message, and takes a long service
+request or reply. Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy on one machine, novo
+0.26.0, agent verbose level 6, a fresh agent for each run, the node on
+`127.0.0.1` except for the board. Every `ros2` command ran under `bash -c 'source
+/opt/ros/jazzy/setup.bash && ...'`. A full test sweep of the repository was running
+on the machine throughout, at a load average of about 33; the runs that lost a
+sample to it are counted below. `ros2 topic echo` cuts a string to 128 characters
+unless it is given `--full-length`, and every text below was printed with it.
+
+The texts are `abcdefghijklmnopqrstuvwxyz` repeated: the one of 1,000 characters
+is 1,005 bytes of CDR (the length 1,001, the characters, the closing zero), the
+one of 2,000 is 2,005 and the one of 2,040 is 2,045, which is more than the four
+slots of the history hold.
+
+### What is on the wire
+
+`rostransport.write_sample_long` and `rosuart.write_sample_long` cut a WRITE_DATA
+the way the eProsima client does: the submessage is serialised whole, with its own
+header and the length of the whole, and sent as a run of messages on stream `0x80`,
+each holding one FRAGMENT of up to 504 bytes, with the flag `0x02` set on the
+last. The three messages for the text of 1,000 characters, from the agent's log
+(request id 5, data writer `0x15`, sequence numbers 0 to 2):
+
+```
+node -> agent  81 80 00 00 0D 01 F8 01 | 07 01 F1 03 00 05 00 15 E9 03 00 00 61 62 63 ...   (512 bytes)
+node -> agent  81 80 01 00 0D 01 F8 01 | 79 7A 61 62 63 64 65 66 67 68 ...                  (512 bytes)
+node -> agent  81 80 02 00 0D 03 05 00 | 69 6A 6B 6C 00                                      (13 bytes)
+```
+
+The first piece begins with the WRITE_DATA's own header, `07 01 F1 03`, whose length
+`0x03F1` is 1,009, the four bytes of ids and the 1,005 of the sample, and then the
+request id `00 05`, the writer `00 15` and the sample. The agent joined the three
+and wrote one sample to DDS: its log has `DataWriter.cpp write ... len: 1005`. A
+reply is cut the same way with the 24 bytes of the request's identity after the ids,
+and the agent's `Replier.cpp write` shows `len: 2033` for a reply of 2,009 bytes.
+`tests/roslong_tests.nv` holds these frames.
+
+A text of 2,045 bytes is 2,053 bytes of WRITE_DATA and five pieces. The history
+holds four messages, so the first call wrote four, 2,008 bytes of the sample, and
+the call after the agent's ACKNACK wrote the fifth. The two calls are in the
+talker's output below.
+
+### (a) The talker over TCP
+
+```
+MicroXRCEAgent tcp4 --port 2151 -v 6
+ros2 topic echo --full-length /novo_text std_msgs/msg/String
+novo build examples/host_long_talker.nv -o host_long_talker
+./host_long_talker 127.0.0.1 2151
+```
+
+The program printed:
+
+```
+session: established
+participant: code 0, agent status 0 (ok)
+topic: code 0, agent status 0 (ok)
+publisher: code 0, agent status 0 (ok)
+datawriter: code 0, agent status 0 (ok)
+text of 1000 characters: call 1, code 0, 1005 of 1005 bytes written
+  0 unacknowledged
+text of 2000 characters: call 1, code 0, 2005 of 2005 bytes written
+  0 unacknowledged
+text of 2040 characters: call 1, code 0, 2008 of 2045 bytes written
+text of 2040 characters: call 2, code 0, 2045 of 2045 bytes written
+  0 unacknowledged
+0 unacknowledged at the end
+```
+
+`ros2 topic echo` printed three samples, of 1,000, 2,000 and 2,040 characters,
+each a run of the alphabet from `a`, checked by a script against the string the
+program built. Two runs, both complete. The agent's log has the pieces at
+sequence 0 to 2, 3 to 6 and 7 to 11, the last of the twelve with `0D 03 25 00`, the
+last flag and 37 bytes, and a `write ... len:` of 1005, 2005 and 2045.
+
+### (b) The talker over UDP
+
+```
+MicroXRCEAgent udp4 --port 2171 -v 6
+./host_long_talker 127.0.0.1 2171 udp
+```
+
+The output is the same as over TCP. The pieces are 512-byte datagrams, one to a
+message, which is what the session announced to the agent. Five runs: three printed
+all of 1,000, 2,000 and 2,040 characters, and two printed the last two only. In
+those two the agent's log has the three `write ... len:` lines, 1005, 2005 and 2045,
+so the node wrote and the agent joined all three; the subscriber had not matched
+the agent's writer yet when the first went out, which is the case "What a first
+sample needs" in the README describes, here with every core busy.
+
+### (c) The device code over a pseudoterminal pair
+
+`examples/uart_stdio_long.nv` is the device's talker (`ConsoleUart`, the serial
+framing, `rosuart.write_sample_long`, no heap) with a host `main`, as
+`uart_stdio_listener.nv` is the device's subscription:
+
+```
+socat pty,raw,echo=0,link=ttyAGENT pty,raw,echo=0,link=ttyBOARD
+MicroXRCEAgent serial --dev ttyAGENT -b 115200 -v 6
+ros2 topic echo --full-length /novo_text std_msgs/msg/String
+novo build examples/uart_stdio_long.nv -o uart_stdio_long
+./uart_stdio_long <>ttyBOARD >&0 2> device.err
+```
+
+`device.err` held:
+
+```
+text of 1000 characters: 1005 bytes written, done true, 0 unacknowledged
+text of 2000 characters: 2005 bytes written, done true, 0 unacknowledged
+text of 2040 characters: 2045 bytes written, done true, 0 unacknowledged
+published 3 text(s), silence 1 ms
+```
+
+Five runs: four printed all three texts, and one the last two, the agent's log again
+showing the three samples written (`len: 1005`, `2005`, `2045`).
+
+### (d) The services
+
+`examples/host_long_server.nv` serves two services. `/long_reply` is
+`std_srvs/srv/Trigger`: the request is one byte and the reply a success flag and a
+text, 1,009 bytes for 1,000 characters and 2,009 for 2,000. `/long_request` is
+`rcl_interfaces/srv/GetParameters`: the request names the parameters, and a name of
+1,000 characters makes it 1,012 bytes; the reply is an empty list.
+
+```
+MicroXRCEAgent tcp4 --port 2132 -v 6
+./host_long_server 127.0.0.1 2132 40 tcp 2000
+ros2 service call /long_reply std_srvs/srv/Trigger
+ros2 service call /long_request rcl_interfaces/srv/GetParameters "{names: ['<1,000 characters>']}"
+```
+
+The server printed:
+
+```
+request 0: /long_reply, 4 bytes; reply of 2000 characters, 2009 bytes
+  reply: code 0, 1984 of 2009 bytes written
+  reply written: 2009 bytes
+request 1: /long_request, 1012 bytes, 1 name(s), the first of 1000 characters
+  reply: code 0, 4 of 4 bytes written
+```
+
+A reply is front 32 bytes and four slots, so the first call wrote 1,984 bytes and
+the rest went out when the agent had acknowledged some. `ros2 service call` printed
+`std_srvs.srv.Trigger_Response(success=True, message='abcdefghijklmnopqrstuvwxyz...')`
+with all 2,000 characters (checked by a script), and for the other service
+`rcl_interfaces.srv.GetParameters_Response(values=[])`. The agent's log has
+`Replier.cpp read_fn ... len: 1036`, the identity and the request, and `write ...
+len: 2033`. The same with 1,000 characters (a reply of 1,009 bytes in three
+pieces, written in one call) and over UDP with 2,000 answered as well: three
+sessions, six calls, all answered.
+
+### (e) The nRF52840-DK
+
+`examples/dk_long_talker.nv` is the same talker for the board: nRF52840-DK 683644473
+(PCA10056, J-Link OB 1366:1024), UARTE0 through the interface MCU (P0.06 TX and
+P0.08 RX), 115200 baud, no wiring. It publishes the three texts in turn, with the
+session kept alive by `poll` and `keepalive`. The board lock
+`/tmp/novo-nrf52840-dk-683644473.lock` was held for the runs.
+
+```
+novo build --target=nrf52840-dk --hci-uart=physical examples/dk_long_talker.nv
+MicroXRCEAgent serial --dev /dev/serial/by-id/usb-SEGGER_J-Link_000683644473-if00 -b 115200 -v 6
+ros2 topic echo --full-length /novo_text std_msgs/msg/String
+probe-rs download --chip nRF52840_xxAA --probe 1366:1024:000683644473 dk_long_talker.elf
+probe-rs reset --chip nRF52840_xxAA --probe 1366:1024:000683644473
+```
+
+The agent was started before the board was flashed and reset. The image is 28,516
+bytes of flash and 2,712 bytes of static RAM, the same static RAM as
+`dk_sensor_node`; the compiler reports 9,072 bytes of worst-case stack, of which the
+sample's 2,056 are part. In 25 seconds `ros2 topic echo` printed, in order, 1,000,
+2,000, 2,040, 1,000, 2,000, 2,040, 1,000 characters in the first run and the same
+and a 2,000 in the second, all correct, with no session re-established. The image
+stays on the board.
+
+### What this run taught the package
+
+- **A write that waits for the history is a loop in the caller.** A reply of
+  more than 1,984 bytes, or a sample of more than 2,008, is more than four
+  slots hold, so the call answers how far it got. Both examples poll between the
+  calls and none of the five calls blocks.
+- **Feed the quiet time the time that passed.** The board's first loop spent
+  its two seconds between texts in `delay_ms` and `heartbeat` with a wait of
+  50 ms, and the agent logged a session re-established every 3.2 seconds. The
+  second loop polled and called `keepalive`, and passed `reliable_tick` 100 ms for
+  each `poll`; `poll` returns at once when a frame is waiting, so the node sent a
+  HEARTBEAT every 9 ms, the agent answered each, and the session was
+  re-established three times in 25 seconds. The loop now reads the board's clock
+  (`hal.timer.ticks_us`), as `dk_sensor_node` does, and passes both the time that
+  passed; the board then kept one session for the whole of both runs.
+- **The agent joins what the client cuts.** Nothing in the agent needed a setting
+  for the node's WRITE_DATA to arrive as one sample: 1,005, 2,005 and 2,045 bytes
+  went to DDS from the three runs of (a).
+- **A subscriber that starts with the node can miss the first text**, here in two of
+  five UDP runs and one of five runs over the pseudoterminal pair, with the sweep
+  running. The README's rule for the first samples applies to long ones too.
 
 ## The board
 

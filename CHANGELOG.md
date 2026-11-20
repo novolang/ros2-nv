@@ -18,6 +18,72 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
   `.github/workflows/interop.yml` runs the suite and `.github/workflows/check.yml`
   builds, tests and audits the package, on every push.
 
+## 0.1.6 — 2026-11-20
+
+A node writes a sample longer than one message, and takes a long service
+request or reply: `write_sample_long`, `send_request_long`, `send_reply_long`,
+`take_request_long` and `take_reply_long`, in `rostransport` over a pipe and in
+`rosuart` over a UART with no heap. Run against a Micro XRCE-DDS Agent 2.4.3 and
+ROS 2 Jazzy on a PC, over a pseudoterminal pair and on an nRF52840-DK. Nothing
+published changed its signature, and a short sample is written byte for byte as
+it was.
+
+### Added
+
+- **`xrcewire` and `xrcefrag`: the pieces of a write.** `begin_fragment` and
+  `finish_fragment` build the message of one FRAGMENT on the reliable stream, the
+  last piece flagged; `put_write_front` and `put_reply_front` write the front of
+  the WRITE_DATA it cuts, whose submessage header carries the length of the whole
+  and which is the first bytes of the first piece, as the eProsima client sends
+  one. `xrcefrag.piece_begin` starts a piece, `piece_room` says how many bytes it
+  takes, `copy_head` puts the first bytes of a joined sample in a message so that
+  `request_of` and `response_of` read it, and `XRCE_PIECE_BYTES` (504) and
+  `XRCE_LONG_MAX_SAMPLE` (2,048) are the constants.
+- **`rostransport` and `rosuart`: `write_sample_long`, `send_request_long` and
+  `send_reply_long`.** A sample that fits one message is written as
+  `write_sample_reliable`, `send_request` and `send_reply` write it. A longer one
+  goes out as pieces of up to 504 bytes, each with a sequence number of its own and
+  a slot of the history, so the HEARTBEAT and the ACKNACK cover every piece. The
+  history is not grown: a call writes as many pieces as the four slots hold,
+  2,016 bytes with the front, and answers `at`, how many bytes of the sample are
+  out, and `done`; the caller polls and calls again with the same `at`. A call that
+  finds the history full writes nothing and answers `ROS_RET_BAD_ALLOC`. A sample
+  longer than 2,048 bytes answers `ROS_RET_INVALID_ARGUMENT`. The device forms
+  take the sample in a `Vec[u8; 2048]`, 2,056 bytes the caller owns.
+- **`take_request_long` and `take_reply_long`** are `take_request` and `take_reply`
+  over `poll_long`: they take the buffer the pieces are joined in and the
+  reassembly state, and answer a request or a reply of up to 2,040 bytes whole.
+  `take_request` and `take_reply` are unchanged.
+- **Examples.** `examples/host_long_talker.nv` publishes a `std_msgs/String` of
+  1,000, 2,000 and 2,040 characters; `examples/host_long_server.nv` serves
+  `/long_reply` (a Trigger whose reply is a text of up to 2,000 characters) and
+  `/long_request` (a GetParameters whose request is as long as the caller sends);
+  `examples/uart_stdio_long.nv` is the device's talker run on a PC over a
+  pseudoterminal pair; and `examples/dk_long_talker.nv` is the same talker on an
+  nRF52840-DK, at 28,516 bytes of flash and 2,712 bytes of static RAM.
+- **Tests.** `tests/roslong_tests.nv`, 15 tests, holds the pieces to the bytes the
+  agent accepted for a text of a thousand characters and drives all five calls
+  of both sessions, with a sample of three, four and five pieces, a window that
+  fills, a pipe and a transmitter that take nothing, a place outside the sample, a
+  sample that fits one message, and a request and a reply joined from the agent's
+  pieces. `tests/embedded_probe.nv` runs 135 checks, six more, and passes under
+  QEMU. Merged line coverage of `src/` is 1,782 of 1,787 lines; the five are the
+  `// cov: skip` lines that were there.
+- **`docs/agent-run.md`** records the runs: the host talker over TCP and UDP, the
+  device's talker over a pseudoterminal pair, the two services, and the
+  nRF52840-DK, each with the text `ros2 topic echo` or `ros2 service call`
+  printed and the agent's log.
+
+### Changed
+
+- The README's rules 15, 22, 32 and 33, the section on a microcontroller, and the
+  list of what the package leaves out describe writing a long sample; the
+  bullets for sending a long sample and for a long request or reply are replaced
+  by the limit of 2,048 bytes, two long samples at once, and a service call that
+  waits for its pieces by itself.
+- The flash of `examples/dk_sensor_node.nv` went from 29,392 to 29,476 bytes, the
+  drop code of the two new result types; its static RAM stayed at 2,712 bytes.
+
 ## 0.1.5 — 2026-11-20
 
 Services: a node calls a service and serves one, with the requester and the
