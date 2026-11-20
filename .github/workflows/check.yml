@@ -24,6 +24,13 @@ jobs:
   check:
     name: build, test and audit
     runs-on: ubuntu-latest
+    env:
+      # The device link is written against ld.lld.  A clang newer than
+      # 20 hands a bare-metal link to the GNU linker of a GCC cross
+      # toolchain it finds, and the runner's GNU ld is the host's,
+      # which knows no ARM.  Every device build on this job, the probe
+      # step's and the bar's, names lld for the link.
+      NOVO_CFLAGS: -fuse-ld=lld
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -89,12 +96,7 @@ jobs:
           set -eu
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi lld qemu-system-arm
-          # The device link is written against ld.lld.  A clang newer than
-          # 20 hands a bare-metal link to the GNU linker of a GCC cross
-          # toolchain it finds, and the runner's GNU ld is the host's,
-          # which knows no ARM; NOVO_CFLAGS names lld for the link.
-          NOVO_CFLAGS=-fuse-ld=lld \
-            novo build --target=nrf52-qemu tests/embedded_probe.nv -o probe.elf
+          novo build --target=nrf52-qemu tests/embedded_probe.nv -o probe.elf
           timeout 60 qemu-system-arm -machine mps2-an386 -nographic -semihosting \
             -kernel probe.elf > probe.out 2>&1 || true
           cat probe.out
