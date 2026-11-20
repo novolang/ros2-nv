@@ -140,12 +140,12 @@ Build and test with `novo pkg build` and `novo test tests`.
 | `rosgraph` | How many of each thing a firmware was built to hold, how many have been created, and whether two endpoints will connect. |
 | `rosexec` | The executor as a step a caller drives, the two dispatch semantics, the three trigger policies, and periodic timers counted in the caller's own milliseconds. |
 | `rosmsg` | A serialised message as bytes this package does not read, the four-byte header that says which byte order they are in, and whether the whole thing fits the transport. |
-| `rostransport` | The session with the agent, the two stream kinds, `RosTransport`, the byte pipe a program implements over its own link, and the functions that open a session, create entities, write samples, ask for samples and take them over one, a sample longer than one message included (`poll_long`). |
-| `xrcewire` | The Micro XRCE-DDS messages a client sends and the replies it reads, built in a buffer the caller owns: the requests that create entities, write and read samples, the HEARTBEAT and ACKNACK of a reliable stream, and the FRAGMENT a long sample is cut into. |
+| `rostransport` | The session with the agent, the two stream kinds, `RosTransport`, the byte pipe a program implements over its own link, and the functions that open a session, create entities, write samples, ask for samples and take them over one, a sample longer than one message included (`poll_long`), and call and serve a service (`send_request`, `take_reply`, `take_request`, `send_reply`). |
+| `xrcewire` | The Micro XRCE-DDS messages a client sends and the replies it reads, built in a buffer the caller owns: the requests that create entities, write and read samples, the HEARTBEAT and ACKNACK of a reliable stream, the FRAGMENT a long sample is cut into, and the requester and replier of a service with the sample identity that pairs a reply to its request. |
 | `xrcestream` | One reliable stream as arithmetic over integers: sequence numbers that wrap, the history of messages kept for retransmission, what a received message asks of the session, and when a HEARTBEAT is due. It allocates nothing. |
 | `xrcefrag` | A sample longer than one message, joined from the pieces the agent sends it in, in a buffer the caller owns, with a limit the caller sets. It allocates nothing. |
 | `xrceframe` | The framing of a serial link to an agent: begin flag, addresses, length, byte stuffing and CRC-16, as a framer and a de-framer that allocate nothing. |
-| `rosuart` | The session over a UART, for a device: the same requests as `rostransport`, including subscriptions, the reliable stream and long samples, with no heap, over `XrceUart`, the trait a board's UART implements. |
+| `rosuart` | The session over a UART, for a device: the same requests as `rostransport`, including subscriptions, the reliable stream, long samples and services, with no heap, over `XrceUart`, the trait a board's UART implements. |
 | `rosparam` | The three parameter types a microcontroller node can have, the seven it cannot, and the rule that a parameter keeps the type it was declared with. |
 | `rosagent` | A byte pipe to a micro-ROS agent over TCP or UDP. The only module in the package that opens anything. |
 
@@ -166,17 +166,21 @@ is a program that publishes a counter through either, on the best-effort
 stream or, given `reliable`, on the reliable one, and `udp` as the fourth
 argument chooses the datagram link. `examples/host_listener.nv` subscribes:
 it creates a data reader, asks for samples and prints each one `poll_long`
-takes, a text of a thousand bytes included.
+takes, a text of a thousand bytes included. `examples/host_server.nv` serves
+`/add_two_ints` (`example_interfaces/srv/AddTwoInts`) and
+`examples/host_client.nv` calls it, or calls the server that
+`ros2 run demo_nodes_py add_two_ints_server` starts.
 
 **A program on a device calls `rosuart`.** Its functions take an
 `XrceUart`, which `rosuart.console_uart` supplies from the board's
 `hal.uart`, and allocate nothing; `examples/dk_talker.nv` is the same
 counter on an nRF54LM20 DK, `examples/dk_sensor_node.nv` is a node on an
 nRF52840-DK that publishes the chip's die temperature on `/dk/temperature`
-once a second and takes `/dk/led` to switch the board's LEDs, and
-`examples/uart_stdio_listener.nv` is the
+once a second, takes `/dk/led` to switch the board's LEDs and serves
+`/dk/add_two_ints`, `examples/uart_stdio_listener.nv` is the
 device's subscription run on a PC, with `string` as its third argument for a
-sample longer than one message, which `rosuart.poll_long` joins. `docs/agent-run.md` has the steps to run
+sample longer than one message, which `rosuart.poll_long` joins, and
+`examples/uart_stdio_server.nv` is the device's service server run on a PC. `docs/agent-run.md` has the steps to run
 each against an agent.
 
 **A program on a device calls the modules that build for it.** See
@@ -228,7 +232,7 @@ each against an agent.
     hidden** from `ros2 topic list`.
 13. **The name on the wire is not the name in the program.** A topic
     `/chatter` is the DDS topic `rt/chatter`, a service's requests are
-    `rq/…` and its replies `rr/…`, and the 255-character limit applies
+    `rq/…Request` and its replies `rr/…Reply`, and the 255-character limit applies
     to those.
 14. **A type name has three parts.** `std_msgs/msg/String`, not
     `std_msgs/String`; the two-part spelling is ROS 1's and is refused.
@@ -296,6 +300,37 @@ each against an agent.
     listens. A node with no agent finds out when `open_session` answers a
     session that is closed. The link sends to the agent's address and drops
     a datagram from any other.
+
+28. **A service is a requester and a replier, and a call is a pair of
+    samples.** A client creates a requester (kind 7) and a server a replier
+    (kind 8), each in a participant and each from an XML string that names
+    the service, its two types and its two topics: for `/add_two_ints`,
+    `rq/add_two_intsRequest` and `rr/add_two_intsReply`, which is what
+    `rosname.dds_request_name` and `dds_reply_name` answer. A server asks
+    for requests with `request_data` on its replier and takes them with
+    `take_request`; a client asks for replies the same way on its requester.
+    Both ask on `xrcewire.XRCE_STREAM_RELIABLE`, because a call that is lost
+    is a call that hangs.
+29. **A reply carries the identity of its request, and the node does not
+    read it.** `take_request` answers the request's `XrceIdentity`, the
+    writer's GUID and a sequence number, and `send_reply` writes it back
+    unchanged. A reply without it, or with another, reaches nobody: the
+    agent hands it to DDS as the reply's related sample identity, and the
+    client that asked finds its answer by it.
+30. **`send_request` answers the id its reply will quote.** A client with
+    several calls out matches `take_reply`'s `request` to it. A request is
+    not kept for a server that has not matched yet, and nothing in the
+    protocol says one has, so a client that wants an answer sends again when
+    none comes (`examples/host_client.nv` waits a second, then two seconds a
+    try, five tries). A request no server read leaves the requester with no
+    answer and no error.
+31. **A node that serves and subscribes reads one pipe.** A request, a
+    command and a status all arrive through `poll`. `take_request` and
+    `take_reply` answer `ROS_RET_SERVICE_TAKE_FAILED` and
+    `ROS_RET_CLIENT_TAKE_FAILED` for a sample that belongs to another
+    entity, with its `object`, and on a device with the sample still in the
+    buffer; `examples/dk_sensor_node.nv` polls and dispatches on
+    `xrcewire.request_of`.
 
 ## Reaching an agent over TCP or UDP
 
@@ -368,7 +403,7 @@ Nine modules build for a microcontroller with no heap allocator:
 `rosret`, `rosqos`, `rosgraph` and `rosexec`, which a node consults before
 it touches the wire, and `xrceframe`, `xrcewire`, `xrcestream`, `xrcefrag`
 and `rosuart`, which are the wire. `tests/embedded_probe.nv` is a firmware
-program that runs a hundred and twenty-one checks over them and is compiled
+program that runs a hundred and twenty-nine checks over them and is compiled
 for a Cortex-M as part of
 this package's checks, so the claim is built rather than asserted. The
 program runs under QEMU and prints `PASS`.
@@ -429,12 +464,19 @@ a counter on `/novo_counter` once a second. It is 22,840 bytes of flash and
 board's two register accesses replaced by standard input and output
 (`examples/uart_stdio.nv`); the run is recorded in `docs/agent-run.md`.
 
-`examples/dk_sensor_node.nv` is a node on an nRF52840-DK with a publisher
-and a subscription on the same UART. It is 24,712 bytes of flash and 2,712
-bytes of static RAM, and `docs/agent-run.md` records the run on the board
-against an agent in serial mode: 76 samples of `/dk/temperature` in 74
-seconds with no gap, and the output register of the LEDs read back after
-each command sent to `/dk/led`.
+`examples/dk_sensor_node.nv` is a node on an nRF52840-DK with a publisher,
+a subscription and a service server on the same UART. It is 29,392 bytes of
+flash and 2,712 bytes of static RAM, and `docs/agent-run.md` records the runs
+on the board against an agent in serial mode: 76 samples of `/dk/temperature`
+in 74 seconds with no gap, the output register of the LEDs read back after
+each command sent to `/dk/led`, and three calls of `/dk/add_two_ints` that
+answered 5, 42 and 999999999993.
+
+**What a service costs on a device.** A replier or a requester is an entity
+like a data writer: one more CREATE at start-up and no RAM of its own. A node
+that serves or calls uses the reliable stream, which is the 2,104 bytes above,
+and a payload buffer of its own (`Vec[u8; 512]`, 520 bytes) for what it sends,
+because the message buffer holds the request while the reply is built.
 
 The other five are excluded, each for a stated reason.
 
@@ -529,13 +571,24 @@ tiers cover all fourteen modules.
   is not found. A sample reaches the node without its encapsulation
   header, which the agent takes off, so the byte order of a big-endian
   publisher is lost; `poll` builds the message as little-endian CDR.
-- **A device listener for a board.** The subscription runs against a real
-  agent over TCP, and over a pseudoterminal pair with the device's own code
-  in `examples/uart_stdio_listener.nv`, a long sample included; it has not
-  been put on a board.
+- **A reply or a request longer than one message.** `take_request` and
+  `take_reply` read what `poll` reads, one message, so a service whose
+  message the agent would cut into pieces is not served; `poll_long` joins
+  pieces and the service calls do not use it. A request or a reply this
+  package writes is one message, as every written sample is.
+- **Knowing that a server is there.** A requester cannot ask whether a replier
+  matched, for the reason a publisher cannot (see "What a first sample
+  needs"), so a call that has no answer is sent again by the program.
+- **Quality of service for a service.** The XML names none, and the agent's
+  defaults matched `ros2 service call` and rclpy's server, both reliable. A
+  server or a client with other settings is not described.
+- **The interface types.** A request and a reply are bytes, as every sample
+  is; `examples/host_server.nv` writes the CDR of `AddTwoInts` by hand, and
+  `cdr-nv` is the package for a generated serialiser.
 - **Actions.** ROS 2's third communication pattern, with goals,
-  feedback and results, is built on five topics and two services. It is
-  a package of its own and rclc treats it that way.
+  feedback and results, is built on five topics and two services. The
+  services are in this package; the action is a package of its own and rclc
+  treats it that way.
 - **Managed nodes.** The configure, activate, deactivate and cleanup
   lifecycle is a separate rcl library.
 - **Discovery.** A micro-ROS node does not discover anything: it is
@@ -566,7 +619,7 @@ tiers cover all fourteen modules.
 
 ## Tests
 
-The suite is thirteen files under `tests/`. What they assert comes from
+The suite is fourteen files under `tests/`. What they assert comes from
 ROS 2's own behaviour rather than from an implementation: the return
 code numbering rcl publishes, the six quality-of-service profiles ROS 2
 ships and the requested-versus-offered rules the DDS specification
@@ -611,6 +664,13 @@ characters, with pieces in order, repeated, out of order and lost, a sample
 exactly as long as the limit and one byte longer, pieces that are not one
 DATA, and `poll_long` of both sessions over a pipe that records and a fake
 UART.
+
+`tests/rosservice_tests.nv` holds the requester and replier messages to the
+bytes the agent sent and accepted on 2026-11-20 in two runs of
+`/add_two_ints`, and drives `send_request`, `send_reply`, `take_request` and
+`take_reply` of both sessions over a pipe that records and a fake UART: the
+identity that comes back unchanged, a full window, a pipe that takes nothing, a
+sample that belongs to another entity, and a refused request.
 
 `tests/embedded_probe.nv` is the microcontroller program described
 above.

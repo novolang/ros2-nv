@@ -5,11 +5,76 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.5 — 2026-11-20
+
+Services: a node calls a service and serves one, with the requester and the
+replier of Micro XRCE-DDS, in `rostransport` over a pipe and in `rosuart` over
+a UART with no heap. Run against a Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy
+on a PC and on an nRF52840-DK. Nothing published changed its signature; the
+DDS names `rosname.dds_request_name` and `dds_reply_name` answer changed
+(Fixed, below).
+
+### Added
+
+- **`xrcewire`: the requester and the replier.** `XRCE_KIND_REQUESTER` (7) and
+  `XRCE_KIND_REPLIER` (8), `create_requester` and `create_replier`, which are
+  `create_entity` with the kind fixed; `begin_write_reply`, which writes a
+  reply's front, the replier's id and the 24-byte sample identity of the
+  request it answers; `XrceIdentity`, that identity as six numbers a server
+  holds between a request and its reply; `request_of` and `response_of`, which
+  read a request, with its identity, or a reply, with the request id of its
+  call, out of a sample `read_sample` or a poll found; `put_sample_i64`,
+  `i64_at` and `identity_at`; `object_kind`. A request is a WRITE_DATA on the
+  requester and a reply at a client a DATA with the call's request id in front;
+  `xrcewire`'s header lays the four forms out beside the client's and the
+  agent's sources.
+- **`rostransport` and `rosuart`: `create_requester`, `create_replier`,
+  `send_request`, `take_reply`, `take_request` and `send_reply`.** Requests
+  and replies go out on the reliable stream and stay in the history until the
+  agent acknowledges them; `send_request` answers the request id the reply
+  quotes. `take_reply` and `take_request` are `poll` with the sample read as a
+  client or a server reads it, and answer `ROS_RET_CLIENT_TAKE_FAILED` or
+  `ROS_RET_SERVICE_TAKE_FAILED`, with the entity's id, for a sample that is
+  another entity's, so that a node that subscribes and serves reads one pipe.
+  The host forms take and answer `Bytes`; the device forms take a
+  `Vec[u8; 512]` for the payload and leave the request in the caller's message
+  buffer. Payloads stay opaque bytes, as for topics.
+- **Examples.** `examples/host_server.nv` serves `/add_two_ints` and
+  `examples/host_client.nv` calls it; `examples/uart_stdio_server.nv` is the
+  device's server run on a PC over a pseudoterminal pair; and
+  `examples/dk_sensor_node.nv` serves `/dk/add_two_ints` beside its topics,
+  at 29,392 bytes of flash and 2,712 bytes of static RAM.
+- **Tests.** `tests/rosservice_tests.nv`, 11 tests, holds the messages to the
+  bytes the agent sent and accepted in two runs of `/add_two_ints` and drives
+  all four calls of both sessions, with a full window, a pipe that takes
+  nothing, a payload that does not fit, a session never opened, a refused
+  request and a sample of another entity. `tests/embedded_probe.nv` runs 129
+  checks, eight more, and passes under QEMU. Merged line coverage of `src/` is
+  1,613 of 1,618 lines; the five are the `// cov: skip` lines that were there.
+- **`docs/agent-run.md`** records the four runs: `ros2 service call` against
+  the novo-lang server over TCP (`sum=5`), the novo-lang client against
+  `ros2 run demo_nodes_py add_two_ints_server` (`sum=42`), the device server
+  over a pseudoterminal pair (`sum=5` and `sum=999999999993`) and the
+  nRF52840-DK (`sum=5`, `42` and `999999999993`), with the frames and the
+  agent's log.
+
+### Fixed
+
+- **`rosname.dds_request_name` and `dds_reply_name` answered a name that is not
+  a topic.** `/add_two_ints` gave `rq/add_two_ints` and `rr/add_two_ints`; the
+  topics a service travels on are `rq/add_two_intsRequest` and
+  `rr/add_two_intsReply`, so a program that built its XML from the old answer
+  named topics no ROS 2 node uses and no call matched. They append `Request` and `Reply`; `ROS_DDS_REQUEST_SUFFIX`
+  and `ROS_DDS_REPLY_SUFFIX` are new. `effective_length` is unchanged.
+- **`examples/dk_sensor_node.nv` makes its reliable stream and history anew
+  after each bring-up.** The agent numbers a new session from 0, and a stream
+  that carried on from the old numbers would have refused everything. The node
+  used the best-effort stream only until now, so it had not shown.
+
+## 0.1.4 — 2026-11-20
 
 A node on the nRF52840-DK, and a fix for a session that did not set up when
-the agent started after the node. No signature or type changed; the next
-release is 0.1.4.
+the agent started after the node. No signature or type changed.
 
 ### Added
 

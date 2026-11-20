@@ -16,10 +16,10 @@ in. The commands below work with either; the name is the only difference.
 
 | The node reaches the agent by | Program | Start the agent with |
 | --- | --- | --- |
-| TCP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv` | `MicroXRCEAgent tcp4 --port 2018` |
-| UDP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, with `udp` as the last argument | `MicroXRCEAgent udp4 --port 2018` |
+| TCP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, `examples/host_server.nv`, `examples/host_client.nv` | `MicroXRCEAgent tcp4 --port 2018` |
+| UDP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, `examples/host_server.nv`, `examples/host_client.nv`, with `udp` as the last argument | `MicroXRCEAgent udp4 --port 2018` |
 | A serial line, from a board | `examples/dk_talker.nv`, `examples/dk_sensor_node.nv` | `MicroXRCEAgent serial --dev /dev/ttyACM<n> -b 115200` |
-| A serial line, from a PC | `examples/uart_stdio.nv`, `examples/uart_stdio_listener.nv` | `MicroXRCEAgent serial --dev <the PC end of the line> -b 115200` |
+| A serial line, from a PC | `examples/uart_stdio.nv`, `examples/uart_stdio_listener.nv`, `examples/uart_stdio_server.nv` | `MicroXRCEAgent serial --dev <the PC end of the line> -b 115200` |
 
 The examples use port 2018 for either agent, TCP or UDP.
 `rosagent.ROS_AGENT_DEFAULT_PORT` is 8888, which is the UDP agent's own
@@ -889,6 +889,222 @@ FIFO and `receive` pauses a millisecond between polls, which is 11 bytes at
 115200 baud. The counters did not show it: no call of `receive` ended with
 a damaged frame, and the UARTE's `ERRORSRC` register, which holds the
 overrun, read 0. The package's `receive` is unchanged.
+
+## Services, 2026-11-20
+
+`/add_two_ints`, `example_interfaces/srv/AddTwoInts`: a request of two 64-bit
+integers `a` and `b`, a reply of one, `sum`. A Micro XRCE-DDS Agent 2.4.3 and
+ROS 2 Jazzy, novo 0.26.1, a fresh agent for each run. This Jazzy install does
+not carry `example_interfaces` or `demo_nodes_py`; both were unpacked from the
+ROS apt repository's packages (`ros-jazzy-example-interfaces` 0.12.1,
+`ros-jazzy-demo-nodes-py` 0.33.11) into a directory outside the tree and put
+on `AMENT_PREFIX_PATH`, `PYTHONPATH` and `LD_LIBRARY_PATH` after the
+`setup.bash` line. Nothing was installed on the system.
+
+A service is two DDS topics and two types, `rq/add_two_intsRequest` carrying
+`example_interfaces::srv::dds_::AddTwoInts_Request_` and `rr/add_two_intsReply`
+carrying `example_interfaces::srv::dds_::AddTwoInts_Response_`, and the node
+creates a *replier* (a server) or a *requester* (a client) in its participant
+from an XML string that names them:
+
+```
+<dds><replier profile_name="novo_add_two_ints" service_name="add_two_ints"
+     request_type="example_interfaces::srv::dds_::AddTwoInts_Request_"
+     reply_type="example_interfaces::srv::dds_::AddTwoInts_Response_">
+  <request_topic_name>rq/add_two_intsRequest</request_topic_name>
+  <reply_topic_name>rr/add_two_intsReply</reply_topic_name>
+</replier></dds>
+```
+
+The agent accepted the first CREATE of each kind (the replier's is the 365-byte
+message `81 01 01 00 01 05 65 01 00 02 00 18 08 02 00 00 57 01 00 00 3C 64 ...
+3E 00 00 11`: object `0x0018`, kind 8, the participant `0x0011` last).
+It logs the replier under the label `requester_id`, which is the agent's own
+pattern for both kinds.
+
+### What is on the wire
+
+A request is a WRITE_DATA on the requester: the request id, the requester's
+id, and the bytes. The agent writes a request to DDS and keeps the request id
+as the number the reply is matched to. A reply to it comes as a DATA on the
+requester: the ids of the READ_DATA that asked, then the request id of the
+call it answers and the requester's id, then the reply. The frames, from the
+second run below, with a = 40 and b = 2 (request id 4, requester `0x17`):
+
+```
+node  -> agent  81 80 00 00 07 01 14 00 00 04 00 17 28 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00
+agent -> node   81 80 01 00 09 01 10 00 00 03 00 17 00 04 00 17 2A 00 00 00 00 00 00 00
+```
+
+At a server a request is a DATA on the replier that has the *sample identity*
+of the request, 24 bytes, in front of the two numbers: the writer's GUID (a
+12-byte prefix and a 4-byte entity id) and a 64-bit sequence number. The
+reply is a WRITE_DATA on the replier that begins with the same 24 bytes. The
+frames, from the first run, a = 2 and b = 3:
+
+```
+agent -> node   81 80 00 00 09 01 2C 00 00 03 00 18
+                01 0F 82 9C 76 6C 8B 09 00 00 00 00 00 00 14 03 00 00 00 00 01 00 00 00
+                02 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00
+node  -> agent  81 80 00 00 07 01 24 00 00 39 00 18
+                01 0F 82 9C 76 6C 8B 09 00 00 00 00 00 00 14 03 00 00 00 00 01 00 00 00
+                05 00 00 00 00 00 00 00
+```
+
+The agent's own log shows the same 32 bytes going to DDS (`Replier.cpp write`,
+the identity then `05 00 ...`). `tests/rosservice_tests.nv` holds these frames.
+
+### (a) `ros2 service call` against the novo-lang server, over TCP
+
+```
+MicroXRCEAgent tcp4 --port 2018 -v 6
+novo build examples/host_server.nv -o host_server
+./host_server 127.0.0.1 2018 25 tcp
+source /opt/ros/jazzy/setup.bash        # and the directory with example_interfaces
+ros2 service call /add_two_ints example_interfaces/srv/AddTwoInts "{a: 2, b: 3}"
+```
+
+The server printed:
+
+```
+session: established
+participant: code 0, agent status 0 (ok)
+replier: code 0, agent status 0 (ok)
+request: code 0
+request 0: 2 + 3 = 5, reply code 0
+served 1 request(s)
+```
+
+and `ros2 service call`:
+
+```
+waiting for service to become available...
+requester: making request: example_interfaces.srv.AddTwoInts_Request(a=2, b=3)
+
+response:
+example_interfaces.srv.AddTwoInts_Response(sum=5)
+```
+
+The agent's log: `create_client`, `session established`, `participant created`
+and `replier created ... participant_id: 0x001(1)`.
+
+### (b) The novo-lang client against `ros2 run demo_nodes_py add_two_ints_server`
+
+```
+MicroXRCEAgent tcp4 --port 2018 -v 6
+ros2 run demo_nodes_py add_two_ints_server
+novo build examples/host_client.nv -o host_client
+./host_client 127.0.0.1 2018 40 2 tcp
+```
+
+The client printed:
+
+```
+session: established
+participant: code 0, agent status 0 (ok)
+requester: code 0, agent status 0 (ok)
+request: code 0
+call 0: 40 + 2, request 4, code 0
+reply to request 4: sum = 42
+```
+
+and the server `[INFO] [add_two_ints_server]: Incoming request` and `a: 40 b: 2`.
+The first request was answered; the client waits a second after creating the
+requester so that the server's reader can match the agent's writer, and sends
+again every two seconds without a reply, five times at most. The agent's log
+has `Requester.cpp write` with the sixteen bytes of the two numbers and
+`Requester.cpp read_fn` with the eight of the sum.
+
+A server that is not there yet is the case the retry is for. A request is
+written to DDS and delivered to the readers matched at that moment; nothing in
+the protocol says whether one is. The same rule holds for a sample on a topic
+(see the section on the first samples).
+
+One agent behaviour showed on an earlier, unrecorded run. A client that
+opened a session with the client key `0xAABBCCDD` received a DATA for the
+replier `0x18`, an object it had not created; the server of the run before,
+with the same key, had been killed a minute earlier. The likely cause is that
+the agent kept that session's replier, with the key, and sent its requests to
+the new session. `take_reply` answered `ROS_RET_CLIENT_TAKE_FAILED` with that
+object and the client went on. A fresh agent for each run avoids it, and the
+runs on this page used one.
+
+### (c) The device code over a pseudoterminal pair
+
+`examples/uart_stdio_server.nv` is the device's server (`ConsoleUart`, the
+serial framing, `rosuart.take_request` and `rosuart.send_reply`, no heap) with
+a host `main`, as `uart_stdio_listener.nv` is the device's subscription:
+
+```
+socat pty,raw,echo=0,link=ttyAGENT pty,raw,echo=0,link=ttyBOARD
+MicroXRCEAgent serial --dev ttyAGENT -b 115200 -v 6
+novo build examples/uart_stdio_server.nv -o uart_stdio_server
+./uart_stdio_server 40 <>ttyBOARD >&0 2> server.err
+ros2 service call /add_two_ints example_interfaces/srv/AddTwoInts "{a: 2, b: 3}"
+ros2 service call /add_two_ints example_interfaces/srv/AddTwoInts "{a: -7, b: 1000000000000}"
+```
+
+The answers were `sum=5` and `sum=999999999993`. `server.err` held:
+
+```
+request 0: 2 + 3 = 5, reply code 0
+request 1: -7 + 1000000000000 = 999999999993, reply code 0
+served 2 request(s), silence 402 ms
+```
+
+The agent's log has `replier created` with the participant `0x001(1)` and
+`session established ... address: 1`.
+
+### (d) The nRF52840-DK
+
+`examples/dk_sensor_node.nv` now also serves `/dk/add_two_ints`. The service is
+this one and not one that switches an LED because the interfaces ROS 2 ships
+for that are `std_srvs/srv/SetBool`, whose reply carries a string, and
+`Trigger`, which carries no number. AddTwoInts is fixed-size CDR in both
+directions, the reply is eight bytes built in place, and `ros2 service call`
+prints the answer. `/dk/led` stays a topic.
+
+The board: nRF52840-DK 683644473 (PCA10056, J-Link OB 1366:1024), UARTE0
+through the interface MCU (P0.06 TX and P0.08 RX), 115200 baud; no wiring.
+The board lock `/tmp/novo-nrf52840-dk-683644473.lock` was held for the run.
+
+```
+novo build --target=nrf52840-dk --hci-uart=physical examples/dk_sensor_node.nv
+MicroXRCEAgent serial --dev /dev/serial/by-id/usb-SEGGER_J-Link_000683644473-if00 -b 115200 -v 6
+probe-rs download --chip nRF52840_xxAA --probe 1366:1024:000683644473 dk_sensor_node.elf
+probe-rs reset --chip nRF52840_xxAA --probe 1366:1024:000683644473
+ros2 service call /dk/add_two_ints example_interfaces/srv/AddTwoInts "{a: 2, b: 3}"
+ros2 service call /dk/add_two_ints example_interfaces/srv/AddTwoInts "{a: 40, b: 2}"
+ros2 service call /dk/add_two_ints example_interfaces/srv/AddTwoInts "{a: -7, b: 1000000000000}"
+```
+
+The agent was started before the board was flashed and reset. The image is
+29,392 bytes of flash (24,712 before the service) and 2,712 bytes of static
+RAM; the worst-case stack the compiler reports is 9,576 bytes. The three calls
+answered `sum=5`, `sum=42` and `sum=999999999993`. The agent's log has the
+seven entities the node made before (`participant`, two `topic`, `publisher`,
+`datawriter`, `subscriber`, `datareader`) and then `replier created`. The topics went on working
+beside the service: `ros2 topic echo /dk/temperature` printed `data: 2325`
+and `data: 2350`, and `ros2 topic pub --once -w 1 /dk/led std_msgs/msg/Int32
+"{data: 2}"` left the output register of GPIO P0 at `0x0001a000` (bit 14
+clear, LED2 lit), read with `probe-rs read b32 ... 0x50000504 1`.
+
+The image stays on the board.
+
+### What this run taught the package
+
+- **The name of a service on the wire.** `rosname.dds_request_name` and
+  `dds_reply_name` answered `rq/add_two_ints` and `rr/add_two_ints`, which are
+  not topics that exist; the topics are `rq/add_two_intsRequest` and
+  `rr/add_two_intsReply`. They now append `Request` and `Reply`.
+- **A reliable stream restarts with the session.** The board node kept its
+  stream state and its history when it opened a new session, and the agent
+  numbers a new session from 0. It now makes both anew after each bring-up.
+- **A node that serves and subscribes reads one pipe.** The board's loop
+  polls once and tells a request from a command by the object the sample
+  belongs to (`xrcewire.request_of`); `take_request` and `take_reply` do the
+  same and report a sample of another entity as a take that failed, with its
+  object.
 
 ## The board
 
