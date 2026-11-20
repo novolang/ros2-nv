@@ -140,12 +140,12 @@ Build and test with `novo pkg build` and `novo test tests`.
 | `rosgraph` | How many of each thing a firmware was built to hold, how many have been created, and whether two endpoints will connect. |
 | `rosexec` | The executor as a step a caller drives, the two dispatch semantics, the three trigger policies, and periodic timers counted in the caller's own milliseconds. |
 | `rosmsg` | A serialised message as bytes this package does not read, the four-byte header that says which byte order they are in, and whether the whole thing fits the transport. |
-| `rostransport` | The session with the agent, the two stream kinds, `RosTransport`, the byte pipe a program implements over its own link, and the functions that open a session, create entities, write samples, ask for samples and take them over one, a sample longer than one message included (`poll_long`), and call and serve a service (`send_request`, `take_reply`, `take_request`, `send_reply`). |
-| `xrcewire` | The Micro XRCE-DDS messages a client sends and the replies it reads, built in a buffer the caller owns: the requests that create entities, write and read samples, the HEARTBEAT and ACKNACK of a reliable stream, the FRAGMENT a long sample is cut into, and the requester and replier of a service with the sample identity that pairs a reply to its request. |
+| `rostransport` | The session with the agent, the two stream kinds, `RosTransport`, the byte pipe a program implements over its own link, and the functions that open a session, create entities, write samples, ask for samples and take them over one, a sample longer than one message included, taken (`poll_long`) and written (`write_sample_long`), and call and serve a service (`send_request`, `take_reply`, `take_request`, `send_reply`, and the `_long` form of each for a request or a reply longer than one message). |
+| `xrcewire` | The Micro XRCE-DDS messages a client sends and the replies it reads, built in a buffer the caller owns: the requests that create entities, write and read samples, the HEARTBEAT and ACKNACK of a reliable stream, the FRAGMENT a long sample is cut into when it is written and read from when it is taken, and the requester and replier of a service with the sample identity that pairs a reply to its request. |
 | `xrcestream` | One reliable stream as arithmetic over integers: sequence numbers that wrap, the history of messages kept for retransmission, what a received message asks of the session, and when a HEARTBEAT is due. It allocates nothing. |
-| `xrcefrag` | A sample longer than one message, joined from the pieces the agent sends it in, in a buffer the caller owns, with a limit the caller sets. It allocates nothing. |
+| `xrcefrag` | A sample longer than one message, joined from the pieces the agent sends it in, in a buffer the caller owns, with a limit the caller sets, and the start of each piece of a sample the node cuts to send. It allocates nothing. |
 | `xrceframe` | The framing of a serial link to an agent: begin flag, addresses, length, byte stuffing and CRC-16, as a framer and a de-framer that allocate nothing. |
-| `rosuart` | The session over a UART, for a device: the same requests as `rostransport`, including subscriptions, the reliable stream, long samples and services, with no heap, over `XrceUart`, the trait a board's UART implements. |
+| `rosuart` | The session over a UART, for a device: the same requests as `rostransport`, including subscriptions, the reliable stream, long samples taken and written, and services, with no heap, over `XrceUart`, the trait a board's UART implements. |
 | `rosparam` | The three parameter types a microcontroller node can have, the seven it cannot, and the rule that a parameter keeps the type it was declared with. |
 | `rosagent` | A byte pipe to a micro-ROS agent over TCP or UDP. The only module in the package that opens anything. |
 
@@ -166,10 +166,12 @@ is a program that publishes a counter through either, on the best-effort
 stream or, given `reliable`, on the reliable one, and `udp` as the fourth
 argument chooses the datagram link. `examples/host_listener.nv` subscribes:
 it creates a data reader, asks for samples and prints each one `poll_long`
-takes, a text of a thousand bytes included. `examples/host_server.nv` serves
+takes, a text of a thousand bytes included. `examples/host_long_talker.nv` publishes a text of 1,000, 2,000 and 2,040
+characters with `write_sample_long`. `examples/host_server.nv` serves
 `/add_two_ints` (`example_interfaces/srv/AddTwoInts`) and
 `examples/host_client.nv` calls it, or calls the server that
-`ros2 run demo_nodes_py add_two_ints_server` starts.
+`ros2 run demo_nodes_py add_two_ints_server` starts; `examples/host_long_server.nv`
+serves two services whose reply and request are longer than one message.
 
 **A program on a device calls `rosuart`.** Its functions take an
 `XrceUart`, which `rosuart.console_uart` supplies from the board's
@@ -180,8 +182,10 @@ once a second, takes `/dk/led` to switch the board's LEDs and serves
 `/dk/add_two_ints`, `examples/uart_stdio_listener.nv` is the
 device's subscription run on a PC, with `string` as its third argument for a
 sample longer than one message, which `rosuart.poll_long` joins, and
-`examples/uart_stdio_server.nv` is the device's service server run on a PC. `docs/agent-run.md` has the steps to run
-each against an agent.
+`examples/uart_stdio_server.nv` is the device's service server run on a PC,
+`examples/uart_stdio_long.nv` is the device's talker of long texts run on a PC,
+and `examples/dk_long_talker.nv` is the same talker on an nRF52840-DK.
+`docs/agent-run.md` has the steps to run each against an agent.
 
 **A program on a device calls the modules that build for it.** See
 "Running on a microcontroller".
@@ -240,8 +244,10 @@ each against an agent.
     layer that could report it.** The default buffer is 512 bytes,
     shared by every message, and the four-byte encapsulation header and
     the session framing both come out of it. That is the node's own
-    writes; a sample the agent sends longer than that arrives in pieces
-    (rule 25).
+    short writes: `write_sample`, `write_sample_reliable` and `publish_i32`
+    answer `ROS_RET_INVALID_ARGUMENT` for a sample that does not fit, and a
+    longer one is written in pieces with `write_sample_long` (rule 32). A
+    sample the agent sends longer than that arrives in pieces (rule 25).
 16. **rclc carries three of ROS 2's ten parameter types**: boolean,
     integer and double. A node moved from a workstation loses its string
     parameters.
@@ -271,7 +277,9 @@ each against an agent.
 22. **A full history refuses the write.** `ROS_RET_BAD_ALLOC` from
     `write_sample_reliable` or `publish_i32_reliable` means four messages
     are unacknowledged and nothing was written. It is not an allocation
-    failure.
+    failure. `write_sample_long` answers it the same way when the call could
+    write no piece, and goes on from the place it reached once `poll` has
+    brought acknowledgements (rule 32).
 23. **`poll` takes one message.** Call it until it answers
     `ROS_RET_SUBSCRIPTION_TAKE_FAILED`, which says nothing more is waiting
     and is not an error. A `rosexec` handle is ready when its take answered
@@ -331,6 +339,31 @@ each against an agent.
     entity, with its `object`, and on a device with the sample still in the
     buffer; `examples/dk_sensor_node.nv` polls and dispatches on
     `xrcewire.request_of`.
+32. **A sample longer than one message is written in turns, on the reliable
+    stream.** `write_sample_long` (and `send_request_long` and
+    `send_reply_long`) cut the sample into FRAGMENT submessages of up to 504
+    bytes, one to a message, each with a sequence number of its own and a slot
+    of the history, and the last flagged; the agent joins them as it joins the
+    pieces of a sample it was handed. The history holds four messages, so one
+    call writes at most four pieces, 2,016 bytes with the WRITE_DATA's front
+    (8 for a sample, 32 for a reply), which is a sample of 2,008 bytes or a reply
+    of 1,984. The outcome's `at` is how many bytes of the sample are out and
+    `done` says whether that is all; when it is not, call `poll` and
+    `reliable_tick` until the agent has acknowledged some pieces, and call again
+    with the same sample and that `at`. A call that finds the history full writes
+    nothing and answers `ROS_RET_BAD_ALLOC`. Write nothing else on the reliable
+    stream until `done`. The largest sample is
+    `xrcefrag.XRCE_LONG_MAX_SAMPLE`, 2,048 bytes; a longer one answers
+    `ROS_RET_INVALID_ARGUMENT`. A sample that fits one message, 500 bytes or a
+    reply of 476, is written as `write_sample_reliable` and `send_reply` write
+    it, byte for byte.
+33. **A long request or reply is taken with the `_long` form.**
+    `take_request_long` and `take_reply_long` are `take_request` and
+    `take_reply` over `poll_long`: they take a buffer to join the pieces in and
+    the reassembly state, and a call that took a piece answers the same take
+    failed code as one that took nothing. `take_request` and `take_reply` read
+    one message, as in 0.1.5, and a request or a reply the agent cut into pieces
+    never reaches them whole.
 
 ## Reaching an agent over TCP or UDP
 
@@ -403,7 +436,7 @@ Nine modules build for a microcontroller with no heap allocator:
 `rosret`, `rosqos`, `rosgraph` and `rosexec`, which a node consults before
 it touches the wire, and `xrceframe`, `xrcewire`, `xrcestream`, `xrcefrag`
 and `rosuart`, which are the wire. `tests/embedded_probe.nv` is a firmware
-program that runs a hundred and twenty-nine checks over them and is compiled
+program that runs a hundred and thirty-five checks over them and is compiled
 for a Cortex-M as part of
 this package's checks, so the claim is built rather than asserted. The
 program runs under QEMU and prints `PASS`.
@@ -447,6 +480,22 @@ the 2,104 bytes above. A node that never asks for a long sample pays none of
 this. `rosuart.poll_long` builds its replies in the same 520-byte scratch
 message `poll` does, and leaves the sample in the caller's buffer, from its
 first byte, until the next call.
+
+**What writing a long sample costs on a device.** The history is not
+grown: a sample is written four pieces at a time through the four slots the
+reliable stream already has, so a node that writes long samples pays no RAM for
+the stream and waits, once, for an acknowledgement, a HEARTBEAT period of 100
+ms, in the middle of a sample longer than 2,008 bytes. What it pays is the
+sample's own buffer, a `Vec[u8; 2048]`, which is 2,056 bytes and which the caller
+fills before the call; a node that also joins long samples can pass its
+reassembly buffer, once it has read what it joined. The functions build each
+piece in the 520-byte message buffer every node here already has, and keep it in
+the history. `examples/dk_long_talker.nv` is 28,516 bytes of flash and 2,712 bytes
+of static RAM, the same static RAM as the nodes before it; the 2,056 bytes of
+its sample are stack, and the compiler reports 9,072 bytes of worst-case stack
+for it. The flash of `examples/dk_sensor_node.nv`, which writes no long sample,
+went from 29,392 to 29,476 bytes, the drop code of two more result types; its
+static RAM stayed at 2,712.
 
 **What a long sample is.** The agent writes what DDS delivers as one DATA
 submessage. If the message that would carry it is longer than the 512 bytes
@@ -545,21 +594,25 @@ tiers cover all fourteen modules.
   after a gap, so the agent sends the gap and what followed it again. That
   costs retransmissions and no RAM. A node on a link that loses often and
   carries large samples would want the buffer.
-- **Sending a long sample.** A sample the agent sends in pieces is joined,
-  and a sample the node writes is not cut: `write_sample`,
-  `write_sample_reliable` and `publish_i32` build a message of at most 512
-  bytes, and a sample that does not fit answers `ROS_RET_INVALID_ARGUMENT`.
-  Writing FRAGMENT submessages needs the reliable output stream to number
-  and keep each piece, and the history holds four messages of 514 bytes.
+- **A sample longer than 2,048 bytes, sent or taken.** The buffer a long sample
+  is written from is a `Vec[u8; 2048]` on a device, and `write_sample_long`
+  refuses a longer sample on a host too, with `ROS_RET_INVALID_ARGUMENT`; the
+  buffer a long sample is joined in is also 2,048 bytes, 2,040 of them the
+  sample. A node that wants more changes a constant and rebuilds. Images and
+  point clouds of hundreds of kilobytes are not carried.
+- **Two long samples at once.** The pieces of one sample take consecutive
+  sequence numbers and the caller writes nothing else on the reliable stream
+  between them, so a node that publishes on two topics finishes one long sample
+  before it begins the next. The history is not grown to hold more than four
+  pieces, so a sample longer than 2,008 bytes waits once for an acknowledgement.
 - **A long sample on the best-effort stream.** The agent sends no pieces on
-  a best-effort stream and drops a DATA that does not fit one message, so
-  there is nothing to join; the samples are asked for on the reliable
-  stream.
+  a best-effort stream and drops a DATA that does not fit one message, and the
+  node's `write_sample` and `publish_i32` refuse one, so there is nothing to join
+  or to cut; long samples are asked for and written on the reliable stream.
 - **A reassembly buffer of another size.** The buffer is a `Vec[u8; 2048]`,
   so a sample longer than 2,040 bytes is dropped whatever limit the caller
-  names, and a node that wants more changes a constant and rebuilds. The
-  buffer is also the only one: pieces of two samples are not joined at once,
-  which the agent does not interleave on one stream.
+  names. The buffer is also the only one: pieces of two samples are not joined
+  at once, which the agent does not interleave on one stream.
 - **A sample that lost a piece to the agent's HEARTBEAT.** An agent that
   gives up on messages it no longer holds moves the input side past them,
   and a sample whose pieces fell on both sides of that is dropped as a
@@ -571,11 +624,11 @@ tiers cover all fourteen modules.
   is not found. A sample reaches the node without its encapsulation
   header, which the agent takes off, so the byte order of a big-endian
   publisher is lost; `poll` builds the message as little-endian CDR.
-- **A reply or a request longer than one message.** `take_request` and
-  `take_reply` read what `poll` reads, one message, so a service whose
-  message the agent would cut into pieces is not served; `poll_long` joins
-  pieces and the service calls do not use it. A request or a reply this
-  package writes is one message, as every written sample is.
+- **A service call that waits for its pieces by itself.** `take_request_long`
+  and `take_reply_long` take one message a call, as `poll_long` does, and a
+  reply of several pieces is several calls; `send_reply_long` and
+  `send_request_long` write as many pieces as the history holds and are called
+  again. The program owns that loop (`examples/host_long_server.nv` is one).
 - **Knowing that a server is there.** A requester cannot ask whether a replier
   matched, for the reason a publisher cannot (see "What a first sample
   needs"), so a call that has no answer is sent again by the program.
@@ -619,7 +672,7 @@ tiers cover all fourteen modules.
 
 ## Tests
 
-The suite is fourteen files under `tests/`. What they assert comes from
+The suite is fifteen files under `tests/`. What they assert comes from
 ROS 2's own behaviour rather than from an implementation: the return
 code numbering rcl publishes, the six quality-of-service profiles ROS 2
 ships and the requested-versus-offered rules the DDS specification
@@ -671,6 +724,15 @@ bytes the agent sent and accepted on 2026-11-20 in two runs of
 `take_reply` of both sessions over a pipe that records and a fake UART: the
 identity that comes back unchanged, a full window, a pipe that takes nothing, a
 sample that belongs to another entity, and a refused request.
+
+`tests/roslong_tests.nv` holds the pieces a node writes to the bytes the agent
+accepted on 2026-11-20 for a text of a thousand characters, and drives
+`write_sample_long`, `send_request_long`, `send_reply_long`, `take_request_long`
+and `take_reply_long` of both sessions: a sample of three pieces, of four, and of
+five written in turns with a window that fills, a sample that fits one message
+written as it always was, a pipe or a transmitter that takes nothing, a place
+outside the sample, and a request or a reply joined from the pieces the agent
+sends.
 
 `tests/embedded_probe.nv` is the microcontroller program described
 above.
