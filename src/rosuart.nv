@@ -529,3 +529,217 @@ fn poll_long<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8;
     if reply.kind == xrcewire.XRCE_REPLY_STATUS and not xrcewire.status_is_ok(reply.status)
         return long_none(heard, ev.stream, joined.assembly, rosret.ROS_RET_ERROR, reply.status)
     long_none(heard, ev.stream, joined.assembly, rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED, 0 - 1)
+
+// ── Services ─────────────────────────────────────────────────────────
+
+// Create a requester, a service client, and wait for its status.
+//
+// The arguments and the outcome are those of `create` with the kind fixed:
+// `requester` is the new entity's id (`xrcewire.object_id(n,
+// xrcewire.XRCE_KIND_REQUESTER)`), `participant` the id of its participant and
+// `xml` its description (see `xrcewire.create_requester`).
+pub @tier(embedded)
+@no_alloc
+fn create_requester<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                                    var f: Vec[u8; 1037], s: rostransport.RosSession,
+                                    requester: Int, participant: Int, xml: Str,
+                                    timeout_ms: Int) -> rostransport.RosOutcome [e]
+    create(u, var d, var m, var f, s, requester, xrcewire.XRCE_KIND_REQUESTER, participant, xml,
+           timeout_ms)
+
+// Create a replier, a service server, and wait for its status.
+//
+// The arguments and the outcome are those of `create_requester`, with the kind
+// `xrcewire.XRCE_KIND_REPLIER`.
+pub @tier(embedded)
+@no_alloc
+fn create_replier<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                                  var f: Vec[u8; 1037], s: rostransport.RosSession,
+                                  replier: Int, participant: Int, xml: Str,
+                                  timeout_ms: Int) -> rostransport.RosOutcome [e]
+    create(u, var d, var m, var f, s, replier, xrcewire.XRCE_KIND_REPLIER, participant, xml,
+           timeout_ms)
+
+// What `send_request` did.
+pub @value
+struct RosCall
+    // The session after the call.
+    session: rostransport.RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // The codes of `publish_i32_reliable`: `ROS_RET_OK`, `ROS_RET_NOT_INIT`,
+    // `ROS_RET_BAD_ALLOC` for a full history, `ROS_RET_INVALID_ARGUMENT` for a
+    // request that does not fit and `ROS_RET_AGENT_UNREACHABLE` when the
+    // transmitter refused.
+    code: Int
+    // The id of the request, which the agent's reply quotes back; 0 when
+    // nothing was written.
+    request: Int
+
+// A `RosCall` that wrote nothing.
+@tier(embedded)
+@no_alloc
+fn call_none(s: rostransport.RosSession, r: xrcestream.RelStream, code: Int) -> RosCall []
+    RosCall { session: s, stream: r, code: code, request: 0 }
+
+// Send the request in `payload` to a requester.
+//
+// `payload` holds the request in CDR without the representation header, from
+// its first byte (`xrcewire.put_sample_i64(var payload, v, 0)` and its kind
+// build one); the caller's `m` is the scratch the message is built in. The
+// request goes out on the reliable stream and stays in the history `h` until
+// the agent acknowledges it. The outcome's `request` is the id the reply
+// carries, and `take_reply` reads the reply.
+pub @tier(embedded)
+@no_alloc
+fn send_request<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                                var h: Vec[u8; 2056], s: rostransport.RosSession,
+                                r: xrcestream.RelStream, requester: Int,
+                                var payload: Vec[u8; 512]) -> RosCall [e]
+    if not rostransport.session_is_ready(s)
+        return call_none(s, r, rosret.ROS_RET_NOT_INIT)
+    if not xrcestream.out_can_write(r)
+        return call_none(s, r, rosret.ROS_RET_BAD_ALLOC)
+    let request = s.next_request
+    let sent = rostransport.session_next_request(s)
+    var ok = xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_RELIABLE, r.out_next, request,
+                                       requester)
+    for i in 0..payload.len()
+        ok = ok and xrcewire.put_sample_byte(var m, payload[i] as Int)
+    if not ok
+        return call_none(s, r, rosret.ROS_RET_INVALID_ARGUMENT)
+    let _len = xrcewire.finish_write_data(var m)
+    let _kept = xrcestream.history_store(var h, r.out_next, var m)
+    let after = xrcestream.out_wrote(r)
+    if not send(u, var m, var f)
+        return RosCall { session: sent, stream: after,
+                         code: rosret.ROS_RET_AGENT_UNREACHABLE, request: request }
+    RosCall { session: sent, stream: after, code: rosret.ROS_RET_OK, request: request }
+
+// Send the reply to a request.
+//
+// `identity` is the one `take_request` gave with the request and `payload` holds
+// the reply in CDR without the representation header, as for `send_request`;
+// `m` is the scratch the message is built in, so a request that was left in it
+// is read before this is called. The outcome and the history are those of
+// `publish_i32_reliable`.
+pub @tier(embedded)
+@no_alloc
+fn send_reply<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                              var h: Vec[u8; 2056], s: rostransport.RosSession,
+                              r: xrcestream.RelStream, replier: Int,
+                              identity: xrcewire.XrceIdentity,
+                              var payload: Vec[u8; 512]) -> rostransport.RosRelOutcome [e]
+    if not rostransport.session_is_ready(s)
+        return rel_outcome(s, r, rosret.ROS_RET_NOT_INIT, 0 - 1)
+    if not xrcestream.out_can_write(r)
+        return rel_outcome(s, r, rosret.ROS_RET_BAD_ALLOC, 0 - 1)
+    let request = s.next_request
+    let sent = rostransport.session_next_request(s)
+    var ok = xrcewire.begin_write_reply(var m, xrcewire.XRCE_STREAM_RELIABLE, r.out_next, request,
+                                        replier, identity)
+    for i in 0..payload.len()
+        ok = ok and xrcewire.put_sample_byte(var m, payload[i] as Int)
+    if not ok
+        return rel_outcome(s, r, rosret.ROS_RET_INVALID_ARGUMENT, 0 - 1)
+    let _len = xrcewire.finish_write_data(var m)
+    let _kept = xrcestream.history_store(var h, r.out_next, var m)
+    let after = xrcestream.out_wrote(r)
+    if not send(u, var m, var f)
+        return rel_outcome(sent, after, rosret.ROS_RET_AGENT_UNREACHABLE, 0 - 1)
+    rel_outcome(sent, after, rosret.ROS_RET_OK, 0 - 1)
+
+// What `take_reply` took from the UART.
+pub @value
+struct RosReplyPoll
+    // The session after the call. Any message from the agent clears its
+    // silence.
+    session: rostransport.RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // `ROS_RET_OK` when `reply` was found; `ROS_RET_CLIENT_TAKE_FAILED` when no
+    // whole frame came in time or what came held no reply, which is not an
+    // error; `ROS_RET_NOT_INIT` for a session that is not established;
+    // `ROS_RET_ERROR` when the agent refused a request, and `status` has the
+    // number. A sample of another entity, a data reader's, is answered as
+    // `ROS_RET_CLIENT_TAKE_FAILED` with `sample` found and still in `m`, for
+    // the caller to read as `poll` leaves it.
+    code: Int
+    // The agent's status number when `code` is `ROS_RET_ERROR`, else -1.
+    status: Int
+    // The sample the frame held, found or not, and where its bytes are in the
+    // caller's message buffer; `sample.object` is the entity it belongs to.
+    sample: xrcewire.XrceSample
+    // The reply, and where its bytes are in the caller's message buffer.
+    reply: xrcewire.XrceResponse
+
+// Take the next frame from the agent and, if it is a reply, read it.
+//
+// `poll` with the sample read as a service client reads it. The reply's bytes
+// are `m[reply.start]` for `reply.length` bytes, and `reply.request` is the id
+// of the call it answers (`send_request`'s `request`). One frame per call.
+pub @tier(embedded)
+@no_alloc
+fn take_reply<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                              var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                              s: rostransport.RosSession, r: xrcestream.RelStream,
+                              timeout_ms: Int) -> RosReplyPoll [e]
+    let got = poll(u, var d, var m, var f, var h, s, r, timeout_ms)
+    let reply = xrcewire.response_of(var m, got.sample)
+    if reply.found
+        return RosReplyPoll { session: got.session, stream: got.stream,
+                              code: rosret.ROS_RET_OK, status: 0 - 1, sample: got.sample,
+                              reply: reply }
+    var code = got.code
+    if code == rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED or code == rosret.ROS_RET_OK
+        code = rosret.ROS_RET_CLIENT_TAKE_FAILED
+    RosReplyPoll { session: got.session, stream: got.stream, code: code, status: got.status,
+                   sample: got.sample, reply: reply }
+
+// What `take_request` took from the UART.
+pub @value
+struct RosRequestPoll
+    // The session after the call. Any message from the agent clears its
+    // silence.
+    session: rostransport.RosSession
+    // The reliable stream after the call.
+    stream: xrcestream.RelStream
+    // `ROS_RET_OK` when `request` was found; `ROS_RET_SERVICE_TAKE_FAILED` when
+    // no whole frame came in time or what came held no request, which is not
+    // an error; `ROS_RET_NOT_INIT` for a session that is not established;
+    // `ROS_RET_ERROR` when the agent refused a request, and `status` has the
+    // number. A sample of another entity is answered as
+    // `ROS_RET_SERVICE_TAKE_FAILED` with `sample` found and still in `m`, for
+    // the caller to read as `poll` leaves it.
+    code: Int
+    // The agent's status number when `code` is `ROS_RET_ERROR`, else -1.
+    status: Int
+    // The sample the frame held, found or not, and where its bytes are in the
+    // caller's message buffer; `sample.object` is the entity it belongs to.
+    sample: xrcewire.XrceSample
+    // The request, its identity, and where its bytes are in the caller's
+    // message buffer.
+    request: xrcewire.XrceRequest
+
+// Take the next frame from the agent and, if it is a request, read it.
+//
+// `poll` with the sample read as a service server reads it. The request's bytes
+// are `m[request.start]` for `request.length` bytes, and `request.identity`
+// goes to `send_reply`. One frame per call.
+pub @tier(embedded)
+@no_alloc
+fn take_request<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                                var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                                s: rostransport.RosSession, r: xrcestream.RelStream,
+                                timeout_ms: Int) -> RosRequestPoll [e]
+    let got = poll(u, var d, var m, var f, var h, s, r, timeout_ms)
+    let request = xrcewire.request_of(var m, got.sample)
+    if request.found
+        return RosRequestPoll { session: got.session, stream: got.stream,
+                                code: rosret.ROS_RET_OK, status: 0 - 1,
+                                sample: got.sample, request: request }
+    var code = got.code
+    if code == rosret.ROS_RET_SUBSCRIPTION_TAKE_FAILED or code == rosret.ROS_RET_OK
+        code = rosret.ROS_RET_SERVICE_TAKE_FAILED
+    RosRequestPoll { session: got.session, stream: got.stream, code: code, status: got.status,
+                     sample: got.sample, request: request }

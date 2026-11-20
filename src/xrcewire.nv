@@ -69,6 +69,37 @@
 //                    id (1).  A reliable stream's receiver says what it
 //                    has and asks for the rest.
 //
+// A SERVICE IS TWO ENTITIES AND THE SAMPLE IDENTITY THAT PAIRS THEM.  A
+// REQUESTER (kind 7) is a service client and a REPLIER (kind 8) is a service
+// server; each is created from an XML string inside a participant, and each
+// is written with WRITE_DATA and read with READ_DATA like a data writer and a
+// data reader.  What differs is the front of the sample
+// (Micro-XRCE-DDS-Client, `src/c/core/session/write_access.c` and
+// `read_access.c`; Micro-XRCE-DDS-Agent, `src/cpp/requester/Requester.cpp`,
+// `src/cpp/replier/Replier.cpp` and `src/cpp/middleware/fastdds/
+// FastDDSEntities.cpp`):
+//
+//   a request    WRITE_DATA on the requester: request id (2), the requester's
+//                id (2), the request's bytes.  The agent keeps the WRITE_DATA's
+//                request id as the number the reply is matched to.
+//   the reply    DATA from the requester: the ids of the READ_DATA (2 + 2), then
+//                the request id of the WRITE_DATA it answers (2) and the
+//                requester's id (2), then the reply's bytes.
+//   a request    DATA from the replier: the ids of the READ_DATA (2 + 2), then
+//   at a server  the SAMPLE IDENTITY of the request (24 bytes), then the
+//                request's bytes.
+//   a reply      WRITE_DATA on the replier: request id (2), the replier's id
+//   at a server  (2), the sample identity of the request it answers (24 bytes,
+//                as it arrived), then the reply's bytes.
+//
+// The sample identity is the request's writer GUID (a 12-byte prefix and a
+// 4-byte entity id) and a 64-bit sequence number, as two 32-bit words, all
+// little-endian.  A server does not read it; it copies it from the request
+// into the reply, and the agent hands it to DDS as the reply's related
+// sample identity, which is how the client that asked finds its answer.
+// `XrceIdentity` holds it as six numbers so that a server keeps it between
+// taking a request and sending the reply with no buffer of its own.
+//
 // AN OBJECT ID IS TWELVE BITS OF NUMBER AND FOUR OF KIND, written most
 // significant byte first: id 1 of kind 5 is 0x00 0x15.
 //
@@ -148,6 +179,10 @@ pub const XRCE_KIND_DATAWRITER = 5
 pub const XRCE_KIND_SUBSCRIBER = 4
 // Object kind of a data reader: 6.
 pub const XRCE_KIND_DATAREADER = 6
+// Object kind of a requester, a service client: 7.
+pub const XRCE_KIND_REQUESTER = 7
+// Object kind of a replier, a service server: 8.
+pub const XRCE_KIND_REPLIER = 8
 
 // The first reliable stream: 0x80.  A stream id of 0x80 or more is
 // reliable, and the index is the id less 0x80.
@@ -187,6 +222,12 @@ pub const XRCE_STATUS_ERR_RESOURCES = 0x87
 // 12, after the message header (4), the submessage header (4) and the
 // request and object ids (4).
 pub const XRCE_SAMPLE_START = 12
+// Where a reply's bytes begin in a message built by `begin_write_reply`: byte
+// 36, after the 12 bytes of `XRCE_SAMPLE_START` and the 24 of the sample
+// identity.
+pub const XRCE_REPLY_START = 36
+// The bytes of a sample identity: 24.
+pub const XRCE_IDENTITY_BYTES = 24
 
 // Creation flags, from the client's `UXR_REUSE` and `UXR_REPLACE`: they
 // ride in the submessage's flags byte.
@@ -402,6 +443,68 @@ fn create_entity(var m: Vec[u8; 512], stream: Int, seq: Int, request: Int, objec
         m.clear()
     ok
 
+// The kind of an object id: its low four bits.
+//
+// ```novo
+// use xrcewire
+//
+// fn main() [io]
+//     println("${xrcewire.object_kind(0x18)}")   // 8, a replier
+// ```
+pub @tier(embedded)
+@no_alloc
+fn object_kind(object: Int) -> Int []
+    object & 0xF
+
+// Build a message that creates a requester, a service client, from an XML
+// string, replacing what `m` held.
+//
+// The arguments are those of `create_entity` with the kind fixed:
+// `requester` is the new entity's id (see `object_id`) and `participant` the
+// id of the participant it belongs to.  The XML names the service, its two
+// types and its two topics:
+//
+// ```
+// <dds><requester profile_name="add_client" service_name="add_two_ints"
+//      request_type="example_interfaces::srv::dds_::AddTwoInts_Request_"
+//      reply_type="example_interfaces::srv::dds_::AddTwoInts_Response_">
+//   <request_topic_name>rq/add_two_intsRequest</request_topic_name>
+//   <reply_topic_name>rr/add_two_intsReply</reply_topic_name>
+// </requester></dds>
+// ```
+//
+// Answers whether it fitted.
+//
+// ```novo
+// use xrcewire
+//
+// fn main() [io]
+//     var m: Vec[u8; 512] = Vec.new()
+//     let xml = "<dds><requester profile_name=\"c\" service_name=\"s\" request_type=\"A\" reply_type=\"B\"></requester></dds>"
+//     let ok = xrcewire.create_requester(var m, 1, 0, 10, xrcewire.object_id(1, 7),
+//                                        xrcewire.object_id(1, 1), xml,
+//                                        xrcewire.XRCE_CREATE_REPLACE)
+//     println("${ok}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn create_requester(var m: Vec[u8; 512], stream: Int, seq: Int, request: Int, requester: Int,
+                    participant: Int, xml: Str, flags: Int) -> Bool []
+    create_entity(var m, stream, seq, request, requester, XRCE_KIND_REQUESTER, participant, xml,
+                  flags)
+
+// Build a message that creates a replier, a service server, from an XML
+// string, replacing what `m` held.
+//
+// The arguments and the XML are those of `create_requester`, with
+// `<replier ...>` for `<requester ...>`.  Answers whether it fitted.
+pub @tier(embedded)
+@no_alloc
+fn create_replier(var m: Vec[u8; 512], stream: Int, seq: Int, request: Int, replier: Int,
+                  participant: Int, xml: Str, flags: Int) -> Bool []
+    create_entity(var m, stream, seq, request, replier, XRCE_KIND_REPLIER, participant, xml,
+                  flags)
+
 // Start a message that writes one sample, replacing what `m` held.
 //
 // The message header, the submessage header and the request and object
@@ -454,6 +557,78 @@ fn finish_write_data(var m: Vec[u8; 512]) -> Int []
     m[6] = (length & 0xFF) as u8
     m[7] = ((length >>> 8) & 0xFF) as u8
     length
+
+// The sample identity of a request: the writer GUID and the sequence number
+// DDS gave it, as six little-endian 32-bit words.
+//
+// A server copies it from the request into the reply, unchanged.
+pub @value
+struct XrceIdentity
+    // Bytes 0 to 3 of the writer's GUID prefix.
+    prefix0: Int
+    // Bytes 4 to 7 of the writer's GUID prefix.
+    prefix1: Int
+    // Bytes 8 to 11 of the writer's GUID prefix.
+    prefix2: Int
+    // The writer's entity id: three key bytes and the kind.
+    entity: Int
+    // The high 32 bits of the request's sequence number.
+    seq_high: Int
+    // The low 32 bits of the request's sequence number.
+    seq_low: Int
+
+// An identity with every word zero, which no DDS writer has.
+pub @tier(embedded)
+@no_alloc
+fn no_identity() -> XrceIdentity []
+    XrceIdentity { prefix0: 0, prefix1: 0, prefix2: 0, entity: 0, seq_high: 0, seq_low: 0 }
+
+// Append a sample identity: six 32-bit numbers, least significant byte
+// first.
+@tier(embedded)
+@no_alloc
+fn put_identity(var m: Vec[u8; 512], id: XrceIdentity) -> Bool []
+    put_u32(var m, id.prefix0) and put_u32(var m, id.prefix1) and put_u32(var m, id.prefix2)
+        and put_u32(var m, id.entity) and put_u32(var m, id.seq_high)
+        and put_u32(var m, id.seq_low)
+
+// Start a message that writes one reply, replacing what `m` held.
+//
+// As `begin_write_data` with the replier's id as the writer, and then the
+// sample identity of the request the reply answers. The caller appends the
+// reply's bytes with `put_sample_byte` and finishes with `finish_write_data`;
+// they begin at byte `XRCE_REPLY_START`.
+pub @tier(embedded)
+@no_alloc
+fn begin_write_reply(var m: Vec[u8; 512], stream: Int, seq: Int, request: Int, replier: Int,
+                     identity: XrceIdentity) -> Bool []
+    begin_write_data(var m, stream, seq, request, replier) and put_identity(var m, identity)
+
+// Append a 64-bit integer to a sample, least significant byte first, padded
+// so that it starts at a multiple of eight counted from `origin`, the offset
+// of the sample's first byte.
+//
+// `XRCE_SAMPLE_START` is the origin of a request and `XRCE_REPLY_START` of a
+// reply built by `begin_write_reply`; a payload built in a buffer of its own
+// has origin 0. CDR aligns an eight-byte number to eight bytes counted from
+// the start of the sample body.
+//
+// ```novo
+// use xrcewire
+//
+// fn main() [io]
+//     var m: Vec[u8; 512] = Vec.new()
+//     let _ = xrcewire.put_sample_i64(var m, 5, 0)
+//     println("${m.len()}")   // 8
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_sample_i64(var m: Vec[u8; 512], v: Int, origin: Int) -> Bool []
+    var ok = true
+    for _i in 0..8
+        if ok and (m.len() - origin) % 8 != 0
+            ok = put_u8(var m, 0)
+    ok and put_u32(var m, v) and put_u32(var m, v >>> 32)
 
 // Read the first status in a received message.
 //
@@ -796,3 +971,119 @@ fn sample_i32(var m: Vec[u8; 512], sample: XrceSample) -> Int []
     if v >= 2147483648
         return v - 4294967296
     v
+
+// The 64-bit integer at byte `at` of a received message, least significant
+// byte first, as a signed number. Answers 0 for a number that is not wholly
+// inside the message.
+//
+// The seven low bytes are added and the top byte is signed, so that a
+// negative number comes out negative.
+pub @tier(embedded)
+@no_alloc
+fn i64_at(var m: Vec[u8; 512], at: Int) -> Int []
+    if at < 0 or at + 8 > m.len()
+        return 0
+    var low = 0
+    var scale = 1
+    for i in 0..7
+        low = low + m[at + i] as Int * scale
+        scale = scale * 256
+    var top = m[at + 7] as Int
+    if top >= 128
+        top = top - 256
+    low + top * scale
+
+// The sample identity at byte `at` of a received message. Answers
+// `no_identity` for one that is not wholly inside the message.
+pub @tier(embedded)
+@no_alloc
+fn identity_at(var m: Vec[u8; 512], at: Int) -> XrceIdentity []
+    if at < 0 or at + XRCE_IDENTITY_BYTES > m.len()
+        return no_identity()
+    XrceIdentity {
+        prefix0: u32_at(var m, at), prefix1: u32_at(var m, at + 4),
+        prefix2: u32_at(var m, at + 8), entity: u32_at(var m, at + 12),
+        seq_high: u32_at(var m, at + 16), seq_low: u32_at(var m, at + 20) }
+
+// The 32-bit number at byte `at` of a received message, least significant
+// byte first, unsigned. The caller has checked that it is inside.
+@tier(embedded)
+@no_alloc
+fn u32_at(var m: Vec[u8; 512], at: Int) -> Int []
+    m[at] as Int + m[at + 1] as Int * 256 + m[at + 2] as Int * 65536
+        + m[at + 3] as Int * 16777216
+
+// A request at a server, read out of a sample the replier delivered.
+pub @value
+struct XrceRequest
+    // Whether the sample was a request: the object is a replier and the
+    // sample holds a whole identity.
+    found: Bool
+    // The id of the entity the sample belongs to, 0 for none.
+    object: Int
+    // The request's sample identity, which the reply carries back.
+    identity: XrceIdentity
+    // The offset of the request's first byte in the message.
+    start: Int
+    // The request's length in bytes.
+    length: Int
+
+// Read a request out of a sample that `read_sample`, or the `sample` of a
+// poll, found.
+//
+// A sample of a data reader, or one too short to hold an identity, answers
+// `found = false`; the sample is still the caller's to handle, and `object`
+// says whose it is. The request's bytes are `m[start]` to
+// `m[start + length - 1]`.
+pub @tier(embedded)
+@no_alloc
+fn request_of(var m: Vec[u8; 512], sample: XrceSample) -> XrceRequest []
+    var object = 0
+    if sample.found
+        object = sample.object
+    if not sample.found or object_kind(object) != XRCE_KIND_REPLIER
+        or sample.length < XRCE_IDENTITY_BYTES
+        return XrceRequest { found: false, object: object, identity: no_identity(), start: 0,
+                             length: 0 }
+    XrceRequest {
+        found: true,
+        object: object,
+        identity: identity_at(var m, sample.start),
+        start: sample.start + XRCE_IDENTITY_BYTES,
+        length: sample.length - XRCE_IDENTITY_BYTES }
+
+// A reply at a client, read out of a sample the requester delivered.
+pub @value
+struct XrceResponse
+    // Whether the sample was a reply: the object is a requester and the
+    // sample holds the request id.
+    found: Bool
+    // The id of the entity the sample belongs to, 0 for none.
+    object: Int
+    // The request id of the WRITE_DATA this reply answers.
+    request: Int
+    // The offset of the reply's first byte in the message.
+    start: Int
+    // The reply's length in bytes.
+    length: Int
+
+// Read a reply out of a sample that `read_sample`, or the `sample` of a poll,
+// found.
+//
+// A sample of a data reader, or one too short to hold the request id, answers
+// `found = false`, with `object` saying whose it is. The reply's bytes are
+// `m[start]` to `m[start + length - 1]`.
+pub @tier(embedded)
+@no_alloc
+fn response_of(var m: Vec[u8; 512], sample: XrceSample) -> XrceResponse []
+    var object = 0
+    if sample.found
+        object = sample.object
+    if not sample.found or object_kind(object) != XRCE_KIND_REQUESTER or sample.length < 4
+        return XrceResponse { found: false, object: object, request: 0, start: 0, length: 0 }
+    XrceResponse {
+        found: true,
+        object: object,
+        request: m[sample.start] as Int * 256 + m[sample.start + 1] as Int,
+        start: sample.start + 4,
+        length: sample.length - 4 }

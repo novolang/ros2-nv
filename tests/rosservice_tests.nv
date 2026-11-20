@@ -1,0 +1,804 @@
+// rosservice_tests.nv — services through the wire builders, the host session
+// and the device session: a requester that calls and a replier that answers.
+//
+// The frames marked "RECORDED" are bytes a Micro XRCE-DDS Agent 2.4.3 sent or
+// accepted on 2026-11-20, in two runs of /add_two_ints
+// (example_interfaces/srv/AddTwoInts) over TCP. In the first,
+// `examples/host_server.nv` was the server and `ros2 service call` the client
+// with a = 2 and b = 3; in the second, `examples/host_client.nv` was the client
+// and `ros2 run demo_nodes_py add_two_ints_server` the server, with a = 40 and
+// b = 2. `docs/agent-run.md` has the runs and the agent's log. What is asserted
+// here is what each function does with them: which frames it puts on the pipe
+// or the line, what it answers, and what it leaves alone.
+
+use std.list
+use std.str
+use std.test
+use rosmsg
+use rosret
+use rostransport
+use rosuart
+use xrceframe
+use xrcestream
+use xrcewire
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+fn vec_of(xs: [Int]) -> Vec[u8; 512]
+    var m: Vec[u8; 512] = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+fn list_of(var m: Vec[u8; 512]) -> [Int]
+    var out: [Int] = []
+    // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+    for x in m
+        let wide = x as Int
+        out = list.push(out, wide)
+    out
+
+// The bytes of a string, as a list.
+fn text_of(s: Str) -> [Int]
+    var out: [Int] = []
+    for i in 0..str.len(s)
+        out = list.push(out, str.byte_at_or(s, i, 0))
+    out
+
+// A 64-bit integer, least significant byte first.
+fn le64(v: Int) -> [Int]
+    var out: [Int] = []
+    for i in 0..8
+        out = list.push(out, (v >>> (8 * i)) & 0xFF)
+    out
+
+// RECORDED.  The sample identity of the request in the first run of the server:
+// the writer's GUID prefix and entity id, and the sequence number 1.
+fn identity_bytes() -> [Int]
+    [0x01, 0x0F, 0x82, 0x9C, 0x76, 0x6C, 0x8B, 0x09, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x14, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]
+
+// Whether two identities are the same six numbers.
+fn same(a: xrcewire.XrceIdentity, b: xrcewire.XrceIdentity) -> Bool
+    a.prefix0 == b.prefix0 and a.prefix1 == b.prefix1 and a.prefix2 == b.prefix2
+        and a.entity == b.entity and a.seq_high == b.seq_high and a.seq_low == b.seq_low
+
+// The same, as the six numbers `XrceIdentity` holds.
+fn an_identity() -> xrcewire.XrceIdentity
+    xrcewire.XrceIdentity { prefix0: 0x9C820F01, prefix1: 0x098B6C76, prefix2: 0,
+                            entity: 0x03140000, seq_high: 0, seq_low: 1 }
+
+// RECORDED.  The DATA the agent sent a replier on the reliable stream at `seq`:
+// the READ_DATA that asked (request 3, replier 0x18), the identity, and the
+// request's two numbers.
+fn request_data(seq: Int, a: Int, b: Int) -> [Int]
+    list.concat(list.concat(
+        [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x09, 0x01, 0x2C, 0x00, 0x00, 0x03, 0x00, 0x18],
+        identity_bytes()), list.concat(le64(a), le64(b)))
+
+// RECORDED.  The WRITE_DATA a server wrote on the reliable stream at `seq`:
+// request id `request`, replier 0x18, the identity of the request it answers
+// and the sum.
+fn reply_write(seq: Int, request: Int, sum: Int) -> [Int]
+    list.concat(list.concat(
+        [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x07, 0x01, 0x24, 0x00, request >>> 8,
+         request & 0xFF, 0x00, 0x18],
+        identity_bytes()), le64(sum))
+
+// RECORDED.  The WRITE_DATA a client wrote on the reliable stream at `seq`:
+// request id `request`, requester 0x17, the two numbers.
+fn call_write(seq: Int, request: Int, a: Int, b: Int) -> [Int]
+    list.concat(
+        [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x07, 0x01, 0x14, 0x00, request >>> 8,
+         request & 0xFF, 0x00, 0x17],
+        list.concat(le64(a), le64(b)))
+
+// RECORDED.  The DATA the agent sent a requester at `seq`: the READ_DATA that
+// asked (request 3, requester 0x17), the request id of the call this answers,
+// and the sum.
+fn reply_data(seq: Int, request: Int, sum: Int) -> [Int]
+    list.concat(
+        [0x81, 0x80, seq & 0xFF, seq >>> 8, 0x09, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x17,
+         request >>> 8, request & 0xFF, 0x00, 0x17],
+        le64(sum))
+
+// RECORDED.  The agent's DATA on the best-effort stream carrying the integer 7
+// for the data reader 0x16: a sample that is not a service's.
+fn topic_data() -> [Int]
+    [0x81, 0x01, 0x04, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16, 0x07, 0x00, 0x00,
+     0x00]
+
+// RECORDED.  An ACKNACK of stream 0x80.
+fn acknack_message(first: Int, bitmap: Int) -> [Int]
+    [0x81, 0x00, 0x00, 0x00, 0x0A, 0x01, 0x05, 0x00, first & 0xFF, first >>> 8,
+     bitmap >>> 8, bitmap & 0xFF, 0x80]
+
+// A STATUS answering a request on the best-effort stream.
+fn status_message(request: Int, object: Int, status: Int) -> [Int]
+    [0x81, 0x01, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, request >>> 8, request & 0xFF,
+     object >>> 8, object & 0xFF, status, 0x00]
+
+fn an_open_session() -> RosSession
+    rostransport.session_established(rostransport.session(0xAABBCCDD, 512), 0x81)
+
+// The open session with `n` as its next request id.
+fn session_at(n: Int) -> RosSession
+    var s = an_open_session()
+    for _i in 1..n
+        s = rostransport.session_next_request(s)
+    s
+
+// A stream that has written and had acknowledged every message before `next`,
+// and delivered nothing.
+fn stream_at(next: Int) -> xrcestream.RelStream
+    xrcestream.RelStream { out_first: next, out_next: next, out_quiet_ms: 0,
+                           in_handled: 65535, in_announced: 65535 }
+
+// A stream that has delivered every message up to `handled`.
+fn stream_after(handled: Int) -> xrcestream.RelStream
+    xrcestream.RelStream { out_first: 0, out_next: 0, out_quiet_ms: 0,
+                           in_handled: handled, in_announced: handled }
+
+// A stream with four messages unacknowledged: the window is full.
+fn stream_full() -> xrcestream.RelStream
+    var full = stream_at(0)
+    for _i in 0..4
+        full = xrcestream.out_wrote(full)
+    full
+
+// ── xrcewire: the builders and the readers ───────────────────────────
+
+@test
+fn test_a_requester_and_a_replier_are_created_like_the_other_entities() [io]
+    // The XML of the first run's replier, which the agent accepted.
+    let service_xml = "<dds><replier profile_name=\"novo_add_two_ints\" service_name=\"add_two_ints\" request_type=\"example_interfaces::srv::dds_::AddTwoInts_Request_\" reply_type=\"example_interfaces::srv::dds_::AddTwoInts_Response_\"><request_topic_name>rq/add_two_intsRequest</request_topic_name><reply_topic_name>rr/add_two_intsReply</reply_topic_name></replier></dds>"
+    var m: Vec[u8; 512] = Vec.new()
+
+    test.case("RECORDED CREATE of the replier 0x18 in the participant 0x11, on the best-effort stream at 1")
+    test.assert(xrcewire.create_replier(var m, 1, 1, 2, 0x18, 0x11, service_xml,
+                                        xrcewire.XRCE_CREATE_REPLACE))
+    // The header, the submessage header (flags 5: replace and little-endian,
+    // length 357), the ids, kind 8, format 2, the string's length 343, the
+    // string with its zero, and the participant.
+    let head = [0x81, 0x01, 0x01, 0x00, 0x01, 0x05, 0x65, 0x01, 0x00, 0x02, 0x00, 0x18, 0x08,
+                0x02, 0x00, 0x00, 0x57, 0x01, 0x00, 0x00]
+    test.assert_eq(list_of(var m),
+                   list.concat(list.concat(head, text_of(service_xml)), [0x00, 0x00, 0x11]))
+
+    test.case("a requester differs in its kind and nothing else")
+    test.assert(xrcewire.create_requester(var m, 1, 1, 2, 0x17, 0x11, service_xml,
+                                          xrcewire.XRCE_CREATE_REPLACE))
+    var other: Vec[u8; 512] = Vec.new()
+    test.assert(xrcewire.create_entity(var other, 1, 1, 2, 0x17, xrcewire.XRCE_KIND_REQUESTER,
+                                       0x11, service_xml, xrcewire.XRCE_CREATE_REPLACE))
+    test.assert_eq(list_of(var m), list_of(var other))
+    test.assert_eq(m[12] as Int, 7)
+    test.assert_eq(m[11] as Int, 0x17)
+
+    test.case("the kinds are 7 and 8, and the kind of an id is its low four bits")
+    test.assert_eq(xrcewire.XRCE_KIND_REQUESTER, 7)
+    test.assert_eq(xrcewire.XRCE_KIND_REPLIER, 8)
+    test.assert_eq(xrcewire.object_kind(xrcewire.object_id(1, xrcewire.XRCE_KIND_REPLIER)), 8)
+    test.assert_eq(xrcewire.object_kind(0x17), xrcewire.XRCE_KIND_REQUESTER)
+
+@test
+fn test_a_request_and_a_reply_are_written_as_the_agent_accepted_them() [io]
+    var m: Vec[u8; 512] = Vec.new()
+
+    test.case("RECORDED WRITE_DATA of a call: request 4, requester 0x17, a = 40, b = 2")
+    test.assert(xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_RELIABLE, 0, 4, 0x17))
+    test.assert(xrcewire.put_sample_i64(var m, 40, xrcewire.XRCE_SAMPLE_START))
+    test.assert(xrcewire.put_sample_i64(var m, 2, xrcewire.XRCE_SAMPLE_START))
+    test.assert_eq(xrcewire.finish_write_data(var m), 20)
+    test.assert_eq(list_of(var m), call_write(0, 4, 40, 2))
+
+    test.case("RECORDED WRITE_DATA of a reply: request 57, replier 0x18, the identity, the sum 5")
+    test.assert(xrcewire.begin_write_reply(var m, xrcewire.XRCE_STREAM_RELIABLE, 0, 57, 0x18,
+                                           an_identity()))
+    test.assert_eq(m.len(), xrcewire.XRCE_REPLY_START)
+    test.assert(xrcewire.put_sample_i64(var m, 5, xrcewire.XRCE_REPLY_START))
+    test.assert_eq(xrcewire.finish_write_data(var m), 36)
+    test.assert_eq(list_of(var m), reply_write(0, 57, 5))
+
+    test.case("a number is padded to a multiple of eight from the origin it is given")
+    var p: Vec[u8; 512] = Vec.new()
+    test.assert(xrcewire.put_sample_byte(var p, 1))
+    test.assert(xrcewire.put_sample_i64(var p, 5, 0))
+    test.assert_eq(list_of(var p), [1, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(xrcewire.i64_at(var p, 8), 5)
+
+    test.case("a negative number round trips, down to the smallest")
+    var q: Vec[u8; 512] = Vec.new()
+    test.assert(xrcewire.put_sample_i64(var q, 0 - 7, 0))
+    test.assert(xrcewire.put_sample_i64(var q, 0 - 9223372036854775807 - 1, 0))
+    test.assert_eq(list_of(var q), [0xF9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x80])
+    test.assert_eq(xrcewire.i64_at(var q, 0), 0 - 7)
+    test.assert_eq(xrcewire.i64_at(var q, 8), 0 - 9223372036854775807 - 1)
+
+    test.case("a number that is not wholly inside the message reads as zero")
+    test.assert_eq(xrcewire.i64_at(var q, 9), 0)
+    test.assert_eq(xrcewire.i64_at(var q, 0 - 1), 0)
+
+    test.case("a full buffer refuses the number")
+    var full: Vec[u8; 512] = Vec.new()
+    for _i in 0..510
+        let _ = full.push(0)
+    test.assert(not xrcewire.put_sample_i64(var full, 1, 0))
+
+@test
+fn test_a_request_and_a_reply_are_read_out_of_the_samples_the_agent_delivers() [io]
+    test.case("RECORDED DATA at a replier: the identity, then a = 2 and b = 3")
+    var m = vec_of(request_data(0, 2, 3))
+    let sample = xrcewire.read_sample(var m)
+    test.assert(sample.found)
+    test.assert_eq(sample.object, 0x18)
+    test.assert_eq(sample.length, 40)
+    let request = xrcewire.request_of(var m, sample)
+    test.assert(request.found)
+    test.assert_eq(request.object, 0x18)
+    test.assert(same(request.identity, an_identity()))
+    test.assert_eq(request.start, 36)
+    test.assert_eq(request.length, 16)
+    test.assert_eq(xrcewire.i64_at(var m, request.start), 2)
+    test.assert_eq(xrcewire.i64_at(var m, request.start + 8), 3)
+
+    test.case("RECORDED DATA at a requester: the request id 4, then the sum 42")
+    var r = vec_of(reply_data(1, 4, 42))
+    let reply_sample = xrcewire.read_sample(var r)
+    let reply = xrcewire.response_of(var r, reply_sample)
+    test.assert(reply.found)
+    test.assert_eq(reply.object, 0x17)
+    test.assert_eq(reply.request, 4)
+    test.assert_eq(reply.start, 16)
+    test.assert_eq(reply.length, 8)
+    test.assert_eq(xrcewire.i64_at(var r, reply.start), 42)
+
+    test.case("a sample of a data reader is neither, and says whose it is")
+    var t = vec_of(topic_data())
+    let topic = xrcewire.read_sample(var t)
+    test.assert(not xrcewire.request_of(var t, topic).found)
+    test.assert_eq(xrcewire.request_of(var t, topic).object, 0x16)
+    test.assert(not xrcewire.response_of(var t, topic).found)
+    test.assert_eq(xrcewire.response_of(var t, topic).object, 0x16)
+
+    test.case("a request is not a reply and a reply is not a request")
+    test.assert(not xrcewire.response_of(var m, sample).found)
+    test.assert(not xrcewire.request_of(var r, reply_sample).found)
+
+    test.case("a sample too short for its front is not found")
+    let short = xrcewire.XrceSample { found: true, request: 3, object: 0x18, start: 12, length: 23 }
+    test.assert(not xrcewire.request_of(var m, short).found)
+    let shorter = xrcewire.XrceSample { found: true, request: 3, object: 0x17, start: 12, length: 3 }
+    test.assert(not xrcewire.response_of(var r, shorter).found)
+
+    test.case("no sample, no object")
+    var none: Vec[u8; 512] = Vec.new()
+    let nothing = xrcewire.read_sample(var none)
+    test.assert_eq(xrcewire.request_of(var none, nothing).object, 0)
+    test.assert_eq(xrcewire.response_of(var none, nothing).object, 0)
+
+    test.case("an identity that is not wholly inside the message is none")
+    test.assert(same(xrcewire.identity_at(var m, 30), xrcewire.no_identity()))
+    test.assert(same(xrcewire.identity_at(var m, 0 - 1), xrcewire.no_identity()))
+    test.assert(same(xrcewire.identity_at(var m, 12), an_identity()))
+
+// ── rostransport: over a pipe that records ───────────────────────────
+
+// Every frame the pipe is handed, as a list of bytes.
+var g_sent: [[Int]]  = []
+// What the agent says next, one message to each receive.
+var g_queue: [Bytes] = []
+// Whether the pipe takes what it is handed.
+var g_takes          = true
+
+struct RecPipe
+    id: Int
+
+impl RosTransport[mutate] for RecPipe
+    fn ros_send(self, frame: Bytes) -> Bool [mutate]
+        if not g_takes
+            return false
+        var xs: [Int] = []
+        for i in 0..bytes.len(frame)
+            xs = list.push(xs, bytes.byte_at(frame, i) ?? 0)
+        g_sent = list.push(g_sent, xs)
+        true
+
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
+        if list.len(g_queue) == 0
+            return None
+        let first = g_queue[0]
+        g_queue = list.drop(g_queue, 1)
+        Some(first)
+
+    fn ros_is_open(self) -> Bool [mutate]
+        g_takes
+
+    fn ros_close(self) [mutate]
+        ()
+
+    fn ros_mtu(self) -> Int
+        512
+
+fn pipe_reset() [mutate]
+    g_sent = []
+    g_queue = []
+    g_takes = true
+
+// The agent says this next.
+fn agent_says(xs: [Int]) [mutate]
+    g_queue = list.push(g_queue, bytes.from_byte_list(xs))
+
+// A short description of a replier or a requester, enough for the agent's
+// parser and not for a service.
+fn short_xml(kind: Str) -> Str
+    "<dds><${kind} profile_name=\"p\" service_name=\"s\" request_type=\"A\" reply_type=\"B\"></${kind}></dds>"
+
+@test
+fn test_a_requester_and_a_replier_are_created_over_the_pipe() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let s = an_open_session()
+    var built: Vec[u8; 512] = Vec.new()
+
+    test.case("the replier's CREATE goes out on the best-effort stream and its status is waited for")
+    pipe_reset()
+    agent_says(status_message(1, 0x18, 0))
+    let replier = rostransport.create_replier(pipe, s, 0x18, 0x11, short_xml("replier"), 100)
+    test.assert_eq(replier.code, rosret.ROS_RET_OK)
+    test.assert(xrcewire.create_replier(var built, 1, 0, 1, 0x18, 0x11, short_xml("replier"),
+                                        xrcewire.XRCE_CREATE_REPLACE))
+    test.assert_eq(g_sent, [list_of(var built)])
+
+    test.case("the requester's CREATE, and an agent that refuses it")
+    pipe_reset()
+    agent_says(status_message(1, 0x17, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let requester = rostransport.create_requester(pipe, s, 0x17, 0x11, short_xml("requester"), 100)
+    test.assert_eq(requester.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(requester.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+    test.assert(xrcewire.create_requester(var built, 1, 0, 1, 0x17, 0x11, short_xml("requester"),
+                                          xrcewire.XRCE_CREATE_REPLACE))
+    test.assert_eq(g_sent, [list_of(var built)])
+
+@test
+fn test_a_request_goes_out_on_the_reliable_stream_and_says_which_reply_is_its_own() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let payload = bytes.concat([bytes.u64_le(40), bytes.u64_le(2)])
+
+    test.case("RECORDED WRITE_DATA at sequence 0 with request 4, kept in the history")
+    pipe_reset()
+    var h = xrcestream.history()
+    let out = rostransport.send_request(pipe, session_at(4), stream_at(0), var h, 0x17, payload)
+    test.assert_eq(out.code, rosret.ROS_RET_OK)
+    test.assert_eq(out.request, 4)
+    test.assert_eq(g_sent, [call_write(0, 4, 40, 2)])
+    test.assert_eq(out.stream.out_next, 1)
+    test.assert_eq(out.session.next_request, 5)
+    var back: Vec[u8; 512] = Vec.new()
+    test.assert_eq(xrcestream.history_load(var h, 0, var back), 28)
+    test.assert_eq(list_of(var back), call_write(0, 4, 40, 2))
+
+    test.case("a full window writes nothing, and there is no request to wait for")
+    pipe_reset()
+    var h2 = xrcestream.history()
+    let blocked = rostransport.send_request(pipe, session_at(4), stream_full(), var h2, 0x17,
+                                            payload)
+    test.assert_eq(blocked.code, rosret.ROS_RET_BAD_ALLOC)
+    test.assert_eq(blocked.request, 0)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("a pipe that takes nothing keeps the request, which the reply can still answer")
+    pipe_reset()
+    g_takes = false
+    var h3 = xrcestream.history()
+    let lost = rostransport.send_request(pipe, session_at(4), stream_at(0), var h3, 0x17, payload)
+    test.assert_eq(lost.code, rosret.ROS_RET_AGENT_UNREACHABLE)
+    test.assert_eq(lost.request, 4)
+    test.assert_eq(lost.stream.out_next, 1)
+    test.assert_eq(xrcestream.history_load(var h3, 0, var back), 28)
+
+    test.case("a request that does not fit the message")
+    pipe_reset()
+    let big = rostransport.send_request(pipe, session_at(4), stream_at(0), var h3, 0x17,
+                                        bytes.zeros(600))
+    test.assert_eq(big.code, rosret.ROS_RET_INVALID_ARGUMENT)
+    test.assert_eq(big.request, 0)
+    test.assert_eq(big.stream.out_next, 0)
+
+    test.case("a session that was never opened")
+    test.assert_eq(rostransport.send_request(pipe, rostransport.session(1, 512), stream_at(0),
+                                             var h3, 0x17, payload).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_a_reply_carries_the_identity_of_the_request_it_answers() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let five = bytes.u64_le(5)
+
+    test.case("RECORDED WRITE_DATA at sequence 0 with request 57, kept in the history")
+    pipe_reset()
+    var h = xrcestream.history()
+    let out = rostransport.send_reply(pipe, session_at(57), stream_at(0), var h, 0x18,
+                                      an_identity(), five)
+    test.assert_eq(out.code, rosret.ROS_RET_OK)
+    test.assert_eq(g_sent, [reply_write(0, 57, 5)])
+    test.assert_eq(out.stream.out_next, 1)
+    test.assert_eq(out.session.next_request, 58)
+    var back: Vec[u8; 512] = Vec.new()
+    test.assert_eq(xrcestream.history_load(var h, 0, var back), 44)
+
+    test.case("a full window writes nothing")
+    pipe_reset()
+    var h2 = xrcestream.history()
+    let blocked = rostransport.send_reply(pipe, session_at(57), stream_full(), var h2, 0x18,
+                                          an_identity(), five)
+    test.assert_eq(blocked.code, rosret.ROS_RET_BAD_ALLOC)
+    test.assert_eq(list.len(g_sent), 0)
+
+    test.case("a pipe that takes nothing keeps the reply and goes on")
+    pipe_reset()
+    g_takes = false
+    var h3 = xrcestream.history()
+    let lost = rostransport.send_reply(pipe, session_at(57), stream_at(0), var h3, 0x18,
+                                       an_identity(), five)
+    test.assert_eq(lost.code, rosret.ROS_RET_AGENT_UNREACHABLE)
+    test.assert_eq(lost.stream.out_next, 1)
+    test.assert_eq(xrcestream.history_load(var h3, 0, var back), 44)
+
+    test.case("a reply that does not fit the message")
+    pipe_reset()
+    let big = rostransport.send_reply(pipe, session_at(57), stream_at(0), var h3, 0x18,
+                                      an_identity(), bytes.zeros(600))
+    test.assert_eq(big.code, rosret.ROS_RET_INVALID_ARGUMENT)
+    test.assert_eq(big.stream.out_next, 0)
+
+    test.case("a session that was never opened")
+    test.assert_eq(rostransport.send_reply(pipe, rostransport.session(1, 512), stream_at(0),
+                                           var h3, 0x18, an_identity(), five).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_a_server_takes_a_request_and_leaves_what_is_not_one() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = rostransport.session_silent(an_open_session(), 300)
+    var h = xrcestream.history()
+
+    test.case("RECORDED DATA at a replier is the request, with its identity, and is acknowledged")
+    pipe_reset()
+    agent_says(request_data(0, 2, 3))
+    let got = rostransport.take_request(pipe, up, stream_at(0), var h, 0)
+    test.assert_eq(got.code, rosret.ROS_RET_OK)
+    test.assert_eq(got.object, 0x18)
+    test.assert(same(got.identity, an_identity()))
+    test.assert_eq(bytes.len(got.payload), 16)
+    test.assert_eq(bytes.u64_le_at(got.payload, 0) ?? 0 - 1, 2)
+    test.assert_eq(bytes.u64_le_at(got.payload, 8) ?? 0 - 1, 3)
+    test.assert_eq(got.session.silent_ms, 0)
+    test.assert_eq(g_sent, [acknack_message(1, 0)])
+
+    test.case("nothing on the pipe is a take that failed, which is not an error")
+    pipe_reset()
+    let quiet = rostransport.take_request(pipe, up, stream_at(0), var h, 0)
+    test.assert_eq(quiet.code, rosret.ROS_RET_SERVICE_TAKE_FAILED)
+    test.assert(not rosret.ros_ret_is_error(quiet.code))
+    test.assert_eq(quiet.object, 0)
+
+    test.case("a sample of a data reader is left for the caller, whole")
+    pipe_reset()
+    agent_says(topic_data())
+    let other = rostransport.take_request(pipe, up, stream_at(0), var h, 0)
+    test.assert_eq(other.code, rosret.ROS_RET_SERVICE_TAKE_FAILED)
+    test.assert_eq(other.object, 0x16)
+    test.assert_eq(bytes.u32_le_at(other.payload, 0) ?? 0 - 1, 7)
+    test.assert(same(other.identity, xrcewire.no_identity()))
+
+    test.case("a refused request comes back as an error with the number")
+    pipe_reset()
+    agent_says(status_message(5, 0x18, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let refused = rostransport.take_request(pipe, up, stream_at(0), var h, 0)
+    test.assert_eq(refused.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(refused.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+
+    test.case("a session that was never opened takes nothing")
+    pipe_reset()
+    agent_says(request_data(0, 2, 3))
+    test.assert_eq(rostransport.take_request(pipe, rostransport.session(1, 512), stream_at(0),
+                                             var h, 0).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_a_client_takes_a_reply_and_leaves_what_is_not_one() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = rostransport.session_silent(an_open_session(), 300)
+    var h = xrcestream.history()
+
+    test.case("RECORDED DATA at a requester is the reply, with the request id of its call")
+    pipe_reset()
+    agent_says(reply_data(1, 4, 42))
+    let got = rostransport.take_reply(pipe, up, stream_after(0), var h, 0)
+    test.assert_eq(got.code, rosret.ROS_RET_OK)
+    test.assert_eq(got.object, 0x17)
+    test.assert_eq(got.request, 4)
+    test.assert_eq(bytes.len(got.payload), 8)
+    test.assert_eq(bytes.u64_le_at(got.payload, 0) ?? 0 - 1, 42)
+    test.assert_eq(got.session.silent_ms, 0)
+    test.assert_eq(g_sent, [acknack_message(2, 0)])
+
+    test.case("nothing on the pipe is a take that failed, which is not an error")
+    pipe_reset()
+    let quiet = rostransport.take_reply(pipe, up, stream_after(0), var h, 0)
+    test.assert_eq(quiet.code, rosret.ROS_RET_CLIENT_TAKE_FAILED)
+    test.assert(not rosret.ros_ret_is_error(quiet.code))
+
+    test.case("a request, which a client does not take, is left for the caller, whole")
+    pipe_reset()
+    agent_says(request_data(0, 2, 3))
+    let other = rostransport.take_reply(pipe, up, stream_at(0), var h, 0)
+    test.assert_eq(other.code, rosret.ROS_RET_CLIENT_TAKE_FAILED)
+    test.assert_eq(other.object, 0x18)
+    test.assert_eq(bytes.len(other.payload), 40)
+    test.assert_eq(other.request, 0)
+
+    test.case("a refused request comes back as an error with the number")
+    pipe_reset()
+    agent_says(status_message(5, 0x17, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let refused = rostransport.take_reply(pipe, up, stream_at(0), var h, 0)
+    test.assert_eq(refused.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(refused.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+
+    test.case("a session that was never opened takes nothing")
+    pipe_reset()
+    agent_says(reply_data(1, 4, 42))
+    test.assert_eq(rostransport.take_reply(pipe, rostransport.session(1, 512), stream_after(0),
+                                           var h, 0).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+// ── rosuart: over a fake UART ────────────────────────────────────────
+
+// The fake UART's state, as in `tests/rossub_tests.nv`: a module-level
+// variable each, because the trait's methods take `self` by value, and
+// fixed-capacity buffers because the functions under test are `@no_alloc`.
+var u_inbox: Vec[u8; 1100]  = Vec.new()
+var u_cursor                = 0
+var u_outbox: Vec[u8; 1100] = Vec.new()
+var u_refusals              = 0
+
+struct FakeUart
+    id: Int
+
+impl XrceUart[mutate] for FakeUart
+    fn uart_put(self, byte: Int) -> Bool [mutate]
+        if u_refusals < 0
+            return false
+        match u_outbox.push(byte as u8)
+            Ok(_)  => true
+            Err(_) => false
+
+    fn uart_get(self) -> Int [mutate]
+        if u_cursor < u_inbox.len()
+            u_cursor = u_cursor + 1
+            return u_inbox[u_cursor - 1] as Int
+        0 - 1
+
+    fn uart_pause_ms(self, ms: Int) [mutate]
+        ()
+
+fn clear_line() [mutate]
+    u_inbox.clear()
+    u_cursor = 0
+    u_outbox.clear()
+    u_refusals = 0
+
+// The frame an agent sends, appended to what is waiting on the line.
+fn agent_sends(payload: [Int]) [mutate]
+    var p = vec_of(payload)
+    var f: Vec[u8; 1037] = Vec.new()
+    let _ = xrceframe.encode(var f, var p, xrceframe.XRCE_ADDR_AGENT,
+                             xrceframe.XRCE_ADDR_CLIENT)
+    for b in f
+        let _ = u_inbox.push(b)
+
+// Every frame the device has put on the line, taken out of its framing:
+// what an agent would have read.
+fn on_the_line() -> [[Int]]
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var out: [[Int]] = []
+    for b in u_outbox
+        if xrceframe.push_byte(var d, b as Int) == xrceframe.XRCE_PUSH_FRAME
+            var p: [Int] = []
+            // workaround(vec-has-no-list-conversion): this loop stands in for a Vec-to-list conversion the family lacks.
+            for x in d.payload
+                let wide = x as Int
+                p = list.push(p, wide)
+            out = list.push(out, p)
+    out
+
+// A payload of two 64-bit integers.
+fn pair_payload(a: Int, b: Int) -> Vec[u8; 512]
+    var p: Vec[u8; 512] = Vec.new()
+    let _ = xrcewire.put_sample_i64(var p, a, 0)
+    let _ = xrcewire.put_sample_i64(var p, b, 0)
+    p
+
+@test
+fn test_the_device_creates_a_requester_and_a_replier() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var built: Vec[u8; 512] = Vec.new()
+
+    test.case("the replier's CREATE goes out on the line and its status is waited for")
+    clear_line()
+    agent_sends(status_message(1, 0x18, 0))
+    let replier = rosuart.create_replier(u, var d, var m, var f, an_open_session(), 0x18, 0x11,
+                                         short_xml("replier"), 3)
+    test.assert_eq(replier.code, rosret.ROS_RET_OK)
+    test.assert(xrcewire.create_replier(var built, 1, 0, 1, 0x18, 0x11, short_xml("replier"),
+                                        xrcewire.XRCE_CREATE_REPLACE))
+    test.assert_eq(on_the_line(), [list_of(var built)])
+
+    test.case("the requester's CREATE, and an agent that refuses it")
+    clear_line()
+    agent_sends(status_message(1, 0x17, xrcewire.XRCE_STATUS_ERR_DDS_ERROR))
+    let requester = rosuart.create_requester(u, var d, var m, var f, an_open_session(), 0x17,
+                                             0x11, short_xml("requester"), 3)
+    test.assert_eq(requester.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(requester.status, xrcewire.XRCE_STATUS_ERR_DDS_ERROR)
+    test.assert(xrcewire.create_requester(var built, 1, 0, 1, 0x17, 0x11, short_xml("requester"),
+                                          xrcewire.XRCE_CREATE_REPLACE))
+    test.assert_eq(on_the_line(), [list_of(var built)])
+
+@test
+fn test_the_device_sends_a_request_and_a_reply_on_the_reliable_stream() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var forty = pair_payload(40, 2)
+    var five: Vec[u8; 512] = Vec.new()
+    let _ = xrcewire.put_sample_i64(var five, 5, 0)
+
+    test.case("RECORDED WRITE_DATA of a call at sequence 0 with request 4, kept in the history")
+    clear_line()
+    var h = xrcestream.history()
+    let out = rosuart.send_request(u, var m, var f, var h, session_at(4), stream_at(0), 0x17,
+                                   var forty)
+    test.assert_eq(out.code, rosret.ROS_RET_OK)
+    test.assert_eq(out.request, 4)
+    test.assert_eq(on_the_line(), [call_write(0, 4, 40, 2)])
+    test.assert_eq(out.stream.out_next, 1)
+    test.assert_eq(out.session.next_request, 5)
+    var back: Vec[u8; 512] = Vec.new()
+    test.assert_eq(xrcestream.history_load(var h, 0, var back), 28)
+
+    test.case("a full window, a transmitter that takes nothing, a payload that does not fit, no session")
+    clear_line()
+    var h2 = xrcestream.history()
+    let blocked = rosuart.send_request(u, var m, var f, var h2, session_at(4), stream_full(), 0x17,
+                                       var forty)
+    test.assert_eq(blocked.code, rosret.ROS_RET_BAD_ALLOC)
+    test.assert_eq(blocked.request, 0)
+    test.assert_eq(list.len(on_the_line()), 0)
+    u_refusals = 0 - 1
+    let lost = rosuart.send_request(u, var m, var f, var h2, session_at(4), stream_at(0), 0x17,
+                                    var forty)
+    test.assert_eq(lost.code, rosret.ROS_RET_AGENT_UNREACHABLE)
+    test.assert_eq(lost.request, 4)
+    test.assert_eq(xrcestream.history_load(var h2, 0, var back), 28)
+    clear_line()
+    var big: Vec[u8; 512] = Vec.new()
+    for _i in 0..505
+        let _ = big.push(0)
+    let toolong = rosuart.send_request(u, var m, var f, var h2, session_at(4), stream_at(0), 0x17,
+                                       var big)
+    test.assert_eq(toolong.code, rosret.ROS_RET_INVALID_ARGUMENT)
+    test.assert_eq(toolong.request, 0)
+    test.assert_eq(rosuart.send_request(u, var m, var f, var h2, rostransport.session(1, 512),
+                                        stream_at(0), 0x17, var forty).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+    test.case("RECORDED WRITE_DATA of a reply at sequence 0 with request 57, kept in the history")
+    clear_line()
+    var h3 = xrcestream.history()
+    let sent = rosuart.send_reply(u, var m, var f, var h3, session_at(57), stream_at(0), 0x18,
+                                  an_identity(), var five)
+    test.assert_eq(sent.code, rosret.ROS_RET_OK)
+    test.assert_eq(on_the_line(), [reply_write(0, 57, 5)])
+    test.assert_eq(sent.stream.out_next, 1)
+    test.assert_eq(sent.session.next_request, 58)
+    test.assert_eq(xrcestream.history_load(var h3, 0, var back), 44)
+
+    test.case("a full window, a transmitter that takes nothing, a payload that does not fit, no session")
+    clear_line()
+    var h4 = xrcestream.history()
+    test.assert_eq(rosuart.send_reply(u, var m, var f, var h4, session_at(57), stream_full(), 0x18,
+                                      an_identity(), var five).code,
+                   rosret.ROS_RET_BAD_ALLOC)
+    test.assert_eq(list.len(on_the_line()), 0)
+    u_refusals = 0 - 1
+    let held = rosuart.send_reply(u, var m, var f, var h4, session_at(57), stream_at(0), 0x18,
+                                  an_identity(), var five)
+    test.assert_eq(held.code, rosret.ROS_RET_AGENT_UNREACHABLE)
+    test.assert_eq(xrcestream.history_load(var h4, 0, var back), 44)
+    clear_line()
+    test.assert_eq(rosuart.send_reply(u, var m, var f, var h4, session_at(57), stream_at(0), 0x18,
+                                      an_identity(), var big).code,
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+    test.assert_eq(rosuart.send_reply(u, var m, var f, var h4, rostransport.session(1, 512),
+                                      stream_at(0), 0x18, an_identity(), var five).code,
+                   rosret.ROS_RET_NOT_INIT)
+
+@test
+fn test_the_device_takes_a_request_and_a_reply_in_the_message_buffer() [io, mutate]
+    let u = FakeUart { id: 1 }
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    let up = rostransport.session_silent(an_open_session(), 300)
+
+    test.case("RECORDED DATA at a replier is the request, with its identity, and is acknowledged")
+    clear_line()
+    agent_sends(request_data(0, 2, 3))
+    let got = rosuart.take_request(u, var d, var m, var f, var h, up, stream_at(0), 3)
+    test.assert_eq(got.code, rosret.ROS_RET_OK)
+    test.assert_eq(got.sample.object, 0x18)
+    test.assert(got.request.found)
+    test.assert(same(got.request.identity, an_identity()))
+    test.assert_eq(got.request.length, 16)
+    test.assert_eq(xrcewire.i64_at(var m, got.request.start), 2)
+    test.assert_eq(xrcewire.i64_at(var m, got.request.start + 8), 3)
+    test.assert_eq(got.session.silent_ms, 0)
+    test.assert_eq(on_the_line(), [acknack_message(1, 0)])
+
+    test.case("an empty line is a take that failed, which is not an error")
+    clear_line()
+    let quiet = rosuart.take_request(u, var d, var m, var f, var h, up, stream_at(0), 3)
+    test.assert_eq(quiet.code, rosret.ROS_RET_SERVICE_TAKE_FAILED)
+    test.assert(not quiet.sample.found)
+
+    test.case("a sample of a data reader is left in the buffer, found")
+    clear_line()
+    agent_sends(topic_data())
+    let other = rosuart.take_request(u, var d, var m, var f, var h, up, stream_at(0), 3)
+    test.assert_eq(other.code, rosret.ROS_RET_SERVICE_TAKE_FAILED)
+    test.assert_eq(other.sample.object, 0x16)
+    test.assert_eq(xrcewire.sample_i32(var m, other.sample), 7)
+    test.assert(not other.request.found)
+
+    test.case("a refused request comes back as an error with the number")
+    clear_line()
+    agent_sends(status_message(5, 0x18, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let refused = rosuart.take_request(u, var d, var m, var f, var h, up, stream_at(0), 3)
+    test.assert_eq(refused.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(refused.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
+
+    test.case("RECORDED DATA at a requester is the reply, with the request id of its call")
+    clear_line()
+    agent_sends(reply_data(1, 4, 42))
+    let reply = rosuart.take_reply(u, var d, var m, var f, var h, up, stream_after(0), 3)
+    test.assert_eq(reply.code, rosret.ROS_RET_OK)
+    test.assert_eq(reply.sample.object, 0x17)
+    test.assert(reply.reply.found)
+    test.assert_eq(reply.reply.request, 4)
+    test.assert_eq(reply.reply.length, 8)
+    test.assert_eq(xrcewire.i64_at(var m, reply.reply.start), 42)
+    test.assert_eq(on_the_line(), [acknack_message(2, 0)])
+
+    test.case("an empty line, and a request, are takes that failed")
+    clear_line()
+    let nothing = rosuart.take_reply(u, var d, var m, var f, var h, up, stream_after(0), 3)
+    test.assert_eq(nothing.code, rosret.ROS_RET_CLIENT_TAKE_FAILED)
+    clear_line()
+    agent_sends(request_data(0, 2, 3))
+    let wrong = rosuart.take_reply(u, var d, var m, var f, var h, up, stream_at(0), 3)
+    test.assert_eq(wrong.code, rosret.ROS_RET_CLIENT_TAKE_FAILED)
+    test.assert_eq(wrong.sample.object, 0x18)
+    test.assert(not wrong.reply.found)
+
+    test.case("a refused request comes back as an error with the number")
+    clear_line()
+    agent_sends(status_message(5, 0x17, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE))
+    let rejected = rosuart.take_reply(u, var d, var m, var f, var h, up, stream_after(0), 3)
+    test.assert_eq(rejected.code, rosret.ROS_RET_ERROR)
+    test.assert_eq(rejected.status, xrcewire.XRCE_STATUS_ERR_UNKNOWN_REFERENCE)
