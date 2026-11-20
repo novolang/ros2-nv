@@ -75,6 +75,10 @@ pub const ROS_DDS_TOPIC_PREFIX = "rt/"
 pub const ROS_DDS_REQUEST_PREFIX = "rq/"
 // The DDS prefix a service reply gets: `rr/`.
 pub const ROS_DDS_REPLY_PREFIX = "rr/"
+// What follows a service's name in the topic its requests travel on: `Request`.
+pub const ROS_DDS_REQUEST_SUFFIX = "Request"
+// What follows a service's name in the topic its replies travel on: `Reply`.
+pub const ROS_DDS_REPLY_SUFFIX = "Reply"
 
 // ── Checking ─────────────────────────────────────────────────────────
 
@@ -446,16 +450,24 @@ fn dds_topic_name(fully_qualified_name: Str) -> Str []
         return ROS_DDS_TOPIC_PREFIX + without_leading_slash(fully_qualified_name)
 
 // The DDS topic name a service's requests travel on.
+//
+// `rq/`, the name with its leading slash removed, and `Request`: the service
+// `/add_two_ints` is the topic `rq/add_two_intsRequest`.
 pub @tier(system)
 fn dds_request_name(fully_qualified_name: Str) -> Str []
     system
         return ROS_DDS_REQUEST_PREFIX + without_leading_slash(fully_qualified_name)
+            + ROS_DDS_REQUEST_SUFFIX
 
 // The DDS topic name a service's replies travel on.
+//
+// `rr/`, the name with its leading slash removed, and `Reply`: the service
+// `/add_two_ints` is the topic `rr/add_two_intsReply`.
 pub @tier(system)
 fn dds_reply_name(fully_qualified_name: Str) -> Str []
     system
         return ROS_DDS_REPLY_PREFIX + without_leading_slash(fully_qualified_name)
+            + ROS_DDS_REPLY_SUFFIX
 
 // How many characters of the budget a fully qualified name uses.
 //

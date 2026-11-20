@@ -111,9 +111,9 @@ fn test_the_name_on_the_wire_is_not_the_name_in_the_program() [io]
 
     test.case("a service gets two topics, rq and rr")
     test.assert_eq(rosname.dds_request_name("/add_two_ints"),
-                   "rq/add_two_ints")
+                   "rq/add_two_intsRequest")
     test.assert_eq(rosname.dds_reply_name("/add_two_ints"),
-                   "rr/add_two_ints")
+                   "rr/add_two_intsReply")
 
     test.case("and the prefix comes out of the length budget")
     test.assert_eq(rosname.effective_length("/chatter"), 10)
