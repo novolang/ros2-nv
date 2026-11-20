@@ -5,25 +5,6 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
-
-### Added
-
-- **The interoperability suite.** `tests/interop/run.sh` runs a node of this
-  package and a ROS 2 Jazzy node against each other through a Micro XRCE-DDS
-  Agent, over TCP and over UDP: `host_talker` heard by an rclpy subscription,
-  an rclpy publisher heard by `host_listener` (integers and a String of 1,000
-  characters), `ros2 service call` answered by `host_server`, and `host_client`
-  answered by an rclpy server. `tests/interop/build_agent.sh` builds the agent;
-  `.github/workflows/interop.yml` runs the suite and `.github/workflows/check.yml`
-  builds, tests and audits the package, on every push.
-
-### Changed
-
-- The minimum `novo` is 0.26.0, which has `Vec.to_list()`.  The sources and
-  the tests copy a message buffer into a list with it, where a push loop
-  stood in before.  Thirteen files are in the form `novo fmt` prints.
-
 ## 0.1.6 — 2026-11-20
 
 A node writes a sample longer than one message, and takes a long service
@@ -79,6 +60,14 @@ it was.
   device's talker over a pseudoterminal pair, the two services, and the
   nRF52840-DK, each with the text `ros2 topic echo` or `ros2 service call`
   printed and the agent's log.
+- **The interoperability suite.** `tests/interop/run.sh` runs a node of this
+  package and a ROS 2 Jazzy node against each other through a Micro XRCE-DDS
+  Agent, over TCP and over UDP: `host_talker` heard by an rclpy subscription,
+  an rclpy publisher heard by `host_listener` (integers and a String of 1,000
+  characters), `ros2 service call` answered by `host_server`, and `host_client`
+  answered by an rclpy server. `tests/interop/build_agent.sh` builds the agent;
+  `.github/workflows/interop.yml` runs the suite and `.github/workflows/check.yml`
+  builds, tests and audits the package, on every push.
 
 ### Changed
 
@@ -89,6 +78,9 @@ it was.
   waits for its pieces by itself.
 - The flash of `examples/dk_sensor_node.nv` went from 29,392 to 29,476 bytes, the
   drop code of the two new result types; its static RAM stayed at 2,712 bytes.
+- The minimum `novo` is 0.26.0, which has `Vec.to_list()`.  The sources and
+  the tests copy a message buffer into a list with it, where a push loop
+  stood in before.  Thirteen files are in the form `novo fmt` prints.
 
 ## 0.1.5 — 2026-11-20
 
