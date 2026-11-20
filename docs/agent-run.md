@@ -18,7 +18,7 @@ in. The commands below work with either; the name is the only difference.
 | --- | --- | --- |
 | TCP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv` | `MicroXRCEAgent tcp4 --port 2018` |
 | UDP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, with `udp` as the last argument | `MicroXRCEAgent udp4 --port 2018` |
-| A serial line, from a board | `examples/dk_talker.nv` | `MicroXRCEAgent serial --dev /dev/ttyACM<n> -b 115200` |
+| A serial line, from a board | `examples/dk_talker.nv`, `examples/dk_sensor_node.nv` | `MicroXRCEAgent serial --dev /dev/ttyACM<n> -b 115200` |
 | A serial line, from a PC | `examples/uart_stdio.nv`, `examples/uart_stdio_listener.nv` | `MicroXRCEAgent serial --dev <the PC end of the line> -b 115200` |
 
 The examples use port 2018 for either agent, TCP or UDP.
@@ -773,6 +773,121 @@ node can do is wait an interval it chose, which is what the examples do and
 which a loaded machine overruns, or write its first sample again in a later
 cycle. The package does neither for the caller. Sizing the writer's history
 through the XML of `XRCE_KIND_DATAWRITER` was not tried.
+
+## A node on the nRF52840-DK, 2026-11-20
+
+`examples/dk_sensor_node.nv` on an nRF52840-DK (J-Link 683644473, its
+virtual COM port `/dev/serial/by-id/usb-SEGGER_J-Link_000683644473-if00`,
+UARTE0 on P0.06 and P0.08, 115200 baud, hardware flow control on), against
+a Micro XRCE-DDS Agent 2.4.3 in serial mode and ROS 2 Jazzy on the PC, novo
+0.26.0, probe-rs for the flash. The node publishes the chip's die
+temperature on `/dk/temperature` as a `std_msgs/msg/Int32` in hundredths of
+a degree Celsius once a second, and takes `/dk/led` as a `std_msgs/msg/Int32`
+from 0 to 4: 0 switches the four LEDs off, 1 to 4 switch that LED on and the
+others off, and any other number changes nothing. The temperature is read
+from the TEMP peripheral with `hw.mem_read32` and `hw.mem_write32`, because
+the board's HAL has no binding for it.
+
+The commands, from the package's directory:
+
+```
+novo build --target=nrf52840-dk --hci-uart=physical examples/dk_sensor_node.nv
+probe-rs download --chip nRF52840_xxAA --probe 1366:1024:000683644473 dk_sensor_node.elf
+probe-rs reset --chip nRF52840_xxAA --probe 1366:1024:000683644473
+MicroXRCEAgent serial --dev /dev/serial/by-id/usb-SEGGER_J-Link_000683644473-if00 -b 115200 -v 6
+source /opt/ros/jazzy/setup.bash
+ros2 topic echo /dk/temperature std_msgs/msg/Int32
+ros2 topic pub --once /dk/led std_msgs/msg/Int32 "{data: 2}"
+```
+
+The agent was run from a build in the home directory with its libraries on
+`LD_LIBRARY_PATH`. `--hci-uart=physical` is the flag the build needs; without it the console is
+RTT and the agent hears nothing. The image is 24,712 bytes of flash, of which
+the program is 15,778, and 2,712 bytes of static RAM. The J-Link's
+mass-storage component on this board is off (`MSDDisable`), which a J-Link
+needs for serial writes longer than 64 bytes to pass.
+
+### The echo
+
+The node had run for eight seconds with no agent when the agent was started,
+and `ros2 topic echo` was started six seconds after that. It ran for 75
+seconds under `timeout`, and a shell loop put the time of arrival in front
+of each line. 76 samples arrived:
+
+```
+06:51:42.014 data: 2350
+06:51:42.253 data: 2350
+06:51:43.180 data: 2350
+06:51:44.188 data: 2375
+06:51:45.188 data: 2400
+...
+06:52:54.585 data: 2400
+06:52:55.511 data: 2400
+```
+
+The first sample is the one the agent's writer retained for a late reader
+(see the section on the first samples above); from the second on, the gap
+between two samples was at least 0.926 s and at most 1.009 s, so no sample
+was missing. The values were 23.25 C once, 23.50 C 15 times, 23.75 C 21
+times, 24.00 C 34 times and 24.25 C five times. The TEMP peripheral's step is
+0.25 C, so no other value can appear.
+
+### The LEDs
+
+The LEDs are P0.13 to P0.16, active low, and the board has no way to show
+them to the PC, so the output register of GPIO P0 was read back through
+probe-rs after each command, `probe-rs read b32 --chip nRF52840_xxAA
+--probe 1366:1024:000683644473 0x50000504 1`. A cleared bit is a lit LED.
+Each command was sent with `ros2 topic pub --once /dk/led std_msgs/msg/Int32
+"{data: N}"` and the register read a second later:
+
+| Before | Command | Register | Bits 13 to 16 | LEDs lit |
+| --- | --- | --- | --- | --- |
+| all off | `data: 2` | `0x0001a000` | 1 0 1 1 (bit 14 clear) | LED2 |
+| all off | `data: 1` | `0x0001c000` | 0 1 1 1 (bit 13 clear) | LED1 |
+| LED2 | `data: 4` | `0x0000e000` | 1 1 1 0 (bit 16 clear) | LED4 |
+| LED4 | `data: 7` | `0x0000e000` | 1 1 1 0 | LED4, unchanged |
+| LED4 | `data: 3` | `0x00016000` | 1 1 0 1 (bit 15 clear) | LED3 |
+| LED3 | `data: 0` | `0x0001e000` | 1 1 1 1 | none |
+
+The row for `data: 1` is from a second run. In the first run the `ros2
+topic pub --once` that sent it was not seen by the agent (the agent's log
+has five reads of the data reader for six commands), and the register stayed
+at the value of the command before. It was sent again with `-w 1`, which
+waits for the matching subscription, and LED1 lit. No frame for the first
+command reached the agent, so the node was not asked.
+
+### What the first runs taught the package
+
+The first runs were not clean, and the cause was in the package.
+
+With the node running and the agent started afterwards, the agent's log had
+a `session re-established` for every second and the entities were created,
+and then created again four seconds later, over and over. The node was
+running the example's bring-up, which creates seven entities and answers a
+closed session when one of them did not get its status. Counters kept in
+RAM during a run and read back with probe-rs showed that `receive` returned
+a whole frame every time, none late and none damaged, and that the status
+`create` read was the one for a request three places earlier: the node
+asked for request 4 and read the status of request 1. The three extra
+answers were the agent's replies to the open requests the node had sent
+while the agent was not there: the port held them, and the agent sent a
+STATUS_AGENT for each when it opened the port. `open` and `create` took the
+first frame they saw, so the answers they read stayed three behind for as
+long as the node ran.
+
+`rosuart.open` and `rosuart.create` now read past a frame that is not the
+answer, up to `ROS_UART_STALE_FRAMES`, 8. With that, the same arrangement
+(node started eight seconds before the agent) created the participant, both
+topics, the publisher, the writer, the subscriber and the reader in 111
+milliseconds, from the first frame the agent saw to the last status, with no second attempt,
+and the 76 samples above followed.
+
+The receiver was suspected first, because the nRF52 UARTE has a six-byte
+FIFO and `receive` pauses a millisecond between polls, which is 11 bytes at
+115200 baud. The counters did not show it: no call of `receive` ended with
+a damaged frame, and the UARTE's `ERRORSRC` register, which holds the
+overrun, read 0. The package's `receive` is unchanged.
 
 ## The board
 

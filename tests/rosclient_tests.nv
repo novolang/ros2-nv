@@ -496,6 +496,14 @@ fn agent_frame(payload: [Int]) -> [Int]
 fn agent_replies(payload: [Int]) [mutate]
     load_inbox(agent_frame(payload))
 
+// Put several of the agent's replies on the line, in order.
+fn agent_replies_in_order(payloads: [[Int]]) [mutate]
+    var all: [Int] = []
+    for payload in payloads
+        for b in agent_frame(payload)
+            all = list.push(all, b)
+    load_inbox(all)
+
 // The message the device sent last, taken out of the frame on the
 // line: what an agent would have read.
 fn sent_payload() -> [Int]
@@ -600,6 +608,23 @@ fn test_a_session_opens_over_the_uart() [io, mutate]
     g_refusals = 0 - 1
     test.assert(not rostransport.session_is_ready(rosuart.open(u, var d, var m, var f, s, 10)))
 
+    test.case("answers to earlier requests ahead of the status are read past")
+    clear_line()
+    agent_replies_in_order([status_message(1, 0x12, 0), info_message(), status_agent_message(0)])
+    test.assert(rostransport.session_is_ready(rosuart.open(u, var d, var m, var f, s, 10)))
+
+    test.case("seven frames ahead are read past and eight are too many")
+    clear_line()
+    agent_replies_in_order([info_message(), info_message(), info_message(), info_message(),
+                            info_message(), info_message(), info_message(),
+                            status_agent_message(0)])
+    test.assert(rostransport.session_is_ready(rosuart.open(u, var d, var m, var f, s, 10)))
+    clear_line()
+    agent_replies_in_order([info_message(), info_message(), info_message(), info_message(),
+                            info_message(), info_message(), info_message(), info_message(),
+                            status_agent_message(0)])
+    test.assert(not rostransport.session_is_ready(rosuart.open(u, var d, var m, var f, s, 10)))
+
     test.case("a smaller MTU is advertised as it is")
     clear_line()
     agent_replies(status_agent_message(0))
@@ -645,6 +670,35 @@ fn test_creating_over_the_uart_reports_in_codes() [io, mutate]
     test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
                                   0x11, markup, 10).code,
                                   rosret.ROS_RET_TIMEOUT)
+
+    test.case("a status for another request ahead of this one is read past")
+    clear_line()
+    agent_replies_in_order([status_message(4, 0x12, 0), info_message(), status_message(1, 0x12, 0)])
+    let behind = rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC, 0x11,
+                                markup, 10)
+    test.assert_eq(behind.code, rosret.ROS_RET_OK)
+    test.assert_eq(behind.session.next_request, 2)
+
+    test.case("a refusal behind a stale status is still a refusal")
+    clear_line()
+    agent_replies_in_order([status_message(4, 0x12, 0), status_message(1, 0x12, 0x85)])
+    test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                  0x11, markup, 10).code,
+                   rosret.ROS_RET_ERROR)
+
+    test.case("eight stale frames are read and the ninth is left for the next request")
+    clear_line()
+    agent_replies_in_order([status_message(4, 0x12, 0), status_message(4, 0x12, 0),
+                            status_message(4, 0x12, 0), status_message(4, 0x12, 0),
+                            status_message(4, 0x12, 0), status_message(4, 0x12, 0),
+                            status_message(4, 0x12, 0), status_message(4, 0x12, 0),
+                            status_message(1, 0x12, 0)])
+    test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                  0x11, markup, 10).code,
+                   rosret.ROS_RET_TIMEOUT)
+    test.assert_eq(rosuart.create(u, var d, var m, var f, s, 0x12, xrcewire.XRCE_KIND_TOPIC,
+                                  0x11, markup, 10).code,
+                   rosret.ROS_RET_OK)
 
     test.case("nobody answers")
     clear_line()

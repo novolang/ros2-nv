@@ -7,7 +7,53 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## Unreleased
 
-Documentation only. No signature, type or behaviour changed.
+A node on the nRF52840-DK, and a fix for a session that did not set up when
+the agent started after the node. No signature or type changed; the next
+release is 0.1.4.
+
+### Added
+
+- **`examples/dk_sensor_node.nv`**, a node on an nRF52840-DK that publishes
+  the chip's die temperature on `/dk/temperature` once a second as a
+  `std_msgs/msg/Int32` in hundredths of a degree Celsius, and takes
+  `/dk/led`, a `std_msgs/msg/Int32` from 0 to 4, to switch the four LEDs
+  (0 all off, 1 to 4 that LED on). It is a second example and not a change
+  to `dk_talker.nv`, because it creates seven entities, takes a
+  subscription and reads a peripheral, where `dk_talker.nv` is the shortest
+  node there is and is written for a different board. The board's HAL has
+  no binding for the TEMP peripheral, so the program reads it with
+  `hw.mem_read32` and `hw.mem_write32`; the sample is an Int32 because
+  `rosuart` publishes and reads that type and no package function writes a
+  Float32. It built with novo 0.26.0 for `--target=nrf52840-dk
+  --hci-uart=physical` at 24,712 bytes of flash and 2,712 bytes of static
+  RAM, and ran against a Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy;
+  `docs/agent-run.md` has the commands, the 76 samples that `ros2 topic echo`
+  printed in 74 seconds and the registers read back after each LED command.
+
+### Fixed
+
+- **`rosuart.open` and `rosuart.create` read past a frame that is not the
+  answer they wait for.** Each took the first frame that arrived, and a
+  `create` that found the status of another request ended with
+  `ROS_RET_TIMEOUT` and left the right status on the line for the next
+  request. A node that starts before its agent sends an open request each
+  second; the serial port holds them, and the agent answers all of them in
+  a burst when it opens the port. On the nRF52840-DK, started eight seconds
+  before the agent, the node read three of those answers in place of the
+  statuses of its first three creates, every create after them took the
+  status of the request three before it. Every create ended with
+  `ROS_RET_TIMEOUT` although the agent had created all seven entities, the
+  example's bring-up answered a closed session, and the node opened another
+  a second later and did the same again, for as long as it ran. Both functions now read and drop up to
+  `ROS_UART_STALE_FRAMES`, 8, frames that are not the answer, and end with the
+  codes they ended with before when none of them is. The first bring-up of
+  the same board then created all seven entities at once. `rosclient_tests`
+  has the cases: a stale status, an INFO and a status ahead of the answer,
+  seven frames ahead and eight, and a refusal behind a stale status.
+  The host functions `rostransport.open_session` and
+  `rostransport.create_entity` read one frame and are unchanged; a TCP
+  stream is in order, and a UDP datagram that arrives late is the case they
+  still end with `ROS_RET_TIMEOUT` for.
 
 ### Changed
 

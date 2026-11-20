@@ -171,7 +171,10 @@ takes, a text of a thousand bytes included.
 **A program on a device calls `rosuart`.** Its functions take an
 `XrceUart`, which `rosuart.console_uart` supplies from the board's
 `hal.uart`, and allocate nothing; `examples/dk_talker.nv` is the same
-counter on an nRF54LM20 DK, and `examples/uart_stdio_listener.nv` is the
+counter on an nRF54LM20 DK, `examples/dk_sensor_node.nv` is a node on an
+nRF52840-DK that publishes the chip's die temperature on `/dk/temperature`
+once a second and takes `/dk/led` to switch the board's LEDs, and
+`examples/uart_stdio_listener.nv` is the
 device's subscription run on a PC, with `string` as its third argument for a
 sample longer than one message, which `rosuart.poll_long` joins. `docs/agent-run.md` has the steps to run
 each against an agent.
@@ -425,6 +428,13 @@ a counter on `/novo_counter` once a second. It is 22,840 bytes of flash and
 2,712 bytes of static RAM, and it ran against a real agent on a PC with the
 board's two register accesses replaced by standard input and output
 (`examples/uart_stdio.nv`); the run is recorded in `docs/agent-run.md`.
+
+`examples/dk_sensor_node.nv` is a node on an nRF52840-DK with a publisher
+and a subscription on the same UART. It is 24,712 bytes of flash and 2,712
+bytes of static RAM, and `docs/agent-run.md` records the run on the board
+against an agent in serial mode: 76 samples of `/dk/temperature` in 74
+seconds with no gap, and the output register of the LEDs read back after
+each command sent to `/dk/led`.
 
 The other five are excluded, each for a stated reason.
 
