@@ -28,6 +28,18 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 - **`tests/roslong_tests.nv`**: a String of 4,000 characters is written in two
   turns, one of 20,000 in ten, and 65,000 bytes is accepted where 65,001 is
   refused.
+- **`rosuart.write_piece` and `xrcefrag.piece_take`: a sample longer than 2,048
+  bytes from a device.** The `Vec[u8; 2048]` forms stop at 2,048 bytes, the size of
+  the buffer. `write_piece` takes the sample a piece at a time: `piece_take(length,
+  at, reply)` says how many bytes the piece at `at` carries, 496 in the first, 472
+  for a reply, 504 after it, or the whole of a sample that fits one message; the
+  caller fills a `Vec[u8; 504]` with them from wherever the sample comes from, and
+  the call writes them as one FRAGMENT of the history, with the outcome and the
+  rules of `write_sample_long`. A sample of up to
+  `xrcefrag.XRCE_PIECED_MAX_SAMPLE`, 65,000 bytes, costs the node 512 bytes.
+  `examples/uart_stdio_long.nv` publishes texts of 4,000 and 20,000 characters this
+  way, over a pseudoterminal pair to an agent; `ros2 topic echo` printed both whole.
+  The probe runs 137 checks, two more, and passes under QEMU.
 
 ### Changed
 

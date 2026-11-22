@@ -836,6 +836,71 @@ fn write_sample_long<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1
     write_in_pieces(u, var m, var f, var h, s, r, writer, false, xrcewire.no_identity(),
                     var payload, at)
 
+// Write the next piece of a sample that the caller supplies a piece at a time.
+//
+// The sample is `length` bytes, up to `xrcefrag.XRCE_PIECED_MAX_SAMPLE`, and is
+// never held whole: `chunk` holds `xrcefrag.piece_take(length, at, reply)` bytes
+// of it from `at` on, which is at most 504, and the call writes them as one
+// message of the history. A node that makes the sample as it goes, such as the
+// rows of an image, pays 504 bytes for it where `write_sample_long` pays 2,056.
+// The rules and the outcome are those of `write_sample_long`: a sample that fits
+// one message is written as `send_request` and `send_reply` write it, any other as
+// one FRAGMENT, the first with the WRITE_DATA's front, the last flagged; the
+// outcome's `at` is the place to pass to the next call, `done` says that the
+// sample is all written, and a call that finds the history full writes nothing
+// and answers `ROS_RET_BAD_ALLOC`. `ROS_RET_INVALID_ARGUMENT` answers a `length` or
+// an `at` outside the sample and a `chunk` shorter than the piece. Poll for the
+// agent's acknowledgements between calls, and write nothing else on the reliable
+// stream until `done`.
+pub @tier(embedded)
+@no_alloc
+fn write_piece<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037],
+                               var h: Vec[u8; 2056], s: rostransport.RosSession,
+                               r: xrcestream.RelStream, object: Int, reply: Bool,
+                               identity: xrcewire.XrceIdentity, length: Int, at: Int,
+                               var chunk: Vec[u8; 504]) -> rostransport.RosLongSent [e]
+    if not rostransport.session_is_ready(s)
+        return rostransport.long_sent(s, r, rosret.ROS_RET_NOT_INIT, at, length, 0)
+    if length > xrcefrag.XRCE_PIECED_MAX_SAMPLE or at < 0 or at > length
+        return rostransport.long_sent(s, r, rosret.ROS_RET_INVALID_ARGUMENT, at, length, 0)
+    if at == length and length > 0
+        return rostransport.long_sent(s, r, rosret.ROS_RET_OK, at, length, 0)
+    let n = xrcefrag.piece_take(length, at, reply)
+    if chunk.len() < n or n > 504
+        return rostransport.long_sent(s, r, rosret.ROS_RET_INVALID_ARGUMENT, at, length, 0)
+    if not xrcestream.out_can_write(r)
+        return rostransport.long_sent(s, r, rosret.ROS_RET_BAD_ALLOC, at, length, 0)
+    let request = s.next_request
+    var sess = s
+    if at == 0
+        sess = rostransport.session_next_request(s)
+    if at == 0 and n == length
+        // One message, built as `send_request` and `send_reply` build it.
+        if reply
+            let _begun = xrcewire.begin_write_reply(var m, xrcewire.XRCE_STREAM_RELIABLE,
+                                                    r.out_next, request, object, identity)
+        else
+            let _begun = xrcewire.begin_write_data(var m, xrcewire.XRCE_STREAM_RELIABLE,
+                                                   r.out_next, request, object)
+        for i in 0..n
+            let _put = xrcewire.put_sample_byte(var m, chunk[i] as Int)
+        let _len = xrcewire.finish_write_data(var m)
+    else
+        let _begun = xrcefrag.piece_begin(var m, r.out_next, at, length, request, object, reply,
+                                          identity)
+        for i in 0..n
+            let _put = xrcewire.put_sample_byte(var m, chunk[i] as Int)
+        let _len = xrcewire.finish_fragment(var m, at + n == length)
+    let _kept = xrcestream.history_store(var h, r.out_next, var m)
+    let after = xrcestream.out_wrote(r)
+    var code = rosret.ROS_RET_OK
+    if not send(u, var m, var f)
+        code = rosret.ROS_RET_AGENT_UNREACHABLE
+    var id = 0
+    if at == 0
+        id = request
+    rostransport.long_sent(sess, after, code, at + n, length, id)
+
 // Send a request to a requester, in pieces if it does not fit one message.
 //
 // `send_request` for a request of up to 2,048 bytes, with the rules of

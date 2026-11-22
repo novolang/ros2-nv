@@ -954,6 +954,171 @@ fn test_the_device_writes_a_long_sample_in_pieces() [io, mutate]
                                              0x15, var text, 1006).code,
                    rosret.ROS_RET_INVALID_ARGUMENT)
 
+// A piece of `sample`, `n` bytes from `at`, as the chunk the device's caller fills.
+fn chunk_of(sample: [Int], at: Int, n: Int) -> Vec[u8; 504]
+    var c: Vec[u8; 504] = Vec.new()
+    for x in list.slice(sample, at, at + n)
+        let _ = c.push(x as u8)
+    c
+
+// Write `sample` with `rosuart.write_piece`, a piece to a call, as a node that
+// makes it as it goes does. The agent acknowledges every message after the fourth
+// is out. Answers what was on the line, the calls made, and the last outcome.
+struct PiecesWritten
+    frames: [[Int]]
+    calls: Int
+    last: rostransport.RosLongSent
+
+fn write_by_pieces(sample: [Int], request: Int, reply: Bool,
+                   object: Int) -> PiecesWritten [io, mutate]
+    let u = FakeUart { id: 1 }
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    clear_line()
+    var out = rostransport.long_sent(session_at(request), stream_at(0), rosret.ROS_RET_OK, 0,
+                                     list.len(sample), 0)
+    var frames: [[Int]] = []
+    var calls = 0
+    while not out.done and calls < 200
+        let n = xrcefrag.piece_take(list.len(sample), out.at, reply)
+        var chunk = chunk_of(sample, out.at, n)
+        let st = if xrcestream.out_can_write(out.stream)
+            out.stream
+        else
+            xrcestream.out_ack(out.stream, out.stream.out_next)
+        out = rosuart.write_piece(u, var m, var f, var h, out.session, st, object, reply,
+                                  an_identity(), list.len(sample), out.at, var chunk)
+        frames = list.concat(frames, on_the_line())
+        clear_line()
+        calls = calls + 1
+    PiecesWritten { frames: frames, calls: calls, last: out }
+
+@test
+fn test_the_device_writes_a_sample_a_piece_at_a_time() [io, mutate]
+    test.case("a text of 4,000 characters is the eight pieces the host writes, eight calls")
+    let four = write_by_pieces(text_cdr(4000), 5, false, 0x15)
+    test.assert(four.last.done)
+    test.assert_eq(four.last.at, 4005)
+    test.assert_eq(four.calls, 8)
+    test.assert_eq(four.frames, fragments_of(write_submessage(5, 0x15, text_cdr(4000)), 504, 0))
+
+    test.case("a text of 20,000 characters is 40 pieces")
+    let twenty = write_by_pieces(text_cdr(20000), 5, false, 0x15)
+    test.assert(twenty.last.done)
+    test.assert_eq(twenty.calls, 40)
+    test.assert_eq(twenty.frames, fragments_of(write_submessage(5, 0x15, text_cdr(20000)), 504, 0))
+
+    test.case("a reply of 4,000 characters holds the identity in its first piece")
+    let reply = write_by_pieces(text_cdr(4000), 57, true, 0x18)
+    test.assert(reply.last.done)
+    test.assert_eq(reply.frames, fragments_of(reply_submessage(57, 0x18, text_cdr(4000)), 504, 0))
+
+    test.case("the first call of a sample sets the request id, and no other does")
+    let u = FakeUart { id: 1 }
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    clear_line()
+    var c0 = chunk_of(text_cdr(1000), 0, 496)
+    let first = rosuart.write_piece(u, var m, var f, var h, session_at(5), stream_at(0), 0x15, false,
+                                    xrcewire.no_identity(), 1005, 0, var c0)
+    test.assert_eq(first.code, rosret.ROS_RET_OK)
+    test.assert(not first.done)
+    test.assert_eq(first.at, 496)
+    test.assert_eq(first.request, 5)
+    test.assert_eq(first.session.next_request, 6)
+    var c1 = chunk_of(text_cdr(1000), 496, 504)
+    let second = rosuart.write_piece(u, var m, var f, var h, first.session, first.stream, 0x15,
+                                     false, xrcewire.no_identity(), 1005, 496, var c1)
+    test.assert_eq(second.at, 1000)
+    test.assert_eq(second.request, 0)
+    test.assert_eq(second.session.next_request, 6)
+
+    test.case("a sample that fits one message is the message send_request writes")
+    clear_line()
+    var short = chunk_of(ramp(8), 0, 8)
+    let one = rosuart.write_piece(u, var m, var f, var h, session_at(4), stream_at(0), 0x17, false,
+                                  xrcewire.no_identity(), 8, 0, var short)
+    test.assert(one.done)
+    test.assert_eq(one.request, 4)
+    let written = on_the_line()
+    clear_line()
+    var again: Vec[u8; 512] = Vec.new()
+    for x in ramp(8)
+        let _ = again.push(x as u8)
+    let plain = rosuart.send_request(u, var m, var f, var h, session_at(4), stream_at(0), 0x17,
+                                     var again)
+    test.assert_eq(plain.request, 4)
+    test.assert_eq(on_the_line(), written)
+
+    test.case("a short reply is the message send_reply writes")
+    clear_line()
+    var short_reply = chunk_of(ramp(8), 0, 8)
+    let reply_one = rosuart.write_piece(u, var m, var f, var h, session_at(57), stream_at(0), 0x18,
+                                        true, an_identity(), 8, 0, var short_reply)
+    test.assert(reply_one.done)
+    test.assert_eq(reply_one.request, 57)
+    let reply_written = on_the_line()
+    clear_line()
+    var reply_again: Vec[u8; 512] = Vec.new()
+    for x in ramp(8)
+        let _ = reply_again.push(x as u8)
+    let reply_plain = rosuart.send_reply(u, var m, var f, var h, session_at(57), stream_at(0), 0x18,
+                                         an_identity(), var reply_again)
+    test.assert_eq(reply_plain.code, rosret.ROS_RET_OK)
+    test.assert_eq(on_the_line(), reply_written)
+
+    test.case("a full window, a session never opened, a place outside the sample, a short chunk")
+    var c2 = chunk_of(text_cdr(1000), 0, 496)
+    let blocked = rosuart.write_piece(u, var m, var f, var h, session_at(5), stream_full(), 0x15,
+                                      false, xrcewire.no_identity(), 1005, 0, var c2)
+    test.assert_eq(blocked.code, rosret.ROS_RET_BAD_ALLOC)
+    test.assert_eq(blocked.at, 0)
+    test.assert_eq(rosuart.write_piece(u, var m, var f, var h, rostransport.session(1, 512),
+                                       stream_at(0), 0x15, false, xrcewire.no_identity(), 1005,
+                                       0, var c2).code,
+                   rosret.ROS_RET_NOT_INIT)
+    test.assert_eq(rosuart.write_piece(u, var m, var f, var h, session_at(5), stream_at(0), 0x15,
+                                       false, xrcewire.no_identity(), 1005, 0 - 1, var c2).code,
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+    test.assert_eq(rosuart.write_piece(u, var m, var f, var h, session_at(5), stream_at(0), 0x15,
+                                       false, xrcewire.no_identity(), 65001, 0, var c2).code,
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+    var few = chunk_of(ramp(10), 0, 10)
+    test.assert_eq(rosuart.write_piece(u, var m, var f, var h, session_at(5), stream_at(0), 0x15,
+                                       false, xrcewire.no_identity(), 1005, 0, var few).code,
+                   rosret.ROS_RET_INVALID_ARGUMENT)
+    let past = rosuart.write_piece(u, var m, var f, var h, session_at(5), stream_at(0), 0x15, false,
+                                   xrcewire.no_identity(), 1005, 1005, var c2)
+    test.assert(past.done)
+    test.assert_eq(past.code, rosret.ROS_RET_OK)
+
+    test.case("a transmitter that takes nothing keeps the piece")
+    clear_line()
+    u_refusals = 0 - 1
+    var h4 = xrcestream.history()
+    var c3 = chunk_of(text_cdr(1000), 0, 496)
+    let lost = rosuart.write_piece(u, var m, var f, var h4, session_at(5), stream_at(0), 0x15, false,
+                                   xrcewire.no_identity(), 1005, 0, var c3)
+    test.assert_eq(lost.code, rosret.ROS_RET_AGENT_UNREACHABLE)
+    test.assert_eq(lost.at, 496)
+    test.assert_eq(lost.stream.out_next, 1)
+    var back: Vec[u8; 512] = Vec.new()
+    test.assert_eq(xrcestream.history_load(var h4, 0, var back), 512)
+    clear_line()
+
+    test.case("the piece sizes, and the two limits")
+    test.assert_eq(xrcefrag.piece_take(1005, 0, false), 496)
+    test.assert_eq(xrcefrag.piece_take(1005, 0, true), 472)
+    test.assert_eq(xrcefrag.piece_take(1005, 496, false), 504)
+    test.assert_eq(xrcefrag.piece_take(1005, 1000, false), 5)
+    test.assert_eq(xrcefrag.piece_take(500, 0, false), 500)
+    test.assert_eq(xrcefrag.piece_take(501, 0, false), 496)
+    test.assert_eq(xrcefrag.piece_take(476, 0, true), 476)
+    test.assert_eq(xrcefrag.piece_take(477, 0, true), 472)
+    test.assert_eq(xrcefrag.XRCE_PIECED_MAX_SAMPLE, rostransport.ROS_HOST_LONG_MAX_SAMPLE)
+
 @test
 fn test_the_device_writes_a_short_sample_as_it_always_did() [io, mutate]
     let u = FakeUart { id: 1 }

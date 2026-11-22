@@ -356,8 +356,11 @@ and `examples/dk_long_talker.nv` is the same talker on an nRF52840-DK.
     stream until `done`. The largest sample the `rostransport` forms write is
     `rostransport.ROS_HOST_LONG_MAX_SAMPLE`, 65,000 bytes, which the 16-bit
     length of the WRITE_DATA's submessage header bounds; a longer one answers
-    `ROS_RET_INVALID_ARGUMENT`. The `rosuart` forms write from a `Vec[u8; 2048]` and so
-    stop at `xrcefrag.XRCE_LONG_MAX_SAMPLE`, 2,048 bytes. A sample that fits one message, 500 bytes or a
+    `ROS_RET_INVALID_ARGUMENT`. The `rosuart` `_long` forms write from a
+    `Vec[u8; 2048]` and so stop at `xrcefrag.XRCE_LONG_MAX_SAMPLE`, 2,048 bytes;
+    `rosuart.write_piece` takes a sample of up to 65,000 bytes a piece at a time,
+    from a `Vec[u8; 504]` the caller fills with the bytes
+    `xrcefrag.piece_take` names. A sample that fits one message, 500 bytes or a
     reply of 476, is written as `write_sample_reliable` and `send_reply` write
     it, byte for byte.
 33. **A long request or reply is taken with the `_long` form.**
@@ -499,6 +502,15 @@ its sample are stack, and the compiler reports 9,072 bytes of worst-case stack
 for it. The flash of `examples/dk_sensor_node.nv`, which writes no long sample,
 went from 29,392 to 29,476 bytes, the drop code of two more result types; its
 static RAM stayed at 2,712.
+
+A sample longer than 2,048 bytes is never held whole. `rosuart.write_piece`
+writes one piece of it a call: the caller asks `xrcefrag.piece_take(length, at,
+reply)` how many bytes the piece at `at` carries, 496 in the first, 472 for a
+reply, 504 after, fills a `Vec[u8; 504]` with them from wherever the sample comes
+from, a sensor, an image row, a computation, and calls. The node pays 512 bytes
+for a sample of up to 65,000, and the pieces on the wire are those of
+`write_sample_long`. `examples/uart_stdio_long.nv` publishes texts of 4,000 and
+20,000 characters this way.
 
 **What a long sample is.** The agent writes what DDS delivers as one DATA
 submessage. If the message that would carry it is longer than the 512 bytes

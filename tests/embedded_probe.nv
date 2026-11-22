@@ -349,6 +349,33 @@ fn long_score() -> Int
                                             var payload, part.at)
     if blocked.code == rosret.ROS_RET_BAD_ALLOC
         n = n + 1
+
+    // A sample a piece at a time: 4,000 bytes that are never held whole, the
+    // first piece 496 bytes and the next 504, and the last place reached.
+    var chunk: Vec[u8; 504] = Vec.new()
+    var h3 = xrcestream.history()
+    var rel = xrcestream.rel_stream()
+    var sess = up
+    var at = 0
+    var pieces = 0
+    for _k in 0..16
+        if at < 4000
+            if not xrcestream.out_can_write(rel)
+                rel = xrcestream.out_ack(rel, rel.out_next)
+            let take = xrcefrag.piece_take(4000, at, false)
+            chunk.clear()
+            for j in 0..take
+                let _c = chunk.push(((at + j) % 251) as u8)
+            let out = rosuart.write_piece(u, var m, var f, var h3, sess, rel, 0x15, false,
+                                          xrcewire.no_identity(), 4000, at, var chunk)
+            sess = out.session
+            rel = out.stream
+            at = out.at
+            pieces = pieces + 1
+    if at == 4000 and pieces == 8
+        n = n + 1
+    if xrcefrag.piece_take(4000, 0, false) == 496 and xrcefrag.piece_take(4000, 3500, false) == 500
+        n = n + 1
     n
 
 // The agent's DATA carrying the integer 7, as recorded.
@@ -618,11 +645,11 @@ fn score() -> Int
 @tier(rt)
 fn main() [hw]
     bsp.board.init()
-    // 135 is the number of checks in `score`, `wire_score`, `stream_score`, `frag_score`, `service_score` and `long_score`.  The count is printed on a
+    // 137 is the number of checks in `score`, `wire_score`, `stream_score`, `frag_score`, `service_score` and `long_score`.  The count is printed on a
     // failure rather than only compared, so a device that disagrees with
     // the host says HOW MANY it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 135
+    if n == 137
         hal.uart.write("PASS: ros2-embedded\n")
     else
         hal.uart.write("FAIL: ros2-embedded score=")

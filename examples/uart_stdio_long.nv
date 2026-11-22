@@ -13,13 +13,20 @@
 //   ./uart_stdio_long <>ttyBOARD >&0
 //
 // It publishes a std_msgs/msg/String of 1,000 characters, then one of 2,000 and one
-// of 2,040, on the reliable stream. `rosuart.write_sample_long` cuts each into
+// of 2,040, on the reliable stream, and then one of 4,000 and one of 20,000. `rosuart.write_sample_long` cuts each into
 // FRAGMENT submessages of up to 504 bytes, one to a message, and the agent joins
 // them. The history holds four messages, so one call writes at most four pieces,
 // 2,016 bytes with the WRITE_DATA's front; the text of 2,040 is five pieces and
 // the program polls for the agent's acknowledgements and calls again from the
 // place the outcome gives. The sample is built in a `Vec[u8; 2048]` on the stack,
 // 2,056 bytes.
+//
+// THE TEXTS OF 4,000 AND 20,000 CHARACTERS ARE NEVER HELD WHOLE. A `Vec[u8; 2048]`
+// holds no more than 2,048 bytes, so `rosuart.write_piece` takes the sample a piece
+// at a time: `xrcefrag.piece_take` says how many bytes the next piece carries, the
+// program makes those bytes in a `Vec[u8; 504]`, and the call writes them as one
+// message of the history. The program pays 504 bytes for a sample of any length up
+// to 65,000.
 //
 // Nothing may print to standard output, because the agent would read it as bytes;
 // the program reports on standard error, once, at the end.
@@ -29,6 +36,7 @@
 use rosret
 use rosuart
 use rostransport
+use xrcefrag
 use xrceframe
 use xrcestream
 use xrcewire
@@ -119,6 +127,59 @@ fn publish_text<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[
     rostransport.RosLongSent { session: st, stream: rel, code: rosret.ROS_RET_OK, at: at,
                                done: at == sample.len(), request: 0 }
 
+// The byte of the CDR of a text of `n` characters at `i`: the length with the
+// closing zero in four bytes, the characters `a` to `z` and round again, the zero.
+@tier(embedded)
+@no_alloc
+fn text_byte(n: Int, i: Int) -> Int
+    if i < 4
+        return ((n + 1) >>> (8 * i)) & 0xFF
+    if i < 4 + n
+        return 97 + (i - 4) % 26
+    0
+
+// Publish a text of `n` characters a piece at a time, as `publish_text` publishes
+// a shorter one: write a piece, poll for the agent's acknowledgements, and write the
+// next when the history has room, then poll on for `rest` rounds. Answers the
+// session, the stream, the place reached and whether the text is all out.
+@tier(embedded)
+@no_alloc
+fn publish_pieces<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                                  var f: Vec[u8; 1037], var h: Vec[u8; 2056],
+                                  var chunk: Vec[u8; 504], s: rostransport.RosSession,
+                                  r: xrcestream.RelStream, n: Int,
+                                  rest: Int) -> rostransport.RosLongSent [e, hw]
+    let length = n + 5
+    var st = s
+    var rel = r
+    var at = 0
+    var last = hal.timer.ticks_us() / 1000
+    for _try in 0..2000
+        if at < length
+            if xrcestream.out_can_write(rel)
+                let take = xrcefrag.piece_take(length, at, false)
+                chunk.clear()
+                for i in 0..take
+                    let _c = chunk.push(text_byte(n, at + i) as u8)
+                let out = rosuart.write_piece(u, var m, var f, var h, st, rel, DATAWRITER, false,
+                                              xrcewire.no_identity(), length, at, var chunk)
+                st = out.session
+                rel = out.stream
+                at = out.at
+            let got = rosuart.poll(u, var d, var m, var f, var h, st, rel, 20)
+            let now = hal.timer.ticks_us() / 1000
+            rel = rosuart.reliable_tick(u, var m, var f, got.session, got.stream, now - last)
+            st = rosuart.keepalive(u, var m, var f, got.session, now - last)
+            last = now
+    for _round in 0..rest
+        let got = rosuart.poll(u, var d, var m, var f, var h, st, rel, 100)
+        let now = hal.timer.ticks_us() / 1000
+        rel = rosuart.reliable_tick(u, var m, var f, got.session, got.stream, now - last)
+        st = rosuart.keepalive(u, var m, var f, got.session, now - last)
+        last = now
+    rostransport.RosLongSent { session: st, stream: rel, code: rosret.ROS_RET_OK, at: at,
+                               done: at == length, request: 0 }
+
 fn main() [hw, io]
     let u = rosuart.console_uart()
     var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
@@ -142,4 +203,12 @@ fn main() [hw, io]
         if out.done
             sent = sent + 1
         eprintln("text of ${n} characters: ${out.at} bytes written, done ${out.done}, ${xrcestream.out_in_flight(rel)} unacknowledged")
+    var piece: Vec[u8; 504] = Vec.new()
+    for n in [4000, 20000]
+        let out = publish_pieces(u, var d, var m, var f, var h, var piece, s, rel, n, 10)
+        s = out.session
+        rel = out.stream
+        if out.done
+            sent = sent + 1
+        eprintln("text of ${n} characters, a piece at a time: ${out.at} bytes written, done ${out.done}, ${xrcestream.out_in_flight(rel)} unacknowledged")
     eprintln("published ${sent} text(s), silence ${s.silent_ms} ms")

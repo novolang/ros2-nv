@@ -1344,6 +1344,24 @@ in the log for the reply of 4,000 characters (the sample, 4,009 bytes of CDR, an
 the 24-byte identity of the request). `tests/interop/run.sh` has the three as
 the legs `longtalk`, `longreply` and `longcall`, over both transports.
 
+### A device's sample of 4,000 and 20,000 characters, over a pseudoterminal pair
+
+`examples/uart_stdio_long.nv` is the device's program (`rosuart`, no heap) run on
+the PC, as in the section above. Its texts of 4,000 and 20,000 characters go out
+through `rosuart.write_piece`, a `Vec[u8; 504]` at a time, since the `Vec[u8; 2048]`
+of `write_sample_long` holds neither.
+
+```sh
+socat pty,raw,echo=0,link=ttyAGENT pty,raw,echo=0,link=ttyBOARD
+MicroXRCEAgent serial --dev ttyAGENT -b 115200 -v 6
+ros2 topic echo /novo_text std_msgs/msg/String --field data
+./uart_stdio_long <>ttyBOARD >&0
+```
+
+`ros2 topic echo` printed five texts, of 1,000, 2,000, 2,040, 4,000 and 20,000
+characters, each whole and in order, the characters `a` to `z` and round again;
+the program reported every sample written, done, with nothing unacknowledged.
+
 ## The board
 
 This part is prepared and has not been run: the two nRF54LM20 DKs were in

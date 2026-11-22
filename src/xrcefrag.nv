@@ -82,6 +82,11 @@ pub const XRCE_PIECE_BYTES = 504
 // device holds it in. A longer one is refused with `ROS_RET_INVALID_ARGUMENT`.
 pub const XRCE_LONG_MAX_SAMPLE = 2048
 
+// The largest sample a node writes in pieces when it supplies the pieces one
+// at a time (`piece_take`): 65,000 bytes, which the 16-bit length of the
+// WRITE_DATA's submessage header bounds, with room for a reply's identity.
+pub const XRCE_PIECED_MAX_SAMPLE = 65000
+
 // The bytes in front of a sample in a DATA: the submessage header (4) and
 // the request id and the object id (2 each).
 const DATA_FRONT = 8
@@ -291,6 +296,32 @@ fn piece_begin(var m: Vec[u8; 512], seq: Int, at: Int, length: Int, request: Int
     if reply
         return ok and xrcewire.put_reply_front(var m, length, request, object, identity)
     ok and xrcewire.put_write_front(var m, length, request, object)
+
+// How many bytes of a sample the piece that begins at `at` carries.
+//
+// `length` is the sample's length and `reply` says whether it is a reply, whose
+// first piece holds the 24-byte identity of the request in front of the sample.
+// A sample that fits one message is the one piece, all of it; any other sample is
+// 496 bytes in its first piece, 472 for a reply, and 504 in each piece after, the
+// last as many as are left. A node that supplies a sample a piece at a time
+// (`rosuart.write_piece`) fills this many bytes.
+pub @tier(embedded)
+@no_alloc
+fn piece_take(length: Int, at: Int, reply: Bool) -> Int []
+    var start = xrcewire.XRCE_SAMPLE_START
+    if reply
+        start = xrcewire.XRCE_REPLY_START
+    if at == 0 and start + length <= 512
+        return length
+    var room = XRCE_PIECE_BYTES
+    if at == 0
+        room = room - 8
+        if reply
+            room = room - xrcewire.XRCE_IDENTITY_BYTES
+    var n = length - at
+    if n > room
+        n = room
+    n
 
 // How many more bytes a piece message takes.
 pub @tier(embedded)

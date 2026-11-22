@@ -102,8 +102,9 @@ pub const ROS_STREAM_HISTORY = 4
 //
 // The WRITE_DATA's submessage header counts the whole sample in 16 bits, and
 // a reply adds the 24 bytes of the request's identity, so the limit leaves
-// room under 65,535 for either. The device forms of the calls keep
-// `xrcefrag.XRCE_LONG_MAX_SAMPLE`, the size of the buffer they write from.
+// room under 65,535 for either; it is `xrcefrag.XRCE_PIECED_MAX_SAMPLE`. The
+// `Vec` forms of the device calls keep `xrcefrag.XRCE_LONG_MAX_SAMPLE`, the
+// size of the buffer they write from.
 pub const ROS_HOST_LONG_MAX_SAMPLE = 65000
 
 // ── The session ──────────────────────────────────────────────────────
@@ -1232,7 +1233,7 @@ fn write_in_pieces<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStr
         let length = bytes.len(payload)
         if not session_is_ready(s)
             return long_sent(s, r, rosret.ROS_RET_NOT_INIT, at, length, 0)
-        if length > ROS_HOST_LONG_MAX_SAMPLE or at < 0 or at > length
+        if length > xrcefrag.XRCE_PIECED_MAX_SAMPLE or at < 0 or at > length
             return long_sent(s, r, rosret.ROS_RET_INVALID_ARGUMENT, at, length, 0)
         var front = xrcewire.XRCE_SAMPLE_START
         if reply
