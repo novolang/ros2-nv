@@ -41,6 +41,19 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
   way, over a pseudoterminal pair to an agent; `ros2 topic echo` printed both whole.
   The probe runs 137 checks, two more, and passes under QEMU.
 
+- **`rosmsg.in_byte_order`: the byte order of a received sample, said by the
+  caller.** The Micro XRCE-DDS Agent takes the encapsulation header off a sample
+  before the node reads it and writes a little-endian header on a sample the node
+  writes (`TopicPubSubType::deserialize` and `serialize` in the agent), so the byte
+  order of a big-endian publisher does not reach the node and `poll` cannot read
+  it. `in_byte_order(m, big_endian)` relabels a message for a program that knows
+  its publisher; `encode_envelope` then gives the four bytes and the payload that
+  cdr-nv's `cdrbytes.reader_from_bytes` reads as big-endian, which cdr-nv 0.1.1
+  does with no change. The interoperability suite has the leg `bigendian`: an
+  rclpy publisher sends the bytes of a big-endian Int32 and the listener takes
+  `00 00 00 2A` as 704643072, and the leg fails if an agent ever passes the header
+  on. `docs/agent-run.md` has the run.
+
 ### Changed
 
 - `write_sample_long`, `send_request_long` and `send_reply_long` of `rostransport`

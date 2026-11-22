@@ -635,9 +635,19 @@ tiers cover all fourteen modules.
   loses messages the agent has already forgotten is the case.
 - **Samples in a format other than DATA.** `read_data` asks for the DATA
   format, the sample's bytes as they are, and a DATA in any other format
-  is not found. A sample reaches the node without its encapsulation
-  header, which the agent takes off, so the byte order of a big-endian
-  publisher is lost; `poll` builds the message as little-endian CDR.
+  is not found.
+- **The byte order of a received sample.** The agent takes the four bytes of
+  the encapsulation header off every sample it hands to a client
+  (`TopicPubSubType::deserialize` keeps the bytes after them) and writes
+  `00 01 00 00` on every sample it hands to DDS, so what reaches the node does
+  not say which way round it is, and `poll` labels every sample little-endian.
+  A big-endian publisher is rare on ROS 2 and the runs that show it are in
+  `docs/agent-run.md`, "A big-endian publisher". A program that knows its
+  publisher is big-endian says so after the take with `rosmsg.in_byte_order(m,
+  true)`, and `rosmsg.encode_envelope` then gives the four bytes and the payload
+  that a CDR reader takes by its header: `cdrbytes.reader_from_bytes` of cdr-nv
+  0.1.1 reads them as big-endian, with no change to cdr-nv. A sample the node
+  writes is little-endian, and the agent labels it so.
 - **A service call that waits for its pieces by itself.** `take_request_long`
   and `take_reply_long` take one message a call, as `poll_long` does, and a
   reply of several pieces is several calls; `send_reply_long` and
@@ -757,7 +767,8 @@ XRCE-DDS Agent on a free port, over TCP and then over UDP, and runs
 `examples/host_talker.nv` against an rclpy subscription, an rclpy publisher
 against `examples/host_listener.nv` (an integer and a String of 1,000
 characters), `ros2 service call` against `examples/host_server.nv`, and
-`examples/host_client.nv` against an rclpy server, and then the long samples:
+`examples/host_client.nv` against an rclpy server, a big-endian publisher against
+`examples/host_listener.nv`, and then the long samples:
 `examples/host_long_talker.nv` publishing Strings of up to 20,000 characters,
 `examples/host_long_server.nv` answering `ros2 service call` with a text of
 4,000 characters, and `examples/host_long_client.nv` calling an rclpy server with

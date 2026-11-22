@@ -1362,6 +1362,43 @@ ros2 topic echo /novo_text std_msgs/msg/String --field data
 characters, each whole and in order, the characters `a` to `z` and round again;
 the program reported every sample written, done, with nothing unacknowledged.
 
+## A big-endian publisher, 2026-11-22
+
+Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy, novo 0.26.0, `examples/host_listener.nv`
+over UDP and TCP. An rclpy publisher on `/novo_cmd` published the serialised bytes
+of a `std_msgs/msg/Int32` itself (`publisher.publish(bytes)`), the way a publisher
+on a big-endian processor sends one: the header `00 00 00 00`, plain CDR most
+significant byte first, and the number 42 as `00 00 00 2A`. The listener took
+`data 704643072, 4 bytes` for every sample, which is 42 read least significant
+byte first: the four bytes of the number, in the publisher's order, with nothing
+to say what that order is.
+
+The agent's source says why. `TopicPubSubType::deserialize` in
+`src/cpp/types/TopicPubSubType.cpp` copies the payload from byte 4 on, so the
+header is dropped whichever representation it named, and `serialize` writes
+`00 01 00 00` in front of every sample a client publishes, so the node's own
+samples are little-endian to DDS whatever order the node wrote them in. A
+sample carries no byte order between the agent and a client, in either direction.
+The package therefore cannot read the order and does not guess: `poll` labels a
+sample `ROS_CDR_LE`, and `rosmsg.in_byte_order` relabels it for a caller that
+knows.
+
+cdr-nv 0.1.1 reads a big-endian message by the header it is given, so the
+relabelled message goes to its reader as it is. A program of this package and
+cdr-nv, run against the four bytes `00 00 00 2A`:
+
+```
+let taken = rosmsg.message(bytes.from_hex("0000002a") ?? bytes.zeros(0), 1)
+let said = rosmsg.in_byte_order(taken, true)
+var r = cdrbytes.reader_from_bytes(rosmsg.encode_envelope(said))
+println("${r.get_i32()}")   // 42
+```
+
+printed 42, and 704643072 for `encode_envelope(taken)`, the same bytes labelled
+little-endian. `tests/interop/run.sh` has the run above as the leg `bigendian`:
+it passes while the agent strips the header, and it fails the day an agent passes
+the representation on, which is the day the package can read the order itself.
+
 ## The board
 
 This part is prepared and has not been run: the two nRF54LM20 DKs were in

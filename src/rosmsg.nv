@@ -121,6 +121,39 @@ pub @tier(system)
 fn is_little_endian(m: RosMessage) -> Bool []
     m.encapsulation == ROS_CDR_LE or m.encapsulation == ROS_PL_CDR_LE
 
+// The message with its payload labelled as least or most significant byte
+// first, the payload untouched.
+//
+// A sample reaches a node without its encapsulation header: the Micro XRCE-DDS
+// Agent takes the four bytes off a sample it hands to a client
+// (`TopicPubSubType::deserialize` keeps the bytes after them) and writes
+// little-endian ones on the sample it hands to DDS, so `poll` cannot tell a
+// big-endian publisher's sample from a little-endian one and labels every sample
+// little-endian. A program that knows the publisher is big-endian, from the
+// topic's documentation or from a field of its own, says so here, and
+// `encode_envelope` then gives the four bytes and the payload in the form a CDR
+// reader reads by its header. A parameter list stays a parameter list.
+//
+// ```novo
+// use std.bytes
+// use rosmsg
+//
+// fn main() [io]
+//     let taken = rosmsg.message(bytes.from_byte_list([0, 0, 0, 42]), 1)
+//     let said = rosmsg.in_byte_order(taken, true)
+//     println("${rosmsg.is_little_endian(said)}")                       // false
+//     println("${bytes.to_hex(rosmsg.encode_envelope(said))}")        // 000000000000002a
+// ```
+pub @tier(system)
+fn in_byte_order(m: RosMessage, big_endian: Bool) -> RosMessage []
+    system
+        var e = ROS_CDR_LE
+        if is_parameter_list(m)
+            e = ROS_PL_CDR_LE
+        if big_endian
+            e = e - 1
+        return RosMessage { payload: m.payload, type_id: m.type_id, encapsulation: e }
+
 // Whether the message carries a parameter list rather than a plain
 // structure.
 //

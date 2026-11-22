@@ -10,7 +10,10 @@ Creates a node and a publisher with the default QoS (reliable, volatile,
 depth 10) and creates the file named by --ready once the publisher exists.
 It then publishes every --period seconds until --timeout passes or it is
 stopped: the integers --start, --start + 1 and so on, or --text every time.
-Each message is appended to --out before it is published, so the file holds at
+With --big-endian each integer is published as the serialised bytes of a
+big-endian CDR message (header 00 00 00 00, the number most significant byte
+first) in place of the message the middleware serialises, which is how a
+publisher on a big-endian processor sends it. Each message is appended to --out before it is published, so the file holds at
 least what any subscriber can have heard.
 
 A message published before a subscription has matched is lost, so a caller
@@ -42,6 +45,7 @@ def main():
     ap.add_argument("--ready", required=True)
     ap.add_argument("--period", type=float, default=0.2)
     ap.add_argument("--timeout", type=float, required=True)
+    ap.add_argument("--big-endian", action="store_true")
     args = ap.parse_args()
 
     rclpy.init()
@@ -60,7 +64,10 @@ def main():
         else:
             msg.data = args.text
         out.write("%s\n" % msg.data)
-        pub.publish(msg)
+        if args.big_endian and args.type == "int32":
+            pub.publish(bytes([0, 0, 0, 0]) + (msg.data & 0xFFFFFFFF).to_bytes(4, "big"))
+        else:
+            pub.publish(msg)
         rclpy.spin_once(node, timeout_sec=args.period)
     out.close()
     node.destroy_node()

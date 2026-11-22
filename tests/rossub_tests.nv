@@ -350,6 +350,34 @@ fn test_polling_takes_a_sample_and_acknowledges_a_reliable_one() [io, mutate]
     test.assert_eq(g_sent, [acknack_message(2, 1)])
 
 @test
+fn test_a_caller_that_knows_its_publisher_is_big_endian_says_so_after_the_take() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let up = rostransport.session_silent(an_open_session(), 300)
+    var h = xrcestream.history()
+
+    test.case("a sample is taken as little-endian, whatever its publisher sent")
+    pipe_reset()
+    agent_says(data_best_effort())
+    let got = rostransport.poll(pipe, up, xrcestream.rel_stream(), var h, 1234, 0)
+    test.assert(rosmsg.is_little_endian(got.message))
+    test.assert_eq(bytes.to_hex(rosmsg.encode_envelope(got.message)), "0001000007000000")
+
+    test.case("the caller relabels it big-endian, and the bytes are the agent's, untouched")
+    let be = rosmsg.in_byte_order(got.message, true)
+    test.assert_eq(be.encapsulation, rosmsg.ROS_CDR_BE)
+    test.assert(not rosmsg.is_little_endian(be))
+    test.assert_eq(be.type_id, 1234)
+    test.assert_eq(bytes.to_hex(rosmsg.encode_envelope(be)), "0000000007000000")
+    test.assert_eq(bytes.u32_be_at(rosmsg.payload(be), 0) ?? 0 - 1, 0x07000000)
+
+    test.case("and back, and a parameter list keeps being one")
+    test.assert_eq(rosmsg.in_byte_order(be, false).encapsulation, rosmsg.ROS_CDR_LE)
+    let pl = rosmsg.message_with(bytes.zeros(4), 1, rosmsg.ROS_PL_CDR_LE)
+    test.assert_eq(rosmsg.in_byte_order(pl, true).encapsulation, rosmsg.ROS_PL_CDR_BE)
+    test.assert_eq(rosmsg.in_byte_order(rosmsg.in_byte_order(pl, true), false).encapsulation,
+                   rosmsg.ROS_PL_CDR_LE)
+
+@test
 fn test_a_heartbeat_is_answered_and_an_acknack_sends_messages_again() [io, mutate]
     let pipe = RecPipe { id: 1 }
     let up = an_open_session()

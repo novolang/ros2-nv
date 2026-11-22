@@ -18,6 +18,12 @@
 #             calls it three times and each reply carries the right sum.
 #   client    an rclpy server serves /add_two_ints; examples/host_client.nv calls
 #             it twice and prints the right sum each time.
+#   bigendian an rclpy publisher sends the integer 42 as a big-endian CDR message
+#             (from the raw bytes, as a publisher on a big-endian processor sends
+#             it); examples/host_listener.nv takes four bytes that read as
+#             704643072 little-endian: the agent strips the encapsulation header,
+#             and the node has no way to tell the byte order (docs/agent-run.md,
+#             "A big-endian publisher").
 #   longtalk  examples/host_long_talker.nv publishes Strings of 1,000, 2,000,
 #             2,040, 4,000 and 20,000 characters on /novo_text; an rclpy
 #             subscription hears each whole, in order.
@@ -50,7 +56,7 @@
 #                  example_interfaces when the system has none
 #   TRANSPORTS     the transports to run, default "tcp udp"
 #   LEGS           the legs to run, default "talker listener text server client
-#                  longtalk longreply longcall"
+#                  bigendian longtalk longreply longcall"
 #   ATTEMPTS       attempts per leg, default 3
 #   KEEP           1 keeps the logs of a passing run too
 #
@@ -69,7 +75,7 @@ PKG="$(cd "$HERE/../.." && pwd)"
 NOVO="${NOVO:-$(command -v novo)}"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 TRANSPORTS="${TRANSPORTS:-tcp udp}"
-LEGS="${LEGS:-talker listener text server client longtalk longreply longcall}"
+LEGS="${LEGS:-talker listener text server client bigendian longtalk longreply longcall}"
 ATTEMPTS="${ATTEMPTS:-3}"
 
 die() { echo "ERROR: $*" >&2; exit 2; }
@@ -340,6 +346,29 @@ leg_client() {
     stop "$server"
 }
 
+# A big-endian publisher: the node takes the bytes, with no sign of their order.
+leg_bigendian() {
+    local dir=$1 tr=$2
+    start_agent "$dir" "$tr" || return 1
+    background "$dir/talk.log" timeout 120 python3 -I "$HERE/talk.py" \
+        --topic /novo_cmd --type int32 --start 42 --period 0.2 --big-endian --out "$dir/sent" --ready "$dir/ready" --timeout 100
+    local talker=$LAST_PID
+    wait_for 60 file_exists "$dir/ready" || { REASON="the rclpy talker did not start"; return 1; }
+    timeout 120 "$BIN/host_listener" 127.0.0.1 "$AGENT_PORT" reliable 4 int32 "$tr" >"$dir/node.log" 2>&1
+    local node=$?
+    stop "$talker"
+    [ "$node" -eq 0 ] || { REASON="host_listener exited $node"; return 1; }
+    heard_numbers "$dir/node.log" >"$dir/heard"
+    # 42, 43, ...: the bytes 00 00 00 2A read least significant first are 42 * 2^24,
+    # and each number after it is the next multiple, so every number the node took
+    # is a multiple of 2^24 and none is below 42 * 2^24.
+    if [ "$(wc -l <"$dir/heard")" -lt 3 ] \
+        || ! awk '$1 % 16777216 != 0 || $1 < 42 * 16777216 { bad = 1 } END { exit bad }' "$dir/heard"; then
+        REASON="host_listener took: $(tr '\n' ' ' <"$dir/heard")(wanted multiples of 16777216 from $((42 * 16777216)): the big-endian bytes read little-endian, so the agent strips the header)"
+        return 1
+    fi
+}
+
 # The leg of the long talker: the five texts it publishes, each heard whole.
 leg_longtalk() {
     local dir=$1 tr=$2
@@ -420,6 +449,7 @@ LEG_TITLE_listener="rclpy talker -> novo listener"
 LEG_TITLE_text="rclpy String of 1,000 characters -> novo listener"
 LEG_TITLE_server="ros2 service call -> novo server"
 LEG_TITLE_client="novo client -> rclpy server"
+LEG_TITLE_bigendian="rclpy big-endian publisher -> novo listener, the bytes without their order"
 LEG_TITLE_longtalk="novo talker, Strings of 1,000 to 20,000 characters -> rclpy listener"
 LEG_TITLE_longreply="ros2 service call -> novo server, a reply of 4,000 characters"
 LEG_TITLE_longcall="novo client, a request of 4,000 characters -> rclpy server"
