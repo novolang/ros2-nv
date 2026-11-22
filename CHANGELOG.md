@@ -56,6 +56,14 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ### Changed
 
+- **The first samples over UDP.** The loss of samples 0 and 1 at `ros2 topic echo`
+  was run down in 0.1.6 as the agent's writer keeping one sample for a late reader.
+  Twenty fresh agents over UDP, under the load of a test sweep, lost nothing, and the
+  agent's log has the data writer's STATUS before the first WRITE_DATA in each. The
+  writer's XML takes a history: with `historyQos` of `KEEP_LAST` and depth 10, or
+  `KEEP_ALL`, a reader that matches late is replayed the samples from the second on
+  and not only the newest. The README names the XML and `docs/agent-run.md` has the
+  runs. The package sends nothing differently.
 - `write_sample_long`, `send_request_long` and `send_reply_long` of `rostransport`
   accepted up to 2,048 bytes and answer `ROS_RET_INVALID_ARGUMENT` above 65,000. The
   `rosuart` forms keep 2,048, the size of the `Vec` they write from.

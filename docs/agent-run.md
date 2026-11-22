@@ -790,6 +790,35 @@ which a loaded machine overruns, or write its first sample again in a later
 cycle. The package does neither for the caller. Sizing the writer's history
 through the XML of `XRCE_KIND_DATAWRITER` was not tried.
 
+### Twenty fresh starts, and the writer's history, 2026-11-22
+
+The machine ran a test sweep: the load average was 7.6 to 16 on 32 cores, which
+is less than the 64 busy loops of the table above. Twenty times, over UDP, a fresh
+agent was started, `ros2 topic echo /novo_counter std_msgs/msg/Int32` was started,
+and `examples/host_talker.nv` (reliable stream, a second before its first sample)
+was started at once. The echo printed all ten samples, from 0, in 20 of 20 runs. The
+miss of 2026-11-20 did not recur at this load. In every run the agent's log has the
+STATUS for the data writer on the line before the WRITE_DATA at sequence 0, so the
+package did not write before the writer existed.
+
+What a caller can do about a reader that arrives late is in the writer's
+description. The agent builds the writer from the XML the node sends, and Fast DDS
+reads the history of the topic from it. With `examples/host_talker.nv` unchanged
+(publishing a sample a second for ten seconds), `ros2 topic echo` started 4.5
+seconds after the first sample printed:
+
+| Writer XML | Samples printed (runs) |
+| --- | --- |
+| no `historyQos` | 5 6 7 8 9 |
+| `<historyQos><kind>KEEP_LAST</kind><depth>10</depth></historyQos>` after `<dataType>` | 1 2 3 4 5 6 7 8 9 (four runs) |
+| `<historyQos><kind>KEEP_ALL</kind></historyQos>` | 1 2 3 4 5 6 7 8 9 (two runs) |
+
+A deeper history makes the agent's writer replay what it holds to a reader that
+matches late, and the late reader reads from sample 1: sample 0 was not replayed in
+any of the six runs, which is not explained here. The history is kept in the agent's
+memory, so a node that writes often chooses a depth it can afford the agent to hold.
+A reader that matches before the first sample is not helped or harmed by it.
+
 ## A node on the nRF52840-DK, 2026-11-20
 
 `examples/dk_sensor_node.nv` on an nRF52840-DK (J-Link 683644473, its

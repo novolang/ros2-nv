@@ -433,8 +433,12 @@ count depends on how long the subscriber takes to start. `examples/host_talker.n
 waits a second after creating the writer. On an idle machine that covered 25
 of 25 runs with `ros2 topic echo`; with every core busy, 12 of 16 runs lost one
 to three samples at the start. A node whose first samples matter writes them
-again in a later cycle; the section on the first samples in `docs/agent-run.md`
-has the runs and the agent's log.
+again in a later cycle, or asks for a deeper history in the writer's XML:
+`<historyQos><kind>KEEP_LAST</kind><depth>10</depth></historyQos>` after the
+`<dataType>` makes the agent's writer replay the ten newest samples to a reader
+that matches late, where the default replays only the newest. The section on the
+first samples in `docs/agent-run.md` has the runs and the agent's log, twenty fresh
+starts that lost nothing at a load of 8 to 16, and the replay with each history.
 
 ## Running on a microcontroller
 
