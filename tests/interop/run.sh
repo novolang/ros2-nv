@@ -18,6 +18,14 @@
 #             calls it three times and each reply carries the right sum.
 #   client    an rclpy server serves /add_two_ints; examples/host_client.nv calls
 #             it twice and prints the right sum each time.
+#   longtalk  examples/host_long_talker.nv publishes Strings of 1,000, 2,000,
+#             2,040, 4,000 and 20,000 characters on /novo_text; an rclpy
+#             subscription hears each whole, in order.
+#   longreply `ros2 service call /long_reply` is answered by
+#             examples/host_long_server.nv with a text of 4,000 characters.
+#   longcall  an rclpy server serves /long_request; examples/host_long_client.nv
+#             calls it with a name of 4,000 characters and the server counts all
+#             of them.
 #
 # Every leg starts a fresh agent on a free port. A leg that fails is repeated,
 # with a fresh agent, up to ATTEMPTS times (3): the agent does not tell a node
@@ -41,7 +49,8 @@
 #                  <dir>/opt/ros/jazzy of unpacked .deb files, for
 #                  example_interfaces when the system has none
 #   TRANSPORTS     the transports to run, default "tcp udp"
-#   LEGS           the legs to run, default "talker listener text server client"
+#   LEGS           the legs to run, default "talker listener text server client
+#                  longtalk longreply longcall"
 #   ATTEMPTS       attempts per leg, default 3
 #   KEEP           1 keeps the logs of a passing run too
 #
@@ -60,7 +69,7 @@ PKG="$(cd "$HERE/../.." && pwd)"
 NOVO="${NOVO:-$(command -v novo)}"
 ROS_SETUP="${ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 TRANSPORTS="${TRANSPORTS:-tcp udp}"
-LEGS="${LEGS:-talker listener text server client}"
+LEGS="${LEGS:-talker listener text server client longtalk longreply longcall}"
 ATTEMPTS="${ATTEMPTS:-3}"
 
 die() { echo "ERROR: $*" >&2; exit 2; }
@@ -175,7 +184,8 @@ build_programs() {
     local name
     local started=$SECONDS
     echo "building the examples with $("$NOVO" --version)"
-    for name in host_talker host_listener host_server host_client; do
+    for name in host_talker host_listener host_server host_client host_long_talker \
+        host_long_server host_long_client; do
         (cd "$PKG" && "$NOVO" build "examples/$name.nv" -o "$BIN/$name") >"$WORK/build-$name.log" 2>&1 || {
             echo "ERROR: examples/$name.nv did not build:" >&2
             sed 's/^/    /' "$WORK/build-$name.log" >&2
@@ -330,6 +340,79 @@ leg_client() {
     stop "$server"
 }
 
+# The leg of the long talker: the five texts it publishes, each heard whole.
+leg_longtalk() {
+    local dir=$1 tr=$2
+    start_agent "$dir" "$tr" || return 1
+    background "$dir/listen.log" timeout 150 python3 -I "$HERE/listen.py" \
+        --topic /novo_text --type string --out "$dir/heard" --ready "$dir/ready" --count 5 --timeout 120
+    local listener=$LAST_PID
+    wait_for 60 file_exists "$dir/ready" || { REASON="the rclpy listener did not start"; return 1; }
+    timeout 150 "$BIN/host_long_talker" 127.0.0.1 "$AGENT_PORT" "$tr" >"$dir/node.log" 2>&1
+    local node=$?
+    wait_for 10 not_running "$listener"
+    stop "$listener"
+    [ "$node" -eq 0 ] || { REASON="host_long_talker exited $node"; return 1; }
+    if ! python3 -I - "$dir/heard" <<'PY'
+import sys
+lines = open(sys.argv[1]).read().split("\n")[:-1]
+want = [1000, 2000, 2040, 4000, 20000]
+got = [len(x) for x in lines]
+ok = got == want and all(x == "".join(chr(97 + i % 26) for i in range(len(x))) for x in lines)
+print("the listener heard texts of", got, "(wanted %s, a to z round again)" % want, file=sys.stderr)
+sys.exit(0 if ok else 1)
+PY
+    then
+        REASON="the listener did not hear the five texts whole and in order: $(awk '{ print length($0) }' "$dir/heard" | tr '\n' ' ')"
+        return 1
+    fi
+}
+
+# A Trigger reply of 4,000 characters, called with `ros2 service call`.
+leg_longreply() {
+    local dir=$1 tr=$2
+    start_agent "$dir" "$tr" || return 1
+    background "$dir/node.log" timeout 180 "$BIN/host_long_server" 127.0.0.1 "$AGENT_PORT" 150 "$tr" 4000
+    local server=$LAST_PID
+    local out tries=0
+    while :; do
+        out=$(timeout 40 ros2 service call /long_reply std_srvs/srv/Trigger 2>&1)
+        echo "$out" >"$dir/call.log"
+        if python3 -I - "$dir/call.log" <<'PY'
+import re, sys
+m = re.search(r"message='([a-z]*)'", open(sys.argv[1]).read())
+text = m.group(1) if m else ""
+sys.exit(0 if len(text) == 4000 and text == "".join(chr(97 + i % 26) for i in range(4000)) else 1)
+PY
+        then
+            break
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 3 ]; then
+            REASON="ros2 service call /long_reply did not answer a text of 4,000 characters: $(echo "$out" | tail -1 | cut -c1-120)"
+            stop "$server"
+            return 1
+        fi
+    done
+    stop "$server"
+}
+
+# A GetParameters request of one name of 4,000 characters, called by the node.
+leg_longcall() {
+    local dir=$1 tr=$2
+    start_agent "$dir" "$tr" || return 1
+    background "$dir/serve.log" timeout 240 python3 -I "$HERE/serve_long.py" \
+        --service /long_request --out "$dir/names" --ready "$dir/ready" --timeout 220
+    local server=$LAST_PID
+    wait_for 60 file_exists "$dir/ready" || { REASON="the rclpy server did not start"; return 1; }
+    timeout 90 "$BIN/host_long_client" 127.0.0.1 "$AGENT_PORT" 4000 "$tr" >"$dir/node.log" 2>&1
+    stop "$server"
+    command grep -Eq "^reply to request [0-9]+: the server counted 4000 characters$" "$dir/node.log" \
+        || { REASON="host_long_client printed: $(tail -1 "$dir/node.log") (wanted 'the server counted 4000 characters')"; return 1; }
+    command grep -q "^4000 abcdefghijklmnopqrstuvwx yzabcdefghijklmnopqrstuv$" "$dir/names" \
+        || { REASON="the rclpy server did not see the name whole: $(head -1 "$dir/names")"; return 1; }
+}
+
 # ---------------------------------------------------------------------------
 
 LEG_TITLE_talker="novo talker -> rclpy listener"
@@ -337,6 +420,9 @@ LEG_TITLE_listener="rclpy talker -> novo listener"
 LEG_TITLE_text="rclpy String of 1,000 characters -> novo listener"
 LEG_TITLE_server="ros2 service call -> novo server"
 LEG_TITLE_client="novo client -> rclpy server"
+LEG_TITLE_longtalk="novo talker, Strings of 1,000 to 20,000 characters -> rclpy listener"
+LEG_TITLE_longreply="ros2 service call -> novo server, a reply of 4,000 characters"
+LEG_TITLE_longcall="novo client, a request of 4,000 characters -> rclpy server"
 
 run_leg() {
     local leg=$1 tr=$2

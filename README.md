@@ -166,12 +166,13 @@ is a program that publishes a counter through either, on the best-effort
 stream or, given `reliable`, on the reliable one, and `udp` as the fourth
 argument chooses the datagram link. `examples/host_listener.nv` subscribes:
 it creates a data reader, asks for samples and prints each one `poll_long`
-takes, a text of a thousand bytes included. `examples/host_long_talker.nv` publishes a text of 1,000, 2,000 and 2,040
+takes, a text of a thousand bytes included. `examples/host_long_talker.nv` publishes texts of 1,000, 2,000, 2,040, 4,000 and 20,000
 characters with `write_sample_long`. `examples/host_server.nv` serves
 `/add_two_ints` (`example_interfaces/srv/AddTwoInts`) and
 `examples/host_client.nv` calls it, or calls the server that
 `ros2 run demo_nodes_py add_two_ints_server` starts; `examples/host_long_server.nv`
-serves two services whose reply and request are longer than one message.
+serves two services whose reply and request are longer than one message, and
+`examples/host_long_client.nv` calls a service with a request of 4,000 characters.
 
 **A program on a device calls `rosuart`.** Its functions take an
 `XrceUart`, which `rosuart.console_uart` supplies from the board's
@@ -352,9 +353,11 @@ and `examples/dk_long_talker.nv` is the same talker on an nRF52840-DK.
     `reliable_tick` until the agent has acknowledged some pieces, and call again
     with the same sample and that `at`. A call that finds the history full writes
     nothing and answers `ROS_RET_BAD_ALLOC`. Write nothing else on the reliable
-    stream until `done`. The largest sample is
-    `xrcefrag.XRCE_LONG_MAX_SAMPLE`, 2,048 bytes; a longer one answers
-    `ROS_RET_INVALID_ARGUMENT`. A sample that fits one message, 500 bytes or a
+    stream until `done`. The largest sample the `rostransport` forms write is
+    `rostransport.ROS_HOST_LONG_MAX_SAMPLE`, 65,000 bytes, which the 16-bit
+    length of the WRITE_DATA's submessage header bounds; a longer one answers
+    `ROS_RET_INVALID_ARGUMENT`. The `rosuart` forms write from a `Vec[u8; 2048]` and so
+    stop at `xrcefrag.XRCE_LONG_MAX_SAMPLE`, 2,048 bytes. A sample that fits one message, 500 bytes or a
     reply of 476, is written as `write_sample_reliable` and `send_reply` write
     it, byte for byte.
 33. **A long request or reply is taken with the `_long` form.**
@@ -594,12 +597,11 @@ tiers cover all fourteen modules.
   after a gap, so the agent sends the gap and what followed it again. That
   costs retransmissions and no RAM. A node on a link that loses often and
   carries large samples would want the buffer.
-- **A sample longer than 2,048 bytes, sent or taken.** The buffer a long sample
-  is written from is a `Vec[u8; 2048]` on a device, and `write_sample_long`
-  refuses a longer sample on a host too, with `ROS_RET_INVALID_ARGUMENT`; the
-  buffer a long sample is joined in is also 2,048 bytes, 2,040 of them the
-  sample. A node that wants more changes a constant and rebuilds. Images and
-  point clouds of hundreds of kilobytes are not carried.
+- **A sample longer than 2,040 bytes, taken.** The buffer a long sample is
+  joined in is a `Vec[u8; 2048]`, 2,040 bytes of it the sample, on a host as
+  on a device. A node that wants more changes a constant and rebuilds. Writing
+  is bounded at 65,000 bytes on a host and, in the `Vec` forms, at 2,048 on a
+  device; images and point clouds of hundreds of kilobytes are not carried.
 - **Two long samples at once.** The pieces of one sample take consecutive
   sequence numbers and the caller writes nothing else on the reliable stream
   between them, so a node that publishes on two topics finishes one long sample
@@ -729,7 +731,8 @@ sample that belongs to another entity, and a refused request.
 accepted on 2026-11-20 for a text of a thousand characters, and drives
 `write_sample_long`, `send_request_long`, `send_reply_long`, `take_request_long`
 and `take_reply_long` of both sessions: a sample of three pieces, of four, and of
-five written in turns with a window that fills, a sample that fits one message
+five written in turns with a window that fills, a String of 4,000 characters and
+one of 20,000 written in turns, a sample that fits one message
 written as it always was, a pipe or a transmitter that takes nothing, a place
 outside the sample, and a request or a reply joined from the pieces the agent
 sends.
@@ -742,7 +745,11 @@ XRCE-DDS Agent on a free port, over TCP and then over UDP, and runs
 `examples/host_talker.nv` against an rclpy subscription, an rclpy publisher
 against `examples/host_listener.nv` (an integer and a String of 1,000
 characters), `ros2 service call` against `examples/host_server.nv`, and
-`examples/host_client.nv` against an rclpy server, under ROS 2 Jazzy. It
+`examples/host_client.nv` against an rclpy server, and then the long samples:
+`examples/host_long_talker.nv` publishing Strings of up to 20,000 characters,
+`examples/host_long_server.nv` answering `ros2 service call` with a text of
+4,000 characters, and `examples/host_long_client.nv` calling an rclpy server with
+a name of 4,000 characters, under ROS 2 Jazzy. It
 compares the integers, the text and the sums with what was sent and exits
 non-zero on a mismatch. The agent and ROS 2 Jazzy have to be installed;
 `tests/interop/build_agent.sh` builds the agent. `.github/workflows/interop.yml`

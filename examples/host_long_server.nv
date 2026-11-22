@@ -8,7 +8,7 @@
 //                                                characters
 //   /long_request  rcl_interfaces/srv/GetParameters
 //                                                a request that names parameters,
-//                                                as long as the caller likes, and a
+//                                                of up to 2,040 bytes, and a
 //                                                reply of an empty list
 //
 // Run it with an agent listening, then call it from ROS 2:
@@ -25,7 +25,7 @@
 //
 // The transport is `tcp`, the default, or `udp`, which reaches an agent started
 // with `MicroXRCEAgent udp4 --port 2018`. The text is 1,000 characters by
-// default and at most 2,000.
+// default and at most 60,000.
 //
 // THE REPLY IS CUT, AND THE REQUEST IS JOINED.  A Trigger reply of 1,000
 // characters is 1,009 bytes of CDR, and with the request's identity and the front
@@ -83,8 +83,8 @@ fn main() [net, io, time]
         seconds = str.to_int(args[3]) ?? 60
     if list.len(args) > 5
         chars = str.to_int(args[5]) ?? 1000
-    if chars > 2000
-        chars = 2000
+    if chars > 60000
+        chars = 60000
     if list.len(args) > 4 and args[4] == "udp"
         match rosagent.connect_udp(host, port)
             None       => println("no UDP socket for ${host}:${port}")

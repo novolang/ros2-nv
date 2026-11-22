@@ -1,11 +1,15 @@
 # interop.yml -- the interoperability suite: a node built on ros2-nv and a ROS 2
 # node, talking to each other through a Micro XRCE-DDS Agent, under ROS 2 Jazzy.
 #
-# tests/interop/run.sh does the work. It runs five legs over TCP and again over
+# tests/interop/run.sh does the work. It runs eight legs over TCP and again over
 # UDP: examples/host_talker.nv heard by an rclpy subscription, an rclpy
 # publisher heard by examples/host_listener.nv (an integer and a String of 1,000
 # characters), `ros2 service call` answered by examples/host_server.nv, and
-# examples/host_client.nv answered by an rclpy server. This file installs what
+# examples/host_client.nv answered by an rclpy server; then the three legs of
+# long samples: Strings of up to 20,000 characters from
+# examples/host_long_talker.nv, a reply of 4,000 characters from
+# examples/host_long_server.nv, and a request of 4,000 characters from
+# examples/host_long_client.nv. This file installs what
 # the script needs and calls it.
 #
 # The runner is Ubuntu 24.04 because ROS 2 Jazzy's packages are built for it.

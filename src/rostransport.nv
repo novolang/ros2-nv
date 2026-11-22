@@ -98,6 +98,14 @@ fn stream_name(kind: Int) -> Str []
 // acknowledgements blocks or drops, depending on the build.
 pub const ROS_STREAM_HISTORY = 4
 
+// The largest sample a host writes in pieces: 65,000 bytes.
+//
+// The WRITE_DATA's submessage header counts the whole sample in 16 bits, and
+// a reply adds the 24 bytes of the request's identity, so the limit leaves
+// room under 65,535 for either. The device forms of the calls keep
+// `xrcefrag.XRCE_LONG_MAX_SAMPLE`, the size of the buffer they write from.
+pub const ROS_HOST_LONG_MAX_SAMPLE = 65000
+
 // ── The session ──────────────────────────────────────────────────────
 
 // The session has not been opened.
@@ -1179,7 +1187,7 @@ struct RosLongSent
     // `ROS_RET_OK`; `ROS_RET_NOT_INIT` for a session that is not established;
     // `ROS_RET_BAD_ALLOC` when the history is full and the call wrote nothing,
     // which is to say `XRCE_HISTORY` messages are unacknowledged; `ROS_RET_INVALID_ARGUMENT`
-    // for a sample longer than `xrcefrag.XRCE_LONG_MAX_SAMPLE`, or an `at`
+    // for a sample longer than `ROS_HOST_LONG_MAX_SAMPLE`, or an `at`
     // outside the sample; `ROS_RET_AGENT_UNREACHABLE` when the pipe refused a
     // piece, which is kept in the history and goes out again when the agent
     // asks for it.
@@ -1224,7 +1232,7 @@ fn write_in_pieces<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStr
         let length = bytes.len(payload)
         if not session_is_ready(s)
             return long_sent(s, r, rosret.ROS_RET_NOT_INIT, at, length, 0)
-        if length > xrcefrag.XRCE_LONG_MAX_SAMPLE or at < 0 or at > length
+        if length > ROS_HOST_LONG_MAX_SAMPLE or at < 0 or at > length
             return long_sent(s, r, rosret.ROS_RET_INVALID_ARGUMENT, at, length, 0)
         var front = xrcewire.XRCE_SAMPLE_START
         if reply
@@ -1275,7 +1283,7 @@ fn write_in_pieces<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelStr
 // `sample` is the CDR body without the representation header, as for
 // `write_sample_reliable`, and `at` is 0 for the first call. A sample of up to
 // 500 bytes is one message, written as `write_sample_reliable` writes it. A
-// longer one, up to `xrcefrag.XRCE_LONG_MAX_SAMPLE`, goes out as FRAGMENT
+// longer one, up to `ROS_HOST_LONG_MAX_SAMPLE`, goes out as FRAGMENT
 // submessages, one to a message and each kept in the history `h` until the
 // agent acknowledges it; the pieces are what the agent joins into the WRITE_DATA.
 // The history holds `xrcestream.XRCE_HISTORY` messages, so a call writes at
@@ -1293,7 +1301,7 @@ fn write_sample_long<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelS
 
 // Send a request to a requester, in pieces if it does not fit one message.
 //
-// `send_request` for a request of up to 2,048 bytes, with the rules of
+// `send_request` for a request of up to `ROS_HOST_LONG_MAX_SAMPLE` bytes, with the rules of
 // `write_sample_long`. The outcome's `request` is the id the reply quotes, set by
 // the call that wrote the first piece.
 pub @tier(system)
@@ -1304,7 +1312,7 @@ fn send_request_long<T: RosTransport[e]>(t: T, s: RosSession, r: xrcestream.RelS
 
 // Send the reply to a request, in pieces if it does not fit one message.
 //
-// `send_reply` for a reply of up to 2,048 bytes, with the rules of
+// `send_reply` for a reply of up to `ROS_HOST_LONG_MAX_SAMPLE` bytes, with the rules of
 // `write_sample_long`. The sample identity of the request goes in the first
 // piece, in front of the reply's bytes.
 pub @tier(system)

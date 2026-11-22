@@ -1321,6 +1321,29 @@ stays on the board.
   five UDP runs and one of five runs over the pseudoterminal pair, with the sweep
   running. The README's rule for the first samples applies to long ones too.
 
+## Samples of tens of thousands of bytes, 2026-11-22
+
+Micro XRCE-DDS Agent 2.4.3 and ROS 2 Jazzy on one machine, novo 0.26.0,
+`ros2 topic echo` and `ros2 service call` as the ROS 2 side, the machine under
+the load of a test sweep. `rostransport.write_sample_long` and
+`send_request_long` take a sample of up to `ROS_HOST_LONG_MAX_SAMPLE`, 65,000
+bytes, which the 16-bit length of the WRITE_DATA's submessage header bounds.
+The pieces and the window are those of the section above; a sample of more than 2,008 bytes is written in turns, and the
+call goes on from the `at` it was given.
+
+| Run | What | Result |
+| --- | --- | --- |
+| `examples/host_long_talker.nv`, TCP and UDP | Strings of 1,000, 2,000, 2,040, 4,000 and 20,000 characters, `a` to `z` and round again, heard by an rclpy subscription | each whole, in order, the characters right |
+| `examples/host_long_server.nv`, TCP and UDP | `ros2 service call /long_reply std_srvs/srv/Trigger`, a message of 4,000 characters and one of 40,000 | each whole |
+| `examples/host_long_client.nv`, TCP and UDP | a `GetParameters` request with one name of 4,000 characters and one of 40,000, answered by `tests/interop/serve_long.py` | the server counted all of them and replied |
+
+A 4,000-character String is 4,005 bytes of CDR and eight pieces, in two calls
+with the acknowledgements of four between them; 20,000 characters are 40 pieces
+and ten calls. The agent wrote each sample to DDS as one WRITE_DATA, `len: 4033`
+in the log for the reply of 4,000 characters (the sample, 4,009 bytes of CDR, and
+the 24-byte identity of the request). `tests/interop/run.sh` has the three as
+the legs `longtalk`, `longreply` and `longcall`, over both transports.
+
 ## The board
 
 This part is prepared and has not been run: the two nRF54LM20 DKs were in

@@ -116,7 +116,7 @@ fn talk<T: RosTransport[e]>(link: T) [e, io, time]
     // A pause for a subscriber to find the agent's writer before the first
     // sample (README, "What a first sample needs").
     time.sleep(1.0)
-    var lengths = [1000, 2000, 2040]
+    var lengths = [1000, 2000, 2040, 4000, 20000]
     for n in lengths
         let sample = text_of(n)
         var at = 0

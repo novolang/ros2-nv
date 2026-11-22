@@ -530,6 +530,53 @@ fn test_a_sample_that_fits_one_message_is_written_as_it_always_was() [io, mutate
     test.assert_eq(lost.stream.out_next, 1)
 
 @test
+fn test_a_text_of_four_thousand_characters_is_written_in_two_turns() [io, mutate]
+    let pipe = RecPipe { id: 1 }
+    let whole = write_submessage(5, 0x15, text_cdr(4000))
+    let expected = fragments_of(whole, 504, 0)
+    test.assert_eq(list.len(expected), 8)
+
+    test.case("the first call writes the four pieces the window holds")
+    pipe_reset()
+    var h = xrcestream.history()
+    let first = rostransport.write_sample_long(pipe, session_at(5), stream_at(0), var h, 0x15,
+                                               text_bytes(4000), 0)
+    test.assert_eq(first.code, rosret.ROS_RET_OK)
+    test.assert(not first.done)
+    test.assert_eq(first.at, 2008)
+    test.assert_eq(first.request, 5)
+    test.assert_eq(g_sent, list.slice(expected, 0, 4))
+
+    test.case("after the agent acknowledges four, the other four go out and the sample is done")
+    pipe_reset()
+    let freed = xrcestream.out_ack(first.stream, 4)
+    let second = rostransport.write_sample_long(pipe, first.session, freed, var h, 0x15,
+                                                text_bytes(4000), first.at)
+    test.assert_eq(second.code, rosret.ROS_RET_OK)
+    test.assert(second.done)
+    test.assert_eq(second.at, 4005)
+    test.assert_eq(second.request, 0)
+    test.assert_eq(second.stream.out_next, 8)
+    test.assert_eq(g_sent, list.slice(expected, 4, 8))
+
+    test.case("a text of 20,000 characters is 40 pieces over ten calls, and the wire is the whole cut")
+    pipe_reset()
+    var h2 = xrcestream.history()
+    let big = write_submessage(5, 0x15, text_cdr(20000))
+    var out = rostransport.write_sample_long(pipe, session_at(5), stream_at(0), var h2, 0x15,
+                                             text_bytes(20000), 0)
+    var calls = 1
+    while not out.done and calls < 20
+        let freed2 = xrcestream.out_ack(out.stream, out.stream.out_next)
+        out = rostransport.write_sample_long(pipe, out.session, freed2, var h2, 0x15,
+                                             text_bytes(20000), out.at)
+        calls = calls + 1
+    test.assert(out.done)
+    test.assert_eq(calls, 10)
+    test.assert_eq(out.at, 20005)
+    test.assert_eq(g_sent, fragments_of(big, 504, 0))
+
+@test
 fn test_a_reply_is_cut_with_the_identity_in_its_first_piece() [io, mutate]
     let pipe = RecPipe { id: 1 }
     let sample = text_cdr(1000)
@@ -570,18 +617,19 @@ fn test_a_write_in_pieces_is_refused_or_cut_short_where_it_should_be() [io, muta
     test.assert(not closed.done)
     test.assert_eq(list.len(g_sent), 0)
 
-    test.case("a sample longer than 2,048 bytes is refused, and 2,048 is not")
+    test.case("a sample longer than 65,000 bytes is refused, and 65,000 is not")
     pipe_reset()
     let toolong = rostransport.write_sample_long(pipe, session_at(5), stream_at(0), var h, 0x15,
-                                                 bytes.zeros(2049), 0)
+                                                 bytes.zeros(65001), 0)
     test.assert_eq(toolong.code, rosret.ROS_RET_INVALID_ARGUMENT)
     test.assert_eq(toolong.stream.out_next, 0)
     test.assert_eq(toolong.session.next_request, 5)
     test.assert_eq(list.len(g_sent), 0)
     let largest = rostransport.write_sample_long(pipe, session_at(5), stream_at(0), var h, 0x15,
-                                                 bytes.zeros(2048), 0)
+                                                 bytes.zeros(65000), 0)
     test.assert_eq(largest.code, rosret.ROS_RET_OK)
     test.assert_eq(largest.at, 2008)
+    test.assert_eq(rostransport.ROS_HOST_LONG_MAX_SAMPLE, 65000)
 
     test.case("a place outside the sample is refused")
     pipe_reset()

@@ -5,6 +5,39 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.7 — 2026-11-22
+
+### Added
+
+- **`rostransport.ROS_HOST_LONG_MAX_SAMPLE`**, 65,000 bytes: the largest sample or
+  request or reply that `write_sample_long`, `send_request_long` and
+  `send_reply_long` write in pieces. The limit is the 16-bit length of the
+  WRITE_DATA's submessage header, with room for a reply's 24-byte identity. The
+  history is not grown: a sample of 4,005 bytes, a String of 4,000 characters, is
+  eight pieces in two calls, and one of 20,005 bytes is 40 pieces in ten.
+- **`examples/host_long_client.nv`** calls `/long_request`
+  (`rcl_interfaces/srv/GetParameters`) with one name of the length the caller
+  gives, 4,000 characters by default, and prints what the server counted;
+  `tests/interop/serve_long.py` is the rclpy server it is run against.
+- **Three interoperability legs**, over TCP and UDP: `longtalk`
+  (`examples/host_long_talker.nv` publishes Strings of 1,000, 2,000, 2,040, 4,000
+  and 20,000 characters and an rclpy subscription hears each whole, in order),
+  `longreply` (`ros2 service call /long_reply` is answered with a text of 4,000
+  characters) and `longcall` (`examples/host_long_client.nv` sends a name of 4,000
+  characters and the rclpy server counts all of them).
+- **`tests/roslong_tests.nv`**: a String of 4,000 characters is written in two
+  turns, one of 20,000 in ten, and 65,000 bytes is accepted where 65,001 is
+  refused.
+
+### Changed
+
+- `write_sample_long`, `send_request_long` and `send_reply_long` of `rostransport`
+  accepted up to 2,048 bytes and answer `ROS_RET_INVALID_ARGUMENT` above 65,000. The
+  `rosuart` forms keep 2,048, the size of the `Vec` they write from.
+- `examples/host_long_talker.nv` publishes 4,000 and 20,000 characters after the
+  three it published, and `examples/host_long_server.nv` takes a reply text of up
+  to 60,000 characters.
+
 ## 0.1.6 — 2026-11-20
 
 A node writes a sample longer than one message, and takes a long service
