@@ -435,10 +435,11 @@ of 25 runs with `ros2 topic echo`; with every core busy, 12 of 16 runs lost one
 to three samples at the start. A node whose first samples matter writes them
 again in a later cycle, or asks for a deeper history in the writer's XML:
 `<historyQos><kind>KEEP_LAST</kind><depth>10</depth></historyQos>` after the
-`<dataType>` makes the agent's writer replay the ten newest samples to a reader
-that matches late, where the default replays only the newest. The section on the
+`<dataType>` makes the agent's writer replay the samples it holds to a reader
+that matches late, where the default replays only the newest; in the runs the
+late reader printed samples 1 to 9 and never sample 0. The section on the
 first samples in `docs/agent-run.md` has the runs and the agent's log, twenty fresh
-starts that lost nothing at a load of 8 to 16, and the replay with each history.
+starts that lost nothing at a load of 7.6 to 16, and the replay with each history.
 
 ## Running on a microcontroller
 
@@ -592,13 +593,41 @@ tiers cover all fourteen modules.
   toolchain with it. The consequence is that this package cannot talk
   to a DDS network directly — it talks to a micro-ROS agent, which is
   what a microcontroller does anyway.
-- **CAN FD, and UDP on a device.** A micro-ROS agent listens on four links.
-  This package reaches three from a PC or a device: TCP and UDP, through
-  `rosagent`, and a serial line, through `rosuart` on a device. The
-  agent's CAN FD transport is not reached. `rosagent` is a host module,
-  because it opens a socket through the standard library, so a device that
-  reaches an agent over UDP brings its own link over its own network stack;
-  `rosuart` is the device's transport and takes a UART.
+- **UDP on a device.** A micro-ROS agent listens on four links, and this package
+  reaches three from a PC or a device: TCP and UDP, through `rosagent`, from a
+  PC, and a serial line, through `rosuart`, from a device. `rosagent` is a host
+  module, because it opens a socket through the standard library, and a device
+  has no socket to open: UDP from a board needs a network stack on the board,
+  an interface under it (Ethernet, Wi-Fi, a cellular modem) and an address the
+  agent can reach, none of which this package carries. The code that would sit
+  on that stack is a transport with the shape of `rosuart`: it writes one
+  message to one datagram and reads one datagram as one message, in a
+  `Vec[u8; 512]` the caller owns, with no heap, and it needs neither the
+  serial framing nor its checksum, because a datagram has its own boundary and
+  its own. `rosuart` builds each message in a scratch buffer and passes it to
+  `send` and `receive`, which frame it, so a datagram form is those two
+  functions replaced and the rest of the session unchanged. The session
+  would also have to meet what a datagram link adds to a serial one: messages
+  that arrive out of order or twice, which the input side drops and the agent
+  sends again (see "A buffer for messages that arrive out of order"), and a
+  datagram sent before the agent binds its port, which is lost. A program on a
+  device that reaches an agent over UDP brings its own network stack and its
+  own transport until then.
+- **CAN FD on a device.** The agent's CAN FD link (`MicroXRCEAgent canfd --dev
+  can0`) puts one message of the session in one CAN FD frame: the first data
+  byte is the message's length, at most 63, and the CAN identifier, extended,
+  names the node. This package builds messages of up to 512 bytes, announces
+  that size when it opens the session, and cuts a long sample into pieces of 504
+  bytes, so a CAN FD link would need a session that announces 63 and a piece
+  that takes what 63 leaves (55 bytes after the message header and the FRAGMENT's
+  submessage header, 47 of a sample in the first piece), with the history's
+  slots and the constants that depend on 512 made a parameter, and a
+  transport that fills and reads the frame, on top of a CAN FD controller driver
+  and the identifiers the agent was started with. Messages that small are what the
+  link is for: the session's own messages, the ACKNACK and the HEARTBEAT, fit
+  one frame, and a sample of a few bytes is one frame, but a String of a thousand
+  characters is 19 frames, written four at a time through the reliable stream's
+  window. The agent's CAN FD link is not reached.
 - **A serial port for a PC.** There is no serial port in the standard
   library, with no baud rate, parity or inter-character timeout. A device
   has `hal.uart`; a PC reaches the same code through standard input and

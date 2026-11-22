@@ -64,6 +64,9 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
   `KEEP_ALL`, a reader that matches late is replayed the samples from the second on
   and not only the newest. The README names the XML and `docs/agent-run.md` has the
   runs. The package sends nothing differently.
+- The README's list of what the package leaves out has a paragraph each for UDP on
+  a device and for CAN FD on a device, what each would need and why neither is in
+  the package.
 - `write_sample_long`, `send_request_long` and `send_reply_long` of `rostransport`
   accepted up to 2,048 bytes and answer `ROS_RET_INVALID_ARGUMENT` above 65,000. The
   `rosuart` forms keep 2,048, the size of the `Vec` they write from.
