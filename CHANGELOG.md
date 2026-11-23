@@ -5,10 +5,9 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.8 — 2026-11-23
 
-The change below is a patch, 0.1.8: a new module pair, examples and tests, with
-nothing that exists changed.
+A patch: a module pair, examples and tests, with nothing that exists changed.
 
 ### Added
 
