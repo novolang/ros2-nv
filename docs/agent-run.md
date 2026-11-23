@@ -35,6 +35,7 @@ and are not in the suite.
 | TCP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, `examples/host_server.nv`, `examples/host_client.nv`, `examples/host_long_talker.nv`, `examples/host_long_server.nv` | `MicroXRCEAgent tcp4 --port 2018` |
 | UDP, from a PC | `examples/host_talker.nv`, `examples/host_listener.nv`, `examples/host_server.nv`, `examples/host_client.nv`, `examples/host_long_talker.nv`, `examples/host_long_server.nv`, with `udp` as the transport argument | `MicroXRCEAgent udp4 --port 2018` |
 | A serial line, from a board | `examples/dk_talker.nv`, `examples/dk_sensor_node.nv`, `examples/dk_long_talker.nv` | `MicroXRCEAgent serial --dev /dev/ttyACM<n> -b 115200` |
+| A radio link, from a board or a PC standing in for one, through a bridge | `examples/link_stdio_node.nv` and `examples/link_bridge.nv` | `MicroXRCEAgent udp4 --port 2018` |
 | A serial line, from a PC | `examples/uart_stdio.nv`, `examples/uart_stdio_listener.nv`, `examples/uart_stdio_server.nv`, `examples/uart_stdio_long.nv` | `MicroXRCEAgent serial --dev <the PC end of the line> -b 115200` |
 
 The examples use port 2018 for either agent, TCP or UDP.
@@ -1458,3 +1459,69 @@ Three things to look at if nothing arrives, in the order they are likely:
   prints nothing.
 - **A second reader of the port.** ModemManager, or a terminal program, on
   the same device reads the frames and the agent hears fewer of them.
+
+## Over a radio link, 2026-11-23
+
+A device reaches an agent over Bluetooth LE through a bridge on a PC. The
+session is the serial one (`rosuart`), carried by `roslink`'s two rings, and
+the bridge turns the device's frames into datagrams for an agent started with
+`udp4` (`rosbridge`). This run has the rings, the bridge, the agent and ROS 2
+and replaces the radio with a pseudoterminal pair, so what it shows is the
+software on both sides of the air and the session across it. It does not show a
+radio: a notification that is queued and dropped, a connection interval, a
+disconnect.
+
+`bash tests/link/run.sh` runs it. It starts `socat pty,raw,echo=0,link=ttyNODE
+pty,raw,echo=0,link=ttyBRIDGE`, an agent on `udp4 --port <free port> -v 6`, the
+bridge on `ttyBRIDGE`, `ros2 topic echo /novo_counter std_msgs/msg/Int32` and
+`ros2 topic pub -r 5 /novo_cmd std_msgs/msg/Int32 "{data: 7}"`, and then
+`examples/link_stdio_node.nv 14` on `ttyNODE` twice. The node's radio moves at
+most 20 octets a call in each direction, so a CREATE_CLIENT of 24 octets, 31 in
+its frame, crosses in two chunks and the creates of the session in three to five, as they do in a
+notification before the ATT_MTU is raised.
+
+```
+the first run
+  node: published 13, heard 71, silence 197 ms, link: 4147 octets out, 4820 in, 0 refused, 0 dropped
+  ok   ros2 topic echo /novo_counter heard 13 consecutive integers (0 to 12)
+  ok   ros2 topic pub /novo_cmd reached the node (71 commands)
+  ok   the link refused and dropped no octet
+the second run: the same client key, the same bridge and agent
+  node: published 13, heard 71, silence 197 ms, link: 4124 octets out, 4777 in, 0 refused, 0 dropped
+  ok   the second session opened and /novo_counter was echoed again (12 integers)
+  bridge: 323 messages up, 460 down, 0 bad frames, 0 lost up, 0 lost down
+4 passed, 0 failed
+```
+
+The node creates a participant, a topic and a writer for `/novo_counter`, a
+topic and a reader for `/novo_cmd`, publishes an integer a second on the
+best-effort stream, and takes the commands on the reliable stream, which is
+the stream a command topic uses.
+
+### What the agent does with a second session
+
+The first run ends without a DELETE, as a device that loses its power does, so
+the agent holds the session. The second run's CREATE_CLIENT, from the same
+client key and the same UDP address, is answered:
+
+```
+session re-established | client_key: 0xAABBCCDD, address: 127.0.0.1:28650
+```
+
+and the node's seven creates, which carry the REPLACE flag, succeed again, so the second
+run's counter reaches `ros2 topic echo`. Agent 2.4.3 therefore accepts a
+device that opens a session again after a radio drop, with the one condition
+the bridge keeps: the UDP source address does not change while the bridge runs.
+
+### What the first attempt of the run taught the package
+
+The first attempt of the second run failed with no session. The agent had
+answered, and `rosuart.open` had read eight frames and given up: the agent sends
+a HEARTBEAT of the old session every 200 ms, the bridge wrote each to the
+pseudoterminal, and about forty of them were queued for a node that was not
+there, ahead of the STATUS_AGENT. `rosuart.open` skips `ROS_STALE_FRAMES` (8)
+frames that are not a STATUS_AGENT. A radio with no device connected queues
+nothing, so the script empties the pseudoterminal before the second run. A
+bridge whose link leg is a Central must likewise write nothing to a link that is
+down: the frames the agent sends in that time are for a session that is lost.
+

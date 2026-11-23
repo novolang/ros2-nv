@@ -146,6 +146,8 @@ Build and test with `novo pkg build` and `novo test tests`.
 | `xrcefrag` | A sample longer than one message, joined from the pieces the agent sends it in, in a buffer the caller owns, with a limit the caller sets, and the start of each piece of a sample the node cuts to send. It allocates nothing. |
 | `xrceframe` | The framing of a serial link to an agent: begin flag, addresses, length, byte stuffing and CRC-16, as a framer and a de-framer that allocate nothing. |
 | `rosuart` | The session over a UART, for a device: the same requests as `rostransport`, including subscriptions, the reliable stream, long samples taken and written, and services, with no heap, over `XrceUart`, the trait a board's UART implements. |
+| `roslink` | The session over a radio link, for a device: the octets of `XrceUart` go through two rings that a Bluetooth LE stack (a characteristic pair, a credit based channel) fills and empties in chunks, with no heap, and the counters of what the rings refused. |
+| `rosbridge` | The program between a radio link and an agent, as functions: the device's frames become datagrams for an agent's UDP port and the agent's messages become frames. A host module. |
 | `rosparam` | The three parameter types a microcontroller node can have, the seven it cannot, and the rule that a parameter keeps the type it was declared with. |
 | `rosagent` | A byte pipe to a micro-ROS agent over TCP or UDP. The only module in the package that opens anything. |
 
@@ -443,11 +445,11 @@ starts that lost nothing at a load of 7.6 to 16, and the replay with each histor
 
 ## Running on a microcontroller
 
-Nine modules build for a microcontroller with no heap allocator:
+Ten modules build for a microcontroller with no heap allocator:
 `rosret`, `rosqos`, `rosgraph` and `rosexec`, which a node consults before
-it touches the wire, and `xrceframe`, `xrcewire`, `xrcestream`, `xrcefrag`
-and `rosuart`, which are the wire. `tests/embedded_probe.nv` is a firmware
-program that runs a hundred and thirty-five checks over them and is compiled
+it touches the wire, and `xrceframe`, `xrcewire`, `xrcestream`, `xrcefrag`,
+`rosuart` and `roslink`, which are the wire. `tests/embedded_probe.nv` is a firmware
+program that runs a hundred and forty-three checks over them and is compiled
 for a Cortex-M as part of
 this package's checks, so the claim is built rather than asserted. The
 program runs under QEMU and prints `PASS`.
@@ -563,16 +565,59 @@ firmware node keeps its payload in a buffer it owns, and `rosuart` moves
 that buffer instead.
 
 `rosagent` opens a TCP or UDP socket, which is the one thing in this package
-that performs anything at all. The manifest names it in `host_modules`,
-so a device build leaves it out.
+that performs anything of its own. `rosbridge` is written over two traits and
+performs what the link and the agent it is given perform, and it builds `Bytes`.
+The manifest names both in `host_modules`, so a device build leaves them out.
 
 The registry measures the tiers per module, and its page for this package
-lists every module except `rosagent` at the embedded and rt tiers. Its tier
+lists every module except `rosagent` and `rosbridge` at the embedded and rt tiers. Its tier
 check admits a module that allocates, such as `rosname`, `rosmsg` and
 `rostransport`, because a device program has a heap of fixed size. The
-claim in this section is narrower: it covers the nine modules the probe
+claim in this section is narrower: it covers the ten modules the probe
 builds and the session counters of `rostransport`. The system, wasm and app
-tiers cover all fourteen modules.
+tiers cover all sixteen modules.
+
+## Over a radio link
+
+A battery robot reaches its agent without a cable by carrying the same serial
+framing over Bluetooth LE. The session does not change: a radio link is a byte
+stream that delivers its octets in order while it is up, and the framing's
+begin flag, length and CRC recover a frame cut by a loss.
+
+**On the device**, `roslink` holds two rings of 1,100 octets, one in each
+direction, as module-level variables, so an image has one link. A product's
+radio type implements two traits: `LinkRadio`, whose one function
+`link_service(wait_ms)` moves octets between the rings and the air in chunks
+(a notification of ATT_MTU less 3 octets, an SDU of a channel) and waits for
+the radio's events, and `XrceUart`, whose three methods are one call each of
+`link_put`, `link_get` and `link_pause`. Every function of `rosuart` then runs
+over the radio unchanged. The radio is serviced when the transmit ring is full,
+when the node asks for an octet and the receive ring is empty, and in every
+pause the session takes; `link_flush` services it once for a program that only
+publishes. `link_counters` reports the octets that crossed and the octets a
+full ring refused or dropped, and `link_reset` clears the rings after a
+disconnect. The module allocates nothing; the probe's build grows by 2,252 bytes of
+flash and 2,304 bytes of RAM, the two rings and the counters, with the module
+and its six checks.
+
+**On the PC**, `rosbridge.step` reads the device's frames from a link (an
+`XrceUart`), sends each whole message to the agent as a datagram (a
+`RosTransport`, `rosagent`'s UDP link) and writes each message of the agent to
+the link in a frame addressed to the device. The agent sees one UDP client for
+as long as the bridge runs, whatever the radio does. `examples/link_bridge.nv`
+is the program; its link is its standard input and output, which in a
+deployment is a Central's notifications and writes.
+
+`examples/link_stdio_node.nv` is a device node, a counter published on
+`/novo_counter` and `/novo_cmd` subscribed to, over `roslink` with a radio that
+moves 20 octets a call on standard input and output. `tests/link/run.sh`
+runs it against the bridge through a pseudoterminal pair that stands in for the
+air, the Micro XRCE-DDS Agent and ROS 2's `ros2 topic echo` and `ros2 topic
+pub`, and then runs the node again with the same client key. The record of a
+run is in `docs/agent-run.md`, "Over a radio link". The comparison of the ways
+to carry the session over a radio, and the board run that would prove it over
+the air, are in `planning/ROS2-WIRELESS-TRANSPORT.md` of the novo-lang
+repository.
 
 ## What is not included
 
@@ -593,6 +638,13 @@ tiers cover all fourteen modules.
   toolchain with it. The consequence is that this package cannot talk
   to a DDS network directly — it talks to a micro-ROS agent, which is
   what a microcontroller does anyway.
+- **A radio link on a device, past the rings.** `roslink` carries the session over
+  Bluetooth LE as a byte stream and holds the two rings a radio fills and empties;
+  the radio itself is a product's, written over its Bluetooth stack as a
+  `LinkRadio`, and no such radio is in this package. The product service that
+  moves the rings over a GATT characteristic pair or an L2CAP credit based
+  channel, the Central that stands where the pseudoterminal does in
+  `tests/link/run.sh`, and a run over the air are not here.
 - **UDP on a device.** A micro-ROS agent listens on four links, and this package
   reaches three from a PC or a device: TCP and UDP, through `rosagent`, from a
   PC, and a serial line, through `rosuart`, from a device. `rosagent` is a host
@@ -729,7 +781,7 @@ tiers cover all fourteen modules.
 
 ## Tests
 
-The suite is fifteen files under `tests/`. What they assert comes from
+The suite is seventeen files under `tests/`. What they assert comes from
 ROS 2's own behaviour rather than from an implementation: the return
 code numbering rcl publishes, the six quality-of-service profiles ROS 2
 ships and the requested-versus-offered rules the DDS specification

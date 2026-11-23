@@ -5,6 +5,39 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased
+
+The change below is a patch, 0.1.8: a new module pair, examples and tests, with
+nothing that exists changed.
+
+### Added
+
+- **`roslink`: the session over a radio link, for a device.** The octets of an
+  `XrceUart` go through two rings of 1,100 octets that a Bluetooth LE stack fills
+  and empties in chunks. A product's radio type implements `LinkRadio`, whose one
+  function `link_service(wait_ms)` moves octets between the rings and the air,
+  and `XrceUart` through `link_put`, `link_get` and `link_pause`; every function
+  of `rosuart` then runs over the radio, the serial framing unchanged. The radio
+  is serviced when the transmit ring is full, when the node asks for an octet and
+  the receive ring is empty, and in every pause; `link_flush` services it once.
+  `link_counters` reports the octets that crossed and the octets a full ring
+  refused or dropped, and `link_reset` clears the rings after a disconnect. No
+  allocation; the probe grows by 2,252 bytes of flash and 2,304 bytes of RAM with
+  the module and its six checks.
+- **`rosbridge`: the program between a radio link and an agent.** `step` reads
+  the device's frames from an `XrceUart`, sends each whole message to the agent as
+  a datagram through a `RosTransport`, and writes each message of the agent to the
+  link in a frame, counting what it moved and what it dropped. A host module.
+- **`examples/link_stdio_node.nv` and `examples/link_bridge.nv`**: a node of two
+  topics over `roslink` with a radio of 20 octets a call, and the bridge to an
+  agent's UDP port, both on standard input and output.
+- **`tests/link/run.sh`**: the two examples through a pseudoterminal pair, the
+  agent and ROS 2's `ros2 topic echo` and `ros2 topic pub`, then the node again
+  with the same client key. The record is in `docs/agent-run.md`, "Over a radio
+  link".
+- **`tests/roslink_tests.nv` and `tests/rosbridge_tests.nv`**, and six checks of
+  the rings in `tests/embedded_probe.nv`.
+
 ## 0.1.7 — 2026-11-22
 
 ### Added

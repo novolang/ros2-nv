@@ -27,6 +27,7 @@ use rosexec
 use rosgraph
 use rosqos
 use rosret
+use roslink
 use rostransport
 use rosuart
 use xrceframe
@@ -103,6 +104,54 @@ impl XrceUart[] for EmptyUart
 
     fn uart_pause_ms(self, ms: Int) []
         ()
+
+// The UART of a node whose link is the rings of `roslink`, serviced by the
+// radio the package carries, which moves nothing.
+@value
+struct RingUart
+    id: Int
+
+impl XrceUart[mutate] for RingUart
+    fn uart_put(self, byte: Int) -> Bool [mutate]
+        roslink.link_put(roslink.null_radio(), byte)
+
+    fn uart_get(self) -> Int [mutate]
+        roslink.link_get(roslink.null_radio())
+
+    fn uart_pause_ms(self, ms: Int) [mutate]
+        roslink.link_pause(roslink.null_radio(), ms)
+
+// The rings of the radio link: a frame goes into the transmit ring, is moved
+// by hand to the receive ring as a radio would carry it to a peer, and is read
+// back through the de-framer.  Six checks.
+@tier(embedded)
+@no_alloc
+fn link_score() -> Int [mutate]
+    var n = 0
+    roslink.link_reset()
+    roslink.link_counters_clear()
+    let u = RingUart { id: 1 }
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    let _built = xrcewire.create_client(var m, 0xAABBCCDD, 512)
+    let sent = m.len()
+    if rosuart.send(u, var m, var f)
+        n = n + 1
+    if roslink.link_tx_pending() == f.len()
+        n = n + 1
+    for _i in 0..f.len()
+        let _ = roslink.link_rx_put(roslink.link_tx_take())
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var back: Vec[u8; 512] = Vec.new()
+    if rosuart.receive(u, var d, var back, 0) == xrceframe.XRCE_PUSH_FRAME
+        n = n + 1
+    if back.len() == sent
+        n = n + 1
+    if u.uart_get() == 0 - 1
+        n = n + 1
+    if roslink.link_counters().tx_octets == f.len()
+        n = n + 1
+    n
 
 // The reliable stream and the subscription path, in buffers on the stack:
 // the history, the state machine, the sample reader and the device
@@ -388,7 +437,7 @@ const A_DATA = [0x81, 0x01, 0x04, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00
 // A firmware image has one line of output; making it depend on all of
 // them is what stops a passing run from meaning "the first check held".
 @tier(embedded)
-fn score() -> Int
+fn score() -> Int [mutate]
     var n = 0
 
     // The return codes, and the four that are not failures.  A node
@@ -640,16 +689,16 @@ fn score() -> Int
     if rosexec.spin_wait_ms(rosexec.set_timeout(e, 100), early) == 60
         n = n + 1
 
-    n + wire_score() + stream_score() + frag_score() + service_score() + long_score()
+    n + wire_score() + stream_score() + frag_score() + service_score() + long_score() + link_score()
 
 @tier(rt)
-fn main() [hw]
+fn main() [hw, mutate]
     bsp.board.init()
-    // 137 is the number of checks in `score`, `wire_score`, `stream_score`, `frag_score`, `service_score` and `long_score`.  The count is printed on a
+    // 143 is the number of checks in `score`, `wire_score`, `stream_score`, `frag_score`, `service_score`, `long_score` and `link_score`.  The count is printed on a
     // failure rather than only compared, so a device that disagrees with
     // the host says HOW MANY it lost and a bisect has somewhere to start.
     let n = score()
-    if n == 137
+    if n == 143
         hal.uart.write("PASS: ros2-embedded\n")
     else
         hal.uart.write("FAIL: ros2-embedded score=")

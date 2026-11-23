@@ -1,0 +1,166 @@
+// link_stdio_node.nv — the device's node over a radio link, run on a PC.
+//
+// The node of a rover reduced to two topics: it publishes the integers 0, 1, 2
+// on /novo_counter and subscribes to /novo_cmd, and it reports each command on
+// standard error.  Its link to the agent is `roslink`, the transport a
+// board uses over Bluetooth LE, with a radio that stands in for the air: standard
+// input and output, moved at most CHUNK octets a call in each direction, the
+// size of a notification before the ATT_MTU is raised.  A frame of the session
+// therefore crosses in several chunks, as it does over the air.
+//
+// Standard input and output are the link, so give them the PC end of a pseudoterminal
+// pair whose other end is the bridge's (`tests/link/run.sh` does all of this):
+//
+//   socat pty,raw,echo=0,link=ttyNODE pty,raw,echo=0,link=ttyBRIDGE
+//   MicroXRCEAgent udp4 --port 2018 -v 6
+//   novo run examples/link_bridge.nv 127.0.0.1 2018 60 <>ttyBRIDGE >&0 &
+//   novo run examples/link_stdio_node.nv 30 <>ttyNODE >&0
+//   ros2 topic echo /novo_counter std_msgs/msg/Int32
+//   ros2 topic pub --once /novo_cmd std_msgs/msg/Int32 "{data: 7}"
+//
+// The first argument is how many seconds to run, 30 by default.  Nothing may
+// print to standard output, because the bridge would read it as octets of a
+// frame; the program reports on standard error.
+
+use std.env
+use std.str
+use std.time
+use rosret
+use roslink
+use rosuart
+use rostransport
+use xrceframe
+use xrcestream
+use xrcewire
+
+// The octets one call of the radio moves each way.
+const CHUNK = 20
+
+// The ids the entities are created with: a participant, the two topics, a
+// publisher and its writer, a subscriber and its reader.
+const PARTICIPANT = 0x11
+const TOPIC_OUT = 0x12
+const PUBLISHER = 0x13
+const SUBSCRIBER = 0x14
+const DATAWRITER = 0x15
+const DATAREADER = 0x16
+const TOPIC_IN = 0x22
+
+// The air, as the process's standard input and output.
+struct StdioRadio
+    id: Int
+
+impl LinkRadio[hw, mutate] for StdioRadio
+    fn link_service(self, wait_ms: Int) [hw, mutate]
+        var moved = 0
+        for _i in 0..CHUNK
+            let b = roslink.link_tx_take()
+            if b >= 0
+                // The transmitter may be busy; the octet is offered again until it is taken.
+                for _try in 0..100000
+                    if hal.uart.try_write_byte(b) == 0
+                        moved = moved + 1
+                        break
+        for _j in 0..CHUNK
+            if roslink.link_rx_room() > 0
+                let r = hal.uart.try_read_byte()
+                if r >= 0
+                    let _ = roslink.link_rx_put(r)
+                    moved = moved + 1
+        if moved == 0 and wait_ms > 0
+            hal.timer.delay_ms(1)
+
+impl XrceUart[hw, mutate] for StdioRadio
+    fn uart_put(self, byte: Int) -> Bool [hw, mutate]
+        roslink.link_put(self, byte)
+
+    fn uart_get(self) -> Int [hw, mutate]
+        roslink.link_get(self)
+
+    fn uart_pause_ms(self, ms: Int) [hw, mutate]
+        roslink.link_pause(self, ms)
+
+// One create request, and whether the agent accepted it.
+fn created(out: rostransport.RosOutcome) -> Bool
+    out.code == 0
+
+// Open a session and create the participant, the counter's writer and the
+// command's reader.  Answers the session, established, or closed.
+fn bring_up<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 512],
+                            var f: Vec[u8; 1037]) -> rostransport.RosSession [e]
+    let s = rosuart.open(u, var d, var m, var f, rostransport.session(0xAABBCCDD, 512), 2000)
+    if not rostransport.session_is_ready(s)
+        return s
+    let participant = rosuart.create(u, var d, var m, var f, s, PARTICIPANT,
+                                     xrcewire.XRCE_KIND_PARTICIPANT, 0,
+                                     "<dds><participant><rtps><name>novo_link</name></rtps></participant></dds>",
+                                     2000)
+    let out_topic = rosuart.create(u, var d, var m, var f, participant.session, TOPIC_OUT,
+                                   xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
+                                   "<dds><topic><name>rt/novo_counter</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></dds>",
+                                   2000)
+    let publisher = rosuart.create(u, var d, var m, var f, out_topic.session, PUBLISHER,
+                                   xrcewire.XRCE_KIND_PUBLISHER, PARTICIPANT, "", 2000)
+    let writer = rosuart.create(u, var d, var m, var f, publisher.session, DATAWRITER,
+                                xrcewire.XRCE_KIND_DATAWRITER, PUBLISHER,
+                                "<dds><data_writer><topic><kind>NO_KEY</kind><name>rt/novo_counter</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></data_writer></dds>",
+                                2000)
+    let in_topic = rosuart.create(u, var d, var m, var f, writer.session, TOPIC_IN,
+                                  xrcewire.XRCE_KIND_TOPIC, PARTICIPANT,
+                                  "<dds><topic><name>rt/novo_cmd</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></dds>",
+                                  2000)
+    let subscriber = rosuart.create(u, var d, var m, var f, in_topic.session, SUBSCRIBER,
+                                    xrcewire.XRCE_KIND_SUBSCRIBER, PARTICIPANT, "", 2000)
+    let reader = rosuart.create(u, var d, var m, var f, subscriber.session, DATAREADER,
+                                xrcewire.XRCE_KIND_DATAREADER, SUBSCRIBER,
+                                "<dds><data_reader><topic><kind>NO_KEY</kind><name>rt/novo_cmd</name><dataType>std_msgs::msg::dds_::Int32_</dataType></topic></data_reader></dds>",
+                                2000)
+    if created(participant) and created(out_topic) and created(publisher) and created(writer)
+       and created(in_topic) and created(subscriber) and created(reader)
+        return reader.session
+    rostransport.session_with_state(reader.session, rostransport.ROS_SESSION_CLOSED)
+
+fn main() [hw, io, time, mutate]
+    let args = env.args()
+    var seconds = 30
+    // args[0] is the program itself.
+    if list.len(args) > 1
+        seconds = str.to_int(args[1]) ?? 30
+    let radio = StdioRadio { id: 1 }
+    let u = radio
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var m: Vec[u8; 512] = Vec.new()
+    var f: Vec[u8; 1037] = Vec.new()
+    var h = xrcestream.history()
+    var rel = xrcestream.rel_stream()
+    var s = bring_up(u, var d, var m, var f)
+    if not rostransport.session_is_ready(s)
+        eprintln("no session: the agent did not answer, or refused an entity")
+        return
+    let asked = rosuart.request_data(u, var m, var f, s, DATAREADER, xrcewire.XRCE_STREAM_RELIABLE,
+                                     xrcewire.XRCE_SAMPLES_UNLIMITED)
+    s = asked.session
+    eprintln("session open")
+    var count = 0
+    var heard = 0
+    var last = time.now()
+    var published_at = last
+    let end = last + seconds
+    while time.now() < end
+        let got = rosuart.poll(u, var d, var m, var f, var h, s, rel, 50)
+        s = got.session
+        rel = got.stream
+        if got.code == rosret.ROS_RET_OK
+            eprintln("command ${xrcewire.sample_i32(var m, got.sample)}")
+            heard = heard + 1
+        let now = time.now()
+        s = rosuart.keepalive(u, var m, var f, s, ((now - last) * 1000.0) as Int)
+        last = now
+        if now - published_at >= 1.0
+            let out = rosuart.publish_i32(u, var m, var f, s, DATAWRITER, count)
+            s = out.session
+            roslink.link_flush(radio)
+            count = count + 1
+            published_at = now
+    let c = roslink.link_counters()
+    eprintln("published ${count}, heard ${heard}, silence ${s.silent_ms} ms, link: ${c.tx_octets} octets out, ${c.rx_octets} in, ${c.tx_refused} refused, ${c.rx_dropped} dropped")

@@ -1,0 +1,55 @@
+// link_bridge.nv — the program between a device's radio link and an agent.
+//
+// A device that speaks the serial framing of Micro XRCE-DDS over a radio
+// (`roslink`) reaches an agent through this bridge.  Standard input and output
+// are the link: the octets of the device's frames come in on standard input and
+// the agent's frames go out on standard output.  The agent is reached over UDP,
+// where a datagram is a whole message, so the bridge takes the device's frames
+// apart and puts the agent's messages in frames (`rosbridge`).
+//
+// In a deployment the link is the radio: a Central that subscribes to the
+// device's notifications and writes the agent's frames to its characteristic
+// would stand where the pseudoterminal does here, and the loop below does not
+// change.  This program runs the host half of that, with the link as a
+// pseudoterminal that stands in for the air (`tests/link/run.sh`):
+//
+//   MicroXRCEAgent udp4 --port 2018 -v 6
+//   novo run examples/link_bridge.nv 127.0.0.1 2018 60 <>ttyBRIDGE >&0
+//
+// The arguments are the agent's host and port, 127.0.0.1 and 2018 by default,
+// and how many seconds to run, 60 by default.  Nothing may print to standard
+// output, because the device would read it as octets of a frame; the program
+// reports on standard error, once, at the end.
+
+use std.env
+use std.str
+use std.time
+use rosagent
+use rosbridge
+use rosuart
+use xrceframe
+
+fn main() [hw, net, io, time]
+    let args = env.args()
+    var host = "127.0.0.1"
+    var port = 2018
+    var seconds = 60
+    // args[0] is the program itself.
+    if list.len(args) > 1
+        host = args[1]
+    if list.len(args) > 2
+        port = str.to_int(args[2]) ?? 2018
+    if list.len(args) > 3
+        seconds = str.to_int(args[3]) ?? 60
+    match rosagent.connect_udp(host, port)
+        None       => eprintln("no UDP socket for ${host}:${port}")
+        Some(link) =>
+            let u = rosuart.console_uart()
+            // The device addresses its frames to the agent.
+            var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+            var c = rosbridge.bridge_counters()
+            let end = time.now() + seconds
+            while time.now() < end
+                rosbridge.step(u, link, var d, var c, 2)
+            rosagent.disconnect_udp(link)
+            eprintln("bridge: ${c.up} messages up, ${c.down} down, ${c.bad} bad frames, ${c.lost_up} lost up, ${c.lost_down} lost down")

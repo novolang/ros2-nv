@@ -1,0 +1,136 @@
+// rosbridge.nv — the program between a device's radio link and an agent, as
+// functions over the two traits of this package.
+//
+// A DEVICE THAT SPEAKS THE SERIAL FRAMING OVER A RADIO (`roslink`) reaches an
+// agent through a bridge on a PC.  One side of the bridge is the radio link
+// as an `XrceUart`: the octets of the framed stream a Central reads from the
+// device's notifications and writes to its characteristic, or the SDUs of a
+// channel, or, in a test, a pipe.  The other is the agent as a `RosTransport`:
+// a UDP socket to `MicroXRCEAgent udp4`, on which a datagram is a whole message.
+//
+// WHAT THE BRIDGE DOES TO A MESSAGE.  It takes the device's frames off the
+// stream, checks each frame's CRC and sends the message in it as one
+// datagram.  It takes each datagram from the agent and puts the message in a
+// frame addressed to the device.  A frame with a wrong CRC, or one that
+// announces more than 512 octets, is dropped and counted: the device's reliable
+// stream sends what it never saw acknowledged, and a best-effort sample is
+// lost.  A message from the agent longer than the 512 octets a frame carries
+// is dropped and counted; an agent writes no message longer than the size the
+// device announced when it created its session, which is at most 512.
+//
+// WHAT THE AGENT SEES.  One UDP socket, so one client address for as long as
+// the bridge runs.  A device that loses its radio link and comes back sends
+// its frames from the same address, and the agent's entities for the client
+// are where it left them.
+//
+// The bridge knows nothing of what a message holds.  It reads no session
+// state and answers nothing on the device's behalf.
+
+use std.bytes
+use std.list
+use rostransport
+use rosuart
+use xrceframe
+
+// How many frames and messages crossed the bridge, and how many did not.
+pub @value
+struct BridgeCounters
+    // Frames of the device sent to the agent as messages.
+    up: Int
+    // Messages of the agent sent to the device as frames.
+    down: Int
+    // Frames of the device dropped for a wrong CRC or a length over 512.
+    bad: Int
+    // Messages of the device that the agent's socket refused.
+    lost_up: Int
+    // Messages of the agent that did not go whole to the device: longer than
+    // 512 octets, or an octet the link would not take.
+    lost_down: Int
+
+// A bridge that has moved nothing.
+pub @tier(system)
+fn bridge_counters() -> BridgeCounters []
+    BridgeCounters { up: 0, down: 0, bad: 0, lost_up: 0, lost_down: 0 }
+
+// How many times an octet is offered to a link that does not take it before
+// the frame is given up: 100000, the number `rosuart` uses.
+pub const ROS_BRIDGE_TX_TRIES = 100000
+
+// The most octets read from the link in one step, so that a link that never
+// goes quiet cannot hold the caller.
+pub const ROS_BRIDGE_READ_BOUND = 4096
+
+// A message from the agent, copied into a buffer.  Answers false when it is
+// longer than the buffer.
+@tier(system)
+fn to_buffer(var m: Vec[u8; 512], b: Bytes) -> Bool []
+    system
+        m.clear()
+        let n = bytes.len(b)
+        if n > 512
+            return false
+        for i in 0..n
+            let _ = m.push((bytes.byte_at(b, i) ?? 0) as u8)
+        return true
+
+// The message in a de-framer's payload, as a `Bytes`.
+@tier(system)
+fn from_payload(d: xrceframe.XrceDeframer) -> Bytes []
+    system
+        return bytes.from_byte_list(list.map(d.payload.to_list(), x => x as Int))
+
+// Write a frame to the link, an octet at a time.  Answers whether every octet
+// was taken.
+@tier(system)
+fn write_frame<U: XrceUart[e]>(u: U, var f: Vec[u8; 1037]) -> Bool [e]
+    system
+        for i in 0..f.len()
+            var taken = false
+            for _try in 0..ROS_BRIDGE_TX_TRIES
+                if not taken and u.uart_put(f[i] as Int)
+                    taken = true
+                    break
+            if not taken
+                return false
+        return true
+
+// One round of the bridge.
+//
+// Reads what the link holds, up to `ROS_BRIDGE_READ_BOUND` octets, and sends
+// each whole frame to the agent as a message; then waits up to `wait_ms` for a
+// message from the agent and writes it to the link in a frame.  `d` is the
+// bridge's de-framer, kept between rounds so that a frame cut across two is
+// not lost; it is made with `xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)`,
+// because the device addresses its frames to the agent.  The wait bounds the
+// time a frame from the device waits for the next round, so a program that
+// bridges a link with its own wake-up passes a short one.
+pub @tier(system)
+fn step<U: XrceUart[e], T: RosTransport[f]>(u: U, t: T, var d: xrceframe.XrceDeframer,
+                                            var c: BridgeCounters, wait_ms: Int) [e, f]
+    system
+        for _k in 0..ROS_BRIDGE_READ_BOUND
+            let b = u.uart_get()
+            if b < 0
+                break
+            let r = xrceframe.push_byte(var d, b)
+            if r == xrceframe.XRCE_PUSH_FRAME
+                if t.ros_send(from_payload(d))
+                    c.up = c.up + 1
+                else
+                    c.lost_up = c.lost_up + 1
+            else if r == xrceframe.XRCE_PUSH_BAD_CRC or r == xrceframe.XRCE_PUSH_TOO_LONG
+                c.bad = c.bad + 1
+        match t.ros_recv(wait_ms)
+            None      => ()
+            Some(msg) =>
+                var m: Vec[u8; 512] = Vec.new()
+                var fr: Vec[u8; 1037] = Vec.new()
+                if to_buffer(var m, msg)
+                    let _framed = xrceframe.encode(var fr, var m, xrceframe.XRCE_ADDR_AGENT,
+                                                   xrceframe.XRCE_ADDR_CLIENT)
+                    if write_frame(u, var fr)
+                        c.down = c.down + 1
+                    else
+                        c.lost_down = c.lost_down + 1
+                else
+                    c.lost_down = c.lost_down + 1

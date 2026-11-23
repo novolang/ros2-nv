@@ -22,7 +22,7 @@ stability   = "experimental"
 #
 # `tests/embedded_probe.nv` is what makes the claim a thing the audit
 # BUILDS: `rosret`, `rosqos`, `rosgraph`, `rosexec` and the serial session
-# (`xrceframe`, `xrcewire`, `xrcestream`, `xrcefrag`, `rosuart`) link for
+# (`xrceframe`, `xrcewire`, `xrcestream`, `xrcefrag`, `rosuart`, `roslink`) link for
 # `--target=nrf52-qemu`.
 layer       = "core"
 
@@ -32,16 +32,22 @@ layer       = "core"
 # `[net]`, and nothing else — no clock, because every timeout in this
 # package is a number the caller measures.
 #
-# `rosuart` is not named here, though it also performs: its functions are
-# generic over `XrceUart[e]`, so they charge a caller what the caller's
-# UART costs, and the one implementation in the package, over `hal.uart`,
-# is `[hw]`, which a device builds.
-host_modules = ["rosagent"]
+# `rosbridge` is the program between a radio link and an agent: it is
+# written over `XrceUart[e]` and `RosTransport[f]` and so performs what
+# the two it is given perform, and it builds `Bytes`, which a device
+# does not.  It is named here for the second reason.
+#
+# `rosuart` and `roslink` are not named here, though they also perform: their functions are its functions are
+# generic over `XrceUart[e]` and `LinkRadio[e]`, so they charge a caller what
+# the caller's UART or radio costs, and the one UART in the package, over
+# `hal.uart`, is `[hw]`, which a device builds.
+host_modules = ["rosagent", "rosbridge"]
 
 category    = "embedded"
 
 tags        = ["ros2", "ros", "rclc", "micro-ros", "robotics", "xrce-dds",
-               "dds", "qos", "embedded", "no-alloc", "serial", "uart", "udp", "tcp"]
+               "dds", "qos", "embedded", "no-alloc", "serial", "uart", "udp", "tcp",
+               "bluetooth", "ble", "radio"]
 repository  = "https://github.com/novolang/ros2-nv"
 maintainers = ["novo-lang"]
 novo        = ">= 0.26.0"

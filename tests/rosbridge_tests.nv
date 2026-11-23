@@ -1,0 +1,270 @@
+// rosbridge_tests.nv — the bridge between a radio link and an agent, over a
+// link and an agent that are tables.
+//
+// THE LINK is an `XrceUart` over module variables: `b_in` holds the octets the
+// device sent and `b_out` collects the octets the bridge wrote.  THE AGENT is a
+// `RosTransport` over module variables too: `t_sent` records each message the
+// bridge sent it, as a 2-octet length and the message, and `t_inbound` holds
+// the one message it answers with.  What is asserted is what crosses: a frame
+// becomes a message and a message becomes a frame addressed to the device, a
+// frame cut across two rounds is kept, a damaged frame is counted and does not
+// stop the next, and a message that does not fit is counted and not written.
+
+use std.bytes
+use std.list
+use std.test
+use rosbridge
+use rostransport
+use rosuart
+use xrceframe
+
+var b_in: Vec[u8; 3000]  = Vec.new()
+var b_cursor             = 0
+var b_out: Vec[u8; 3000] = Vec.new()
+// Octets the link's transmitter refuses before it takes one; -1 refuses for ever.
+var b_refusals = 0
+// How many octets a call of `uart_get` may deliver before it says none.
+var b_budget = 100000
+
+struct TableLink
+    id: Int
+
+impl XrceUart[mutate] for TableLink
+    fn uart_put(self, byte: Int) -> Bool [mutate]
+        if b_refusals < 0
+            return false
+        if b_refusals > 0
+            b_refusals = b_refusals - 1
+            return false
+        match b_out.push(byte as u8)
+            Ok(_)  => true
+            Err(_) => false
+
+    fn uart_get(self) -> Int [mutate]
+        if b_cursor < b_in.len() and b_budget > 0
+            b_cursor = b_cursor + 1
+            b_budget = b_budget - 1
+            return b_in[b_cursor - 1] as Int
+        0 - 1
+
+    fn uart_pause_ms(self, ms: Int) [mutate]
+        ()
+
+var t_sent: Vec[u8; 3000]    = Vec.new()
+var t_inbound: Vec[u8; 1100] = Vec.new()
+var t_has_inbound            = false
+var t_accepts                = true
+var t_waited                 = 0
+
+struct TableAgent
+    id: Int
+
+impl RosTransport[mutate] for TableAgent
+    fn ros_send(self, frame: Bytes) -> Bool [mutate]
+        if not t_accepts
+            return false
+        let n = bytes.len(frame)
+        let _lo = t_sent.push((n & 0xFF) as u8)
+        let _hi = t_sent.push((n >>> 8) as u8)
+        for i in 0..n
+            let _ = t_sent.push((bytes.byte_at(frame, i) ?? 0) as u8)
+        true
+
+    fn ros_recv(self, timeout_ms: Int) -> ?Bytes [mutate]
+        t_waited = timeout_ms
+        if t_has_inbound
+            t_has_inbound = false
+            return Some(bytes.from_byte_list(list.map(t_inbound.to_list(), x => x as Int)))
+        None
+
+    fn ros_is_open(self) -> Bool
+        true
+
+    fn ros_close(self) [mutate]
+        ()
+
+    fn ros_mtu(self) -> Int
+        512
+
+fn clear_all() [mutate]
+    b_in.clear()
+    b_cursor = 0
+    b_out.clear()
+    b_refusals = 0
+    b_budget = 100000
+    t_sent.clear()
+    t_inbound.clear()
+    t_has_inbound = false
+    t_accepts = true
+    t_waited = 0
+
+fn vec_of(xs: [Int]) -> Vec[u8; 512]
+    var m: Vec[u8; 512] = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+// The octets of a frame from `src` to `dst` carrying `payload`.
+fn frame_of(payload: [Int], src: Int, dst: Int) -> [Int]
+    var p = vec_of(payload)
+    var f: Vec[u8; 1037] = Vec.new()
+    let _ = xrceframe.encode(var f, var p, src, dst)
+    list.map(f.to_list(), x => x as Int)
+
+// The device sends: put a frame on the link.
+fn device_sends(payload: [Int]) [mutate]
+    for b in frame_of(payload, xrceframe.XRCE_ADDR_CLIENT, xrceframe.XRCE_ADDR_AGENT)
+        let _ = b_in.push(b as u8)
+
+// The agent answers with a message on its next receive.
+fn agent_answers(payload: [Int]) [mutate]
+    t_inbound.clear()
+    for b in payload
+        let _ = t_inbound.push(b as u8)
+    t_has_inbound = true
+
+// The messages the bridge sent to the agent.
+fn sent_to_agent() -> [[Int]]
+    var out: [[Int]] = []
+    var i = 0
+    for _k in 0..t_sent.len()
+        if i < t_sent.len()
+            let n = t_sent[i] as Int + t_sent[i + 1] as Int * 256
+            var one: [Int] = []
+            for j in 0..n
+                one = list.push(one, t_sent[i + 2 + j] as Int)
+            out = list.push(out, one)
+            i = i + 2 + n
+    out
+
+// The messages on the link, out of their frames, addressed to the device.
+fn on_the_link() -> [[Int]]
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_CLIENT)
+    var out: [[Int]] = []
+    for b in b_out
+        if xrceframe.push_byte(var d, b as Int) == xrceframe.XRCE_PUSH_FRAME
+            out = list.push(out, list.map(d.payload.to_list(), x => x as Int))
+    out
+
+fn a_message() -> [Int]
+    [0x81, 0x01, 0x00, 0x00, 0x05, 0x01, 0x06, 0x00, 0x00, 0x01, 0x00, 0x15, 0x00, 0x00]
+
+fn another_message() -> [Int]
+    [0x81, 0x80, 0x01, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16, 0x7E, 0x7D, 0x00, 0x00]
+
+fn a_long_message(n: Int) -> [Int]
+    var xs: [Int] = []
+    for i in 0..n
+        xs = list.push(xs, i & 0x3F)
+    xs
+
+fn bridge() -> rosbridge.BridgeCounters
+    rosbridge.bridge_counters()
+
+@test
+fn test_a_frame_of_the_device_is_a_message_for_the_agent() [io, mutate]
+    clear_all()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var c = bridge()
+    device_sends(a_message())
+    device_sends(another_message())
+
+    test.case("both frames come out as messages, in order, with their octets intact")
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 3)
+    test.assert_eq(sent_to_agent(), [a_message(), another_message()])
+    test.assert_eq(c.up, 2)
+    test.assert_eq(c.bad, 0)
+
+    test.case("the agent's receive was given the round's wait")
+    test.assert_eq(t_waited, 3)
+
+@test
+fn test_a_frame_cut_across_two_rounds_is_kept() [io, mutate]
+    clear_all()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var c = bridge()
+    device_sends(a_message())
+
+    test.case("a round that reads half a frame sends nothing")
+    b_budget = 9
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 0)
+    test.assert_eq(c.up, 0)
+    test.assert_eq(list.len(sent_to_agent()), 0)
+
+    test.case("the next round finishes it")
+    b_budget = 100000
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 0)
+    test.assert_eq(sent_to_agent(), [a_message()])
+    test.assert_eq(c.up, 1)
+
+@test
+fn test_a_damaged_frame_is_counted_and_the_next_one_still_crosses() [io, mutate]
+    clear_all()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var c = bridge()
+
+    test.case("a frame whose CRC is wrong is dropped")
+    let whole = frame_of(a_message(), xrceframe.XRCE_ADDR_CLIENT, xrceframe.XRCE_ADDR_AGENT)
+    // Octet 13 is the ninth octet of the payload, a zero; a one in its place leaves
+    // the framing intact and the CRC wrong.
+    for i in 0..list.len(whole)
+        if i == 13
+            let _ = b_in.push(1)
+        else
+            let _ = b_in.push(whole[i] as u8)
+
+    test.case("a frame that announces more than 512 octets is dropped")
+    for b in [0x7E, 0x01, 0x00, 0x00, 0x03]
+        let _ = b_in.push(b as u8)
+
+    test.case("a good frame after both crosses")
+    device_sends(another_message())
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 0)
+    test.assert_eq(c.bad, 2)
+    test.assert_eq(c.up, 1)
+    test.assert_eq(sent_to_agent(), [another_message()])
+
+@test
+fn test_a_message_of_the_agent_is_a_frame_for_the_device() [io, mutate]
+    clear_all()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var c = bridge()
+    agent_answers(another_message())
+
+    test.case("the frame is addressed to the device and carries the message")
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 0)
+    test.assert_eq(on_the_link(), [another_message()])
+    test.assert_eq(c.down, 1)
+
+    test.case("a round with nothing from either side moves nothing")
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 0)
+    test.assert_eq(c.down, 1)
+    test.assert_eq(c.up, 0)
+    test.assert_eq(list.len(on_the_link()), 1)
+
+@test
+fn test_what_does_not_fit_or_is_refused_is_counted() [io, mutate]
+    clear_all()
+    var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
+    var c = bridge()
+
+    test.case("a message of the agent longer than a frame carries is dropped")
+    agent_answers(a_long_message(600))
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 0)
+    test.assert_eq(c.lost_down, 1)
+    test.assert_eq(b_out.len(), 0)
+
+    test.case("a message the link will not take is dropped")
+    b_refusals = 0 - 1
+    agent_answers(a_message())
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 0)
+    test.assert_eq(c.lost_down, 2)
+    test.assert_eq(c.down, 0)
+
+    test.case("a frame of the device the agent's socket refuses is counted")
+    b_refusals = 0
+    t_accepts = false
+    device_sends(a_message())
+    rosbridge.step(TableLink { id: 1 }, TableAgent { id: 1 }, var d, var c, 0)
+    test.assert_eq(c.lost_up, 1)
+    test.assert_eq(c.up, 0)
