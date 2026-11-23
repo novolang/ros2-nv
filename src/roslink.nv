@@ -107,49 +107,106 @@ var link_rx_octets                          = 0
 var link_rx_dropped                         = 0
 var link_services                           = 0
 
+// The lock the rings are held under.  The node and the radio may be two tasks of the scheduler, which preempt each other, as they are on
+// a board whose Host is a task of its own: every access to a ring is made under the lock, and the radio is serviced outside it.  Where
+// the node and the radio are one task, the lock is taken and released at once.
+var link_lock = core.rt.mutex_new(0)
+
+@tier(embedded)
+@no_alloc
+fn lock() [mutate]
+    core.rt.mutex_lock(link_lock)
+
+@tier(embedded)
+@no_alloc
+fn unlock() [mutate]
+    core.rt.mutex_unlock(link_lock)
+
 // Offer one octet to the receive ring on behalf of the radio.  Answers whether
 // it fitted; an octet that does not is counted and dropped.
 pub @tier(embedded)
 @no_alloc
 fn link_rx_put(byte: Int) -> Bool [mutate]
+    lock()
+    var fitted = false
     match link_rx.push_back((byte & 0xFF) as u8)
         Ok(_)  =>
             link_rx_octets = link_rx_octets + 1
-            true
+            fitted = true
         Err(_) =>
             link_rx_dropped = link_rx_dropped + 1
-            false
+    unlock()
+    fitted
 
 // The next octet the node wrote, taken out of the transmit ring on behalf of
 // the radio, or -1 when the ring is empty.
 pub @tier(embedded)
 @no_alloc
 fn link_tx_take() -> Int [mutate]
+    lock()
+    var taken = 0 - 1
     match link_tx.pop_front()
         Some(b) =>
             link_tx_octets = link_tx_octets + 1
-            b as Int
-        None    => 0 - 1
+            taken = b as Int
+        None    => ()
+    unlock()
+    taken
+
+// Octet `i` of those waiting in the transmit ring, 0 for the oldest, or -1 past the last: a radio that sends a chunk and removes it only
+// when the link has taken it reads the chunk with this and removes it with `link_tx_drop`.
+pub @tier(embedded)
+@no_alloc
+fn link_tx_peek(i: Int) -> Int [mutate]
+    lock()
+    var seen = 0 - 1
+    match link_tx.get(i)
+        Some(b) =>
+            seen = b as Int
+        None    => ()
+    unlock()
+    seen
+
+// Remove the `n` oldest octets of the transmit ring, which the radio has taken: they count as octets the radio took.  Fewer are removed
+// when the ring holds fewer.
+pub @tier(embedded)
+@no_alloc
+fn link_tx_drop(n: Int) [mutate]
+    lock()
+    for _i in 0..n
+        match link_tx.pop_front()
+            Some(_) =>
+                link_tx_octets = link_tx_octets + 1
+            None    => ()
+    unlock()
 
 // The octets waiting in the transmit ring.
 pub @tier(embedded)
 @no_alloc
 fn link_tx_pending() -> Int [mutate]
-    link_tx.len()
+    lock()
+    let n = link_tx.len()
+    unlock()
+    n
 
 // The octets the receive ring has room for.
 pub @tier(embedded)
 @no_alloc
 fn link_rx_room() -> Int [mutate]
-    link_rx.capacity() - link_rx.len()
+    lock()
+    let n = link_rx.capacity() - link_rx.len()
+    unlock()
+    n
 
 // Clear both rings, after a disconnect or before a session is opened again.
 // The counters are kept.
 pub @tier(embedded)
 @no_alloc
 fn link_reset() [mutate]
+    lock()
     link_tx.clear()
     link_rx.clear()
+    unlock()
 
 // The counters of the link.
 pub @tier(embedded)
@@ -184,14 +241,18 @@ fn link_flush<R: LinkRadio[e]>(radio: R) [e, mutate]
 pub @tier(embedded)
 @no_alloc
 fn link_put<R: LinkRadio[e]>(radio: R, byte: Int) -> Bool [e, mutate]
-    if link_tx.is_full()
+    if link_tx_pending() >= ROS_LINK_RING_BYTES
         link_services = link_services + 1
         radio.link_service(0)
+    lock()
+    var fitted = false
     match link_tx.push_back((byte & 0xFF) as u8)
-        Ok(_)  => true
+        Ok(_)  =>
+            fitted = true
         Err(_) =>
             link_tx_refused = link_tx_refused + 1
-            false
+    unlock()
+    fitted
 
 // The next octet from the receive ring, or -1, the body of `XrceUart.uart_get`.
 //
@@ -199,14 +260,25 @@ fn link_put<R: LinkRadio[e]>(radio: R, byte: Int) -> Bool [e, mutate]
 pub @tier(embedded)
 @no_alloc
 fn link_get<R: LinkRadio[e]>(radio: R) -> Int [e, mutate]
+    var got = rx_pop()
+    if got < 0
+        link_services = link_services + 1
+        radio.link_service(0)
+        got = rx_pop()
+    got
+
+// The next octet of the receive ring under the lock, or -1.
+@tier(embedded)
+@no_alloc
+fn rx_pop() -> Int [mutate]
+    lock()
+    var got = 0 - 1
     match link_rx.pop_front()
-        Some(b) => b as Int
-        None    =>
-            link_services = link_services + 1
-            radio.link_service(0)
-            match link_rx.pop_front()
-                Some(b) => b as Int
-                None    => 0 - 1
+        Some(b) =>
+            got = b as Int
+        None    => ()
+    unlock()
+    got
 
 // A pause of the session, the body of `XrceUart.uart_pause_ms`: the radio is
 // serviced and told to wait up to `ms` milliseconds for its events.

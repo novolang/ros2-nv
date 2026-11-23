@@ -596,9 +596,16 @@ when the node asks for an octet and the receive ring is empty, and in every
 pause the session takes; `link_flush` services it once for a program that only
 publishes. `link_counters` reports the octets that crossed and the octets a
 full ring refused or dropped, and `link_reset` clears the rings after a
-disconnect. The module allocates nothing; the probe's build grows by 2,252 bytes of
-flash and 2,304 bytes of RAM, the two rings and the counters, with the module
-and its six checks.
+disconnect. The module allocates nothing; the probe's build grows by 2,828 bytes of
+flash and 2,320 bytes of RAM, the two rings, the lock and the counters, with the
+module and its six checks.
+
+The rings are held under a lock (`core.rt.mutex_lock`), because the node and the
+radio may be two tasks that preempt each other: a Bluetooth LE Host allocates, and
+`rosuart`'s functions are `@no_alloc`, which the compiler checks through the
+transport's methods, so a board's node cannot call the Host from its own pause.
+The Host runs in a task of its own, moves octets with `link_tx_peek`, `link_tx_drop`
+and `link_rx_put`, and the pause of the node is the scheduler's sleep.
 
 **On the PC**, `rosbridge.step` reads the device's frames from a link (an
 `XrceUart`), sends each whole message to the agent as a datagram (a

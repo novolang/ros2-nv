@@ -22,8 +22,11 @@ nothing that exists changed.
   the receive ring is empty, and in every pause; `link_flush` services it once.
   `link_counters` reports the octets that crossed and the octets a full ring
   refused or dropped, and `link_reset` clears the rings after a disconnect. No
-  allocation; the probe grows by 2,252 bytes of flash and 2,304 bytes of RAM with
-  the module and its six checks.
+  allocation; the probe grows by 2,828 bytes of flash and 2,320 bytes of RAM with
+  the module and its six checks. The rings are held under a lock, so that the node
+  and a Host in a task of its own may share them, and `link_tx_peek` and
+  `link_tx_drop` let a radio read a chunk of the transmit ring and remove it when
+  the link has taken it.
 - **`rosbridge`: the program between a radio link and an agent.** `step` reads
   the device's frames from an `XrceUart`, sends each whole message to the agent as
   a datagram through a `RosTransport`, and writes each message of the agent to the

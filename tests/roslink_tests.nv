@@ -272,3 +272,24 @@ fn test_the_radio_the_package_carries_moves_nothing() [io, mutate]
     roslink.link_flush(roslink.null_radio())
     test.assert_eq(roslink.link_tx_pending(), 1)
     test.assert_eq(roslink.link_counters().services, 1)
+
+@test
+fn test_a_radio_may_read_a_chunk_and_remove_it_when_the_link_has_taken_it() [io, mutate]
+    clear_air()
+    let u = radio()
+    for i in 0..5
+        test.assert(u.uart_put(10 + i))
+
+    test.case("peek reads from the oldest octet and leaves the ring as it was")
+    test.assert_eq(roslink.link_tx_peek(0), 10)
+    test.assert_eq(roslink.link_tx_peek(4), 14)
+    test.assert_eq(roslink.link_tx_peek(5), 0 - 1)
+    test.assert_eq(roslink.link_tx_pending(), 5)
+
+    test.case("drop removes the oldest octets and counts them, and no more than the ring holds")
+    roslink.link_tx_drop(2)
+    test.assert_eq(roslink.link_tx_peek(0), 12)
+    test.assert_eq(roslink.link_tx_pending(), 3)
+    roslink.link_tx_drop(9)
+    test.assert_eq(roslink.link_tx_pending(), 0)
+    test.assert_eq(roslink.link_counters().tx_octets, 5)
