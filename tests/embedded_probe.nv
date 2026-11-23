@@ -105,6 +105,9 @@ impl XrceUart[] for EmptyUart
     fn uart_pause_ms(self, ms: Int) []
         ()
 
+// The rings of the probe's link, which the UART below and the checks both name.
+var probe_link = roslink.link_rings()
+
 // The UART of a node whose link is the rings of `roslink`, serviced by the
 // radio the package carries, which moves nothing.
 @value
@@ -113,13 +116,13 @@ struct RingUart
 
 impl XrceUart[mutate] for RingUart
     fn uart_put(self, byte: Int) -> Bool [mutate]
-        roslink.link_put(roslink.null_radio(), byte)
+        roslink.link_put(var probe_link, roslink.null_radio(), byte)
 
     fn uart_get(self) -> Int [mutate]
-        roslink.link_get(roslink.null_radio())
+        roslink.link_get(var probe_link, roslink.null_radio())
 
     fn uart_pause_ms(self, ms: Int) [mutate]
-        roslink.link_pause(roslink.null_radio(), ms)
+        roslink.link_pause(var probe_link, roslink.null_radio(), ms)
 
 // The rings of the radio link: a frame goes into the transmit ring, is moved
 // by hand to the receive ring as a radio would carry it to a peer, and is read
@@ -128,8 +131,8 @@ impl XrceUart[mutate] for RingUart
 @no_alloc
 fn link_score() -> Int [mutate]
     var n = 0
-    roslink.link_reset()
-    roslink.link_counters_clear()
+    roslink.link_reset(var probe_link)
+    roslink.link_counters_clear(var probe_link)
     let u = RingUart { id: 1 }
     var m: Vec[u8; 512] = Vec.new()
     var f: Vec[u8; 1037] = Vec.new()
@@ -137,10 +140,10 @@ fn link_score() -> Int [mutate]
     let sent = m.len()
     if rosuart.send(u, var m, var f)
         n = n + 1
-    if roslink.link_tx_pending() == f.len()
+    if roslink.link_tx_pending(probe_link) == f.len()
         n = n + 1
     for _i in 0..f.len()
-        let _ = roslink.link_rx_put(roslink.link_tx_take())
+        let _ = roslink.link_rx_put(var probe_link, roslink.link_tx_take(var probe_link))
     var d = xrceframe.deframer(xrceframe.XRCE_ADDR_AGENT)
     var back: Vec[u8; 512] = Vec.new()
     if rosuart.receive(u, var d, var back, 0) == xrceframe.XRCE_PUSH_FRAME
@@ -149,7 +152,7 @@ fn link_score() -> Int [mutate]
         n = n + 1
     if u.uart_get() == 0 - 1
         n = n + 1
-    if roslink.link_counters().tx_octets == f.len()
+    if roslink.link_counters(probe_link).tx_octets == f.len()
         n = n + 1
     n
 

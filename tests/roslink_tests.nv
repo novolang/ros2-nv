@@ -28,6 +28,8 @@ var air_cursor             = 0
 var air_chunk  = 20
 var air_calls  = 0
 var air_waited = 0
+// The rings of the link: the module-level variable that the radio and the node both name.
+var ring = roslink.link_rings()
 
 struct AirRadio
     id: Int
@@ -37,24 +39,24 @@ impl LinkRadio[mutate] for AirRadio
         air_calls = air_calls + 1
         air_waited = air_waited + wait_ms
         for _i in 0..air_chunk
-            let b = roslink.link_tx_take()
+            let b = roslink.link_tx_take(var ring)
             if b >= 0
                 let _ = air_out.push(b as u8)
         for _j in 0..air_chunk
             if air_cursor < air_in.len()
-                if roslink.link_rx_put(air_in[air_cursor] as Int)
+                if roslink.link_rx_put(var ring, air_in[air_cursor] as Int)
                     air_cursor = air_cursor + 1
 
 // The same type is the node's UART: the three methods are one call each.
 impl XrceUart[mutate] for AirRadio
     fn uart_put(self, byte: Int) -> Bool [mutate]
-        roslink.link_put(self, byte)
+        roslink.link_put(var ring, self, byte)
 
     fn uart_get(self) -> Int [mutate]
-        roslink.link_get(self)
+        roslink.link_get(var ring, self)
 
     fn uart_pause_ms(self, ms: Int) [mutate]
-        roslink.link_pause(self, ms)
+        roslink.link_pause(var ring, self, ms)
 
 fn radio() -> AirRadio
     AirRadio { id: 1 }
@@ -67,8 +69,8 @@ fn clear_air() [mutate]
     air_chunk = 20
     air_calls = 0
     air_waited = 0
-    roslink.link_reset()
-    roslink.link_counters_clear()
+    roslink.link_reset(var ring)
+    roslink.link_counters_clear(var ring)
 
 // A message buffer from a list.
 fn vec_of(xs: [Int]) -> Vec[u8; 512]
@@ -102,10 +104,7 @@ fn status_agent_message() -> [Int]
 
 // Sixty octets that are a whole message to the framing.
 fn sixty() -> [Int]
-    var xs: [Int] = []
-    for i in 0..60
-        xs = list.push(xs, (i * 7 + 1) & 0x3F)
-    xs
+    list.map(list.range(0, 60), i => (i * 7 + 1) & 0x3F)
 
 @test
 fn test_a_frame_crosses_the_air_in_chunks_and_arrives_whole() [io, mutate]
@@ -118,22 +117,22 @@ fn test_a_frame_crosses_the_air_in_chunks_and_arrives_whole() [io, mutate]
     test.assert(rosuart.send(u, var m, var f))
     let n = f.len()
     test.assert(n >= 67)
-    test.assert_eq(roslink.link_tx_pending(), n)
+    test.assert_eq(roslink.link_tx_pending(ring), n)
     test.assert_eq(air_out.len(), 0)
     test.assert_eq(air_calls, 0)
 
     test.case("each service call moves one chunk of 20 octets")
-    roslink.link_flush(radio())
+    roslink.link_flush(var ring, radio())
     test.assert_eq(air_out.len(), 20)
-    test.assert_eq(roslink.link_tx_pending(), n - 20)
+    test.assert_eq(roslink.link_tx_pending(ring), n - 20)
     for _k in 0..(n + 19) / 20 - 1
-        roslink.link_flush(radio())
+        roslink.link_flush(var ring, radio())
     test.assert_eq(air_out.len(), n)
-    test.assert_eq(roslink.link_tx_pending(), 0)
+    test.assert_eq(roslink.link_tx_pending(ring), 0)
 
     test.case("the octets on the air are the frame, and the peer takes the message out of it")
     test.assert_eq(on_the_air(), [sixty()])
-    let c = roslink.link_counters()
+    let c = roslink.link_counters(ring)
     test.assert_eq(c.tx_octets, n)
     test.assert_eq(c.tx_refused, 0)
     test.assert_eq(c.services, (n + 19) / 20)
@@ -151,7 +150,7 @@ fn test_a_frame_from_the_agent_is_read_across_chunks() [io, mutate]
     test.assert_eq(list.map(m.to_list(), x => x as Int), sixty())
 
     test.case("the radio was serviced for each empty ring, and the octets are counted")
-    let c = roslink.link_counters()
+    let c = roslink.link_counters(ring)
     test.assert_eq(c.rx_octets, air_in.len())
     test.assert_eq(c.rx_dropped, 0)
     test.assert(c.services >= (air_in.len() + 19) / 20)
@@ -182,9 +181,9 @@ fn test_a_session_opens_and_a_sample_is_written_over_the_link() [io, mutate]
     test.case("a sample written and flushed reaches the air as a WRITE_DATA")
     let out = rosuart.publish_i32(u, var m, var f, s, 0x15, 7)
     test.assert_eq(out.code, rosret.ROS_RET_OK)
-    roslink.link_flush(radio())
-    roslink.link_flush(radio())
-    roslink.link_flush(radio())
+    roslink.link_flush(var ring, radio())
+    roslink.link_flush(var ring, radio())
+    roslink.link_flush(var ring, radio())
     let all = on_the_air()
     test.assert_eq(list.len(all), 2)
     test.assert_eq(all[1][4], xrcewire.XRCE_SUB_WRITE_DATA)
@@ -197,12 +196,12 @@ fn test_a_full_transmit_ring_is_serviced_and_then_refuses() [io, mutate]
     test.case("an octet offered to a full ring makes the radio take a chunk first")
     for _i in 0..roslink.ROS_LINK_RING_BYTES
         test.assert(u.uart_put(0x41))
-    test.assert_eq(roslink.link_tx_pending(), roslink.ROS_LINK_RING_BYTES)
+    test.assert_eq(roslink.link_tx_pending(ring), roslink.ROS_LINK_RING_BYTES)
     test.assert_eq(air_calls, 0)
     test.assert(u.uart_put(0x42))
     test.assert_eq(air_calls, 1)
     test.assert_eq(air_out.len(), 20)
-    test.assert_eq(roslink.link_tx_pending(), roslink.ROS_LINK_RING_BYTES - 19)
+    test.assert_eq(roslink.link_tx_pending(ring), roslink.ROS_LINK_RING_BYTES - 19)
 
     test.case("a radio that moves nothing leaves the ring full and the octet is refused and counted")
     air_chunk = 0
@@ -210,7 +209,7 @@ fn test_a_full_transmit_ring_is_serviced_and_then_refuses() [io, mutate]
         test.assert(u.uart_put(0x43))
     test.assert(not u.uart_put(0x44))
     test.assert(not u.uart_put(0x45))
-    let c = roslink.link_counters()
+    let c = roslink.link_counters(ring)
     test.assert_eq(c.tx_refused, 2)
 
 @test
@@ -218,41 +217,41 @@ fn test_an_octet_for_a_full_receive_ring_is_dropped_and_counted() [io, mutate]
     clear_air()
     test.case("the ring takes its capacity and refuses the next, which the counter records")
     for _i in 0..roslink.ROS_LINK_RING_BYTES
-        test.assert(roslink.link_rx_put(0x55))
-    test.assert_eq(roslink.link_rx_room(), 0)
-    test.assert(not roslink.link_rx_put(0x56))
-    let c = roslink.link_counters()
+        test.assert(roslink.link_rx_put(var ring, 0x55))
+    test.assert_eq(roslink.link_rx_room(ring), 0)
+    test.assert(not roslink.link_rx_put(var ring, 0x56))
+    let c = roslink.link_counters(ring)
     test.assert_eq(c.rx_octets, roslink.ROS_LINK_RING_BYTES)
     test.assert_eq(c.rx_dropped, 1)
 
     test.case("a radio that cannot deliver leaves the rest of the air for a later call")
     clear_air()
     for _j in 0..roslink.ROS_LINK_RING_BYTES - 5
-        test.assert(roslink.link_rx_put(0x55))
+        test.assert(roslink.link_rx_put(var ring, 0x55))
     for _k in 0..40
         let _ = air_in.push(0x66)
-    roslink.link_flush(radio())
+    roslink.link_flush(var ring, radio())
     test.assert_eq(air_cursor, 5)
-    test.assert_eq(roslink.link_rx_room(), 0)
+    test.assert_eq(roslink.link_rx_room(ring), 0)
 
 @test
 fn test_a_reset_clears_the_rings_and_keeps_the_counters() [io, mutate]
     clear_air()
     let u = radio()
     test.assert(u.uart_put(1))
-    test.assert(roslink.link_rx_put(2))
-    test.assert_eq(roslink.link_tx_pending(), 1)
+    test.assert(roslink.link_rx_put(var ring, 2))
+    test.assert_eq(roslink.link_tx_pending(ring), 1)
 
     test.case("both rings are empty after the reset")
-    roslink.link_reset()
-    test.assert_eq(roslink.link_tx_pending(), 0)
-    test.assert_eq(roslink.link_rx_room(), roslink.ROS_LINK_RING_BYTES)
-    test.assert_eq(roslink.link_tx_take(), 0 - 1)
+    roslink.link_reset(var ring)
+    test.assert_eq(roslink.link_tx_pending(ring), 0)
+    test.assert_eq(roslink.link_rx_room(ring), roslink.ROS_LINK_RING_BYTES)
+    test.assert_eq(roslink.link_tx_take(var ring), 0 - 1)
 
     test.case("the counters stay until they are cleared")
-    test.assert_eq(roslink.link_counters().rx_octets, 1)
-    roslink.link_counters_clear()
-    test.assert_eq(roslink.link_counters().rx_octets, 0)
+    test.assert_eq(roslink.link_counters(ring).rx_octets, 1)
+    roslink.link_counters_clear(var ring)
+    test.assert_eq(roslink.link_counters(ring).rx_octets, 0)
 
 @test
 fn test_a_pause_is_a_service_call_with_the_wait() [io, mutate]
@@ -269,9 +268,9 @@ fn test_the_radio_the_package_carries_moves_nothing() [io, mutate]
     test.case("a flush through it leaves the transmit ring as it was")
     let u = radio()
     test.assert(u.uart_put(5))
-    roslink.link_flush(roslink.null_radio())
-    test.assert_eq(roslink.link_tx_pending(), 1)
-    test.assert_eq(roslink.link_counters().services, 1)
+    roslink.link_flush(var ring, roslink.null_radio())
+    test.assert_eq(roslink.link_tx_pending(ring), 1)
+    test.assert_eq(roslink.link_counters(ring).services, 1)
 
 @test
 fn test_a_radio_may_read_a_chunk_and_remove_it_when_the_link_has_taken_it() [io, mutate]
@@ -281,15 +280,15 @@ fn test_a_radio_may_read_a_chunk_and_remove_it_when_the_link_has_taken_it() [io,
         test.assert(u.uart_put(10 + i))
 
     test.case("peek reads from the oldest octet and leaves the ring as it was")
-    test.assert_eq(roslink.link_tx_peek(0), 10)
-    test.assert_eq(roslink.link_tx_peek(4), 14)
-    test.assert_eq(roslink.link_tx_peek(5), 0 - 1)
-    test.assert_eq(roslink.link_tx_pending(), 5)
+    test.assert_eq(roslink.link_tx_peek(ring, 0), 10)
+    test.assert_eq(roslink.link_tx_peek(ring, 4), 14)
+    test.assert_eq(roslink.link_tx_peek(ring, 5), 0 - 1)
+    test.assert_eq(roslink.link_tx_pending(ring), 5)
 
     test.case("drop removes the oldest octets and counts them, and no more than the ring holds")
-    roslink.link_tx_drop(2)
-    test.assert_eq(roslink.link_tx_peek(0), 12)
-    test.assert_eq(roslink.link_tx_pending(), 3)
-    roslink.link_tx_drop(9)
-    test.assert_eq(roslink.link_tx_pending(), 0)
-    test.assert_eq(roslink.link_counters().tx_octets, 5)
+    roslink.link_tx_drop(var ring, 2)
+    test.assert_eq(roslink.link_tx_peek(ring, 0), 12)
+    test.assert_eq(roslink.link_tx_pending(ring), 3)
+    roslink.link_tx_drop(var ring, 9)
+    test.assert_eq(roslink.link_tx_pending(ring), 0)
+    test.assert_eq(roslink.link_counters(ring).tx_octets, 5)

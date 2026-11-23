@@ -125,15 +125,13 @@ fn agent_answers(payload: [Int]) [mutate]
 
 // The messages the bridge sent to the agent.
 fn sent_to_agent() -> [[Int]]
+    let all = list.map(t_sent.to_list(), x => x as Int)
     var out: [[Int]] = []
     var i = 0
     for _k in 0..t_sent.len()
         if i < t_sent.len()
             let n = t_sent[i] as Int + t_sent[i + 1] as Int * 256
-            var one: [Int] = []
-            for j in 0..n
-                one = list.push(one, t_sent[i + 2 + j] as Int)
-            out = list.push(out, one)
+            out = list.push(out, all[i + 2:i + 2 + n])
             i = i + 2 + n
     out
 
@@ -153,10 +151,7 @@ fn another_message() -> [Int]
     [0x81, 0x80, 0x01, 0x00, 0x09, 0x01, 0x08, 0x00, 0x00, 0x05, 0x00, 0x16, 0x7E, 0x7D, 0x00, 0x00]
 
 fn a_long_message(n: Int) -> [Int]
-    var xs: [Int] = []
-    for i in 0..n
-        xs = list.push(xs, i & 0x3F)
-    xs
+    list.map(list.range(0, n), i => i & 0x3F)
 
 fn bridge() -> rosbridge.BridgeCounters
     rosbridge.bridge_counters()

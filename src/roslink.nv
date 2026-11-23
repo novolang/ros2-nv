@@ -11,28 +11,41 @@
 // and empties in chunks, and `link_put`, `link_get` and `link_pause` are the three
 // methods of that `XrceUart`.
 //
+// THE RINGS ARE THE CALLER'S.  `LinkRings` holds the two rings, their lock and
+// the counters, and every function of this module takes it as its first
+// argument, as `rosuart`'s functions take the message buffer: no function here
+// declares an effect of its own, and a program that never builds one pays
+// nothing.  The methods of `XrceUart` take `self` by value, so a product holds
+// its `LinkRings` in a module-level variable of its own, which is where it pays
+// `[mutate]`, and the node's task and the radio's task name the same variable.
+// There is one link in an image, which is what a node with one agent has.  Each
+// ring holds `ROS_LINK_RING_BYTES`, the 1,037 octets of the largest frame and a
+// little over.
+//
 // THE RADIO IS A TRAIT, `LinkRadio[e]`, for the reason `XrceUart[e]` is one.
 // A product's radio type implements it and `XrceUart`, whose three methods are
-// one call each of `link_put`, `link_get` and `link_pause` (the two impls are in
-// `tests/roslink_tests.nv` and `examples/link_stdio_node.nv`); a struct over a
-// type parameter cannot be a `@value`, so the package supplies the methods as
-// functions and not as a ready-made `XrceUart`.  The one function of `LinkRadio`, `link_service`, is what a product writes over its Bluetooth
-// stack: it takes octets out of the transmit ring with `link_tx_take`, sends
-// them in chunks of whatever the link carries (an ATT_MTU less 3 for a
-// notification, an SDU for a channel), gives the octets that arrived to
-// `link_rx_put`, and waits up to a number of milliseconds for the radio's own
-// events.  On a board that is one turn of the Host's pump.  A radio that takes
-// no octet out of the ring in a call leaves them for the next, and a radio
-// that cannot put an octet in the receive ring (it is full) tells its peer to
-// wait if the link has flow control, and drops the octet if it has none: the
-// loss is counted in `LinkCounters.rx_dropped`, and the frame it cut is
-// discarded on its CRC or at the next begin flag.
+// one call each of `link_put`, `link_get` and `link_pause` with the product's
+// `LinkRings` (the two impls are in `tests/roslink_tests.nv` and
+// `examples/link_stdio_node.nv`); a struct over a type parameter cannot be a
+// `@value`, so the package supplies the methods as functions and not as a
+// ready-made `XrceUart`.  The one function of `LinkRadio`, `link_service`, is
+// what a product writes over its Bluetooth stack: it takes octets out of the
+// transmit ring with `link_tx_take`, sends them in chunks of whatever the link
+// carries (an ATT_MTU less 3 for a notification, an SDU for a channel), gives
+// the octets that arrived to `link_rx_put`, and waits up to a number of
+// milliseconds for the radio's own events.  A radio that takes no octet out of
+// the ring in a call leaves them for the next, and a radio that cannot put an
+// octet in the receive ring (it is full) tells its peer to wait if the link has
+// flow control, and drops the octet if it has none: the loss is counted in
+// `LinkCounters.rx_dropped`, and the frame it cut is discarded on its CRC or at
+// the next begin flag.
 //
-// THE RINGS ARE MODULE-LEVEL VARIABLES, because the methods of `XrceUart` take
-// `self` by value and the radio's events arrive from outside the node's own
-// call chain.  There is one link in an image, which is what a node with one
-// agent has.  Each ring holds `ROS_LINK_RING_BYTES`, the 1,037 octets of the
-// largest frame and a little over.
+// TWO TASKS MAY SHARE THE RINGS.  A Bluetooth LE Host allocates and `rosuart`'s
+// functions are `@no_alloc`, which the compiler checks through the transport's
+// methods, so on a board the Host is a task of its own and the node another,
+// and they preempt each other.  Every access to a ring is made under the lock
+// in `LinkRings`, and the radio is serviced outside it.  Where the node and the
+// radio are one task, the lock is taken and released at once.
 //
 // WHEN THE RADIO IS SERVICED.  Without a call of the node's own, a frame the
 // node wrote would sit in the transmit ring.  The transport services the radio
@@ -43,9 +56,8 @@
 // after a write, once per sample.
 //
 // NO CLOCK AND NO ALLOCATION.  A wait is the number of milliseconds the
-// session names, handed to `link_service`; the node holds no heap.  The
-// functions that touch a ring declare `[mutate]`, the effect of a module-level
-// variable.
+// session names, handed to `link_service`; the node holds no heap once its
+// `LinkRings` is made.
 //
 // A disconnect leaves a frame half sent and half received.  `link_reset` clears
 // both rings, and the node opens a session again with `rosuart.open`.
@@ -97,141 +109,142 @@ pub @tier(embedded)
 fn null_radio() -> NullRadio []
     NullRadio { unused: 0 }
 
-// From the node to the radio.
-var link_tx: Deque[u8; ROS_LINK_RING_BYTES] = Deque.new()
-// From the radio to the node.
-var link_rx: Deque[u8; ROS_LINK_RING_BYTES] = Deque.new()
-var link_tx_octets                          = 0
-var link_tx_refused                         = 0
-var link_rx_octets                          = 0
-var link_rx_dropped                         = 0
-var link_services                           = 0
+// The two rings, the lock they are held under and the counters, made once with `link_rings` and passed to every function of this module.
+pub struct LinkRings
+    var tx: Deque[u8; ROS_LINK_RING_BYTES]
+    var rx: Deque[u8; ROS_LINK_RING_BYTES]
+    var lock: Mutex
+    var tx_octets: Int
+    var tx_refused: Int
+    var rx_octets: Int
+    var rx_dropped: Int
+    var services: Int
 
-// The lock the rings are held under.  The node and the radio may be two tasks of the scheduler, which preempt each other, as they are on
-// a board whose Host is a task of its own: every access to a ring is made under the lock, and the radio is serviced outside it.  Where
-// the node and the radio are one task, the lock is taken and released at once.
-var link_lock = core.rt.mutex_new(0)
-
-@tier(embedded)
-@no_alloc
-fn lock() [mutate]
-    core.rt.mutex_lock(link_lock)
-
-@tier(embedded)
-@no_alloc
-fn unlock() [mutate]
-    core.rt.mutex_unlock(link_lock)
+// Two empty rings and zeroed counters.  A boxed struct is built inside `system` at the embedded tier, so a product calls this once at start-up.
+pub @tier(embedded)
+fn link_rings() -> LinkRings
+    system
+        LinkRings { tx: Deque.new(),
+            rx: Deque.new(),
+            lock: core.rt.mutex_new(0),
+            tx_octets: 0,
+            tx_refused: 0,
+            rx_octets: 0,
+            rx_dropped: 0,
+            services: 0 }
 
 // Offer one octet to the receive ring on behalf of the radio.  Answers whether
 // it fitted; an octet that does not is counted and dropped.
 pub @tier(embedded)
 @no_alloc
-fn link_rx_put(byte: Int) -> Bool [mutate]
-    lock()
+fn link_rx_put(var l: LinkRings, byte: Int) -> Bool []
+    core.rt.mutex_lock(l.lock)
     var fitted = false
-    match link_rx.push_back((byte & 0xFF) as u8)
+    match l.rx.push_back((byte & 0xFF) as u8)
         Ok(_)  =>
-            link_rx_octets = link_rx_octets + 1
+            l.rx_octets = l.rx_octets + 1
             fitted = true
         Err(_) =>
-            link_rx_dropped = link_rx_dropped + 1
-    unlock()
+            l.rx_dropped = l.rx_dropped + 1
+    core.rt.mutex_unlock(l.lock)
     fitted
 
 // The next octet the node wrote, taken out of the transmit ring on behalf of
 // the radio, or -1 when the ring is empty.
 pub @tier(embedded)
 @no_alloc
-fn link_tx_take() -> Int [mutate]
-    lock()
+fn link_tx_take(var l: LinkRings) -> Int []
+    core.rt.mutex_lock(l.lock)
     var taken = 0 - 1
-    match link_tx.pop_front()
+    match l.tx.pop_front()
         Some(b) =>
-            link_tx_octets = link_tx_octets + 1
+            l.tx_octets = l.tx_octets + 1
             taken = b as Int
         None    => ()
-    unlock()
+    core.rt.mutex_unlock(l.lock)
     taken
 
 // Octet `i` of those waiting in the transmit ring, 0 for the oldest, or -1 past the last: a radio that sends a chunk and removes it only
 // when the link has taken it reads the chunk with this and removes it with `link_tx_drop`.
 pub @tier(embedded)
 @no_alloc
-fn link_tx_peek(i: Int) -> Int [mutate]
-    lock()
+fn link_tx_peek(l: LinkRings, i: Int) -> Int []
+    core.rt.mutex_lock(l.lock)
     var seen = 0 - 1
-    match link_tx.get(i)
+    match l.tx.get(i)
         Some(b) =>
             seen = b as Int
         None    => ()
-    unlock()
+    core.rt.mutex_unlock(l.lock)
     seen
 
 // Remove the `n` oldest octets of the transmit ring, which the radio has taken: they count as octets the radio took.  Fewer are removed
 // when the ring holds fewer.
 pub @tier(embedded)
 @no_alloc
-fn link_tx_drop(n: Int) [mutate]
-    lock()
+fn link_tx_drop(var l: LinkRings, n: Int) []
+    core.rt.mutex_lock(l.lock)
     for _i in 0..n
-        match link_tx.pop_front()
+        match l.tx.pop_front()
             Some(_) =>
-                link_tx_octets = link_tx_octets + 1
+                l.tx_octets = l.tx_octets + 1
             None    => ()
-    unlock()
+    core.rt.mutex_unlock(l.lock)
 
 // The octets waiting in the transmit ring.
 pub @tier(embedded)
 @no_alloc
-fn link_tx_pending() -> Int [mutate]
-    lock()
-    let n = link_tx.len()
-    unlock()
+fn link_tx_pending(l: LinkRings) -> Int []
+    core.rt.mutex_lock(l.lock)
+    let n = l.tx.len()
+    core.rt.mutex_unlock(l.lock)
     n
 
 // The octets the receive ring has room for.
 pub @tier(embedded)
 @no_alloc
-fn link_rx_room() -> Int [mutate]
-    lock()
-    let n = link_rx.capacity() - link_rx.len()
-    unlock()
+fn link_rx_room(l: LinkRings) -> Int []
+    core.rt.mutex_lock(l.lock)
+    let n = l.rx.capacity() - l.rx.len()
+    core.rt.mutex_unlock(l.lock)
     n
 
 // Clear both rings, after a disconnect or before a session is opened again.
 // The counters are kept.
 pub @tier(embedded)
 @no_alloc
-fn link_reset() [mutate]
-    lock()
-    link_tx.clear()
-    link_rx.clear()
-    unlock()
+fn link_reset(var l: LinkRings) []
+    core.rt.mutex_lock(l.lock)
+    l.tx.clear()
+    l.rx.clear()
+    core.rt.mutex_unlock(l.lock)
 
 // The counters of the link.
 pub @tier(embedded)
 @no_alloc
-fn link_counters() -> LinkCounters [mutate]
-    LinkCounters { tx_octets: link_tx_octets, tx_refused: link_tx_refused,
-                   rx_octets: link_rx_octets, rx_dropped: link_rx_dropped,
-                   services: link_services }
+fn link_counters(l: LinkRings) -> LinkCounters []
+    LinkCounters { tx_octets: l.tx_octets,
+        tx_refused: l.tx_refused,
+        rx_octets: l.rx_octets,
+        rx_dropped: l.rx_dropped,
+        services: l.services }
 
 // Set the counters to zero.
 pub @tier(embedded)
 @no_alloc
-fn link_counters_clear() [mutate]
-    link_tx_octets = 0
-    link_tx_refused = 0
-    link_rx_octets = 0
-    link_rx_dropped = 0
-    link_services = 0
+fn link_counters_clear(var l: LinkRings) []
+    l.tx_octets = 0
+    l.tx_refused = 0
+    l.rx_octets = 0
+    l.rx_dropped = 0
+    l.services = 0
 
 // Service the radio once without waiting: what a program that only publishes
 // calls after each write.
 pub @tier(embedded)
 @no_alloc
-fn link_flush<R: LinkRadio[e]>(radio: R) [e, mutate]
-    link_services = link_services + 1
+fn link_flush<R: LinkRadio[e]>(var l: LinkRings, radio: R) [e]
+    l.services = l.services + 1
     radio.link_service(0)
 
 // Offer one octet to the transmit ring, the body of `XrceUart.uart_put`.
@@ -240,18 +253,18 @@ fn link_flush<R: LinkRadio[e]>(radio: R) [e, mutate]
 // refused, and counted, when the radio made none.
 pub @tier(embedded)
 @no_alloc
-fn link_put<R: LinkRadio[e]>(radio: R, byte: Int) -> Bool [e, mutate]
-    if link_tx_pending() >= ROS_LINK_RING_BYTES
-        link_services = link_services + 1
+fn link_put<R: LinkRadio[e]>(var l: LinkRings, radio: R, byte: Int) -> Bool [e]
+    if link_tx_pending(l) >= ROS_LINK_RING_BYTES
+        l.services = l.services + 1
         radio.link_service(0)
-    lock()
+    core.rt.mutex_lock(l.lock)
     var fitted = false
-    match link_tx.push_back((byte & 0xFF) as u8)
+    match l.tx.push_back((byte & 0xFF) as u8)
         Ok(_)  =>
             fitted = true
         Err(_) =>
-            link_tx_refused = link_tx_refused + 1
-    unlock()
+            l.tx_refused = l.tx_refused + 1
+    core.rt.mutex_unlock(l.lock)
     fitted
 
 // The next octet from the receive ring, or -1, the body of `XrceUart.uart_get`.
@@ -259,31 +272,31 @@ fn link_put<R: LinkRadio[e]>(radio: R, byte: Int) -> Bool [e, mutate]
 // With nothing waiting, the radio is serviced once to take what has arrived.
 pub @tier(embedded)
 @no_alloc
-fn link_get<R: LinkRadio[e]>(radio: R) -> Int [e, mutate]
-    var got = rx_pop()
+fn link_get<R: LinkRadio[e]>(var l: LinkRings, radio: R) -> Int [e]
+    var got = rx_pop(var l)
     if got < 0
-        link_services = link_services + 1
+        l.services = l.services + 1
         radio.link_service(0)
-        got = rx_pop()
+        got = rx_pop(var l)
     got
 
 // The next octet of the receive ring under the lock, or -1.
 @tier(embedded)
 @no_alloc
-fn rx_pop() -> Int [mutate]
-    lock()
+fn rx_pop(var l: LinkRings) -> Int []
+    core.rt.mutex_lock(l.lock)
     var got = 0 - 1
-    match link_rx.pop_front()
+    match l.rx.pop_front()
         Some(b) =>
             got = b as Int
         None    => ()
-    unlock()
+    core.rt.mutex_unlock(l.lock)
     got
 
 // A pause of the session, the body of `XrceUart.uart_pause_ms`: the radio is
 // serviced and told to wait up to `ms` milliseconds for its events.
 pub @tier(embedded)
 @no_alloc
-fn link_pause<R: LinkRadio[e]>(radio: R, ms: Int) [e, mutate]
-    link_services = link_services + 1
+fn link_pause<R: LinkRadio[e]>(var l: LinkRings, radio: R, ms: Int) [e]
+    l.services = l.services + 1
     radio.link_service(ms)

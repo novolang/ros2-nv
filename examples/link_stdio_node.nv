@@ -46,6 +46,9 @@ const DATAWRITER = 0x15
 const DATAREADER = 0x16
 const TOPIC_IN = 0x22
 
+// The rings of the link: the module-level variable that the radio and the node both name.
+var ring = roslink.link_rings()
+
 // The air, as the process's standard input and output.
 struct StdioRadio
     id: Int
@@ -54,7 +57,7 @@ impl LinkRadio[hw, mutate] for StdioRadio
     fn link_service(self, wait_ms: Int) [hw, mutate]
         var moved = 0
         for _i in 0..CHUNK
-            let b = roslink.link_tx_take()
+            let b = roslink.link_tx_take(var ring)
             if b >= 0
                 // The transmitter may be busy; the octet is offered again until it is taken.
                 for _try in 0..100000
@@ -62,23 +65,23 @@ impl LinkRadio[hw, mutate] for StdioRadio
                         moved = moved + 1
                         break
         for _j in 0..CHUNK
-            if roslink.link_rx_room() > 0
+            if roslink.link_rx_room(ring) > 0
                 let r = hal.uart.try_read_byte()
                 if r >= 0
-                    let _ = roslink.link_rx_put(r)
+                    let _ = roslink.link_rx_put(var ring, r)
                     moved = moved + 1
         if moved == 0 and wait_ms > 0
             hal.timer.delay_ms(1)
 
 impl XrceUart[hw, mutate] for StdioRadio
     fn uart_put(self, byte: Int) -> Bool [hw, mutate]
-        roslink.link_put(self, byte)
+        roslink.link_put(var ring, self, byte)
 
     fn uart_get(self) -> Int [hw, mutate]
-        roslink.link_get(self)
+        roslink.link_get(var ring, self)
 
     fn uart_pause_ms(self, ms: Int) [hw, mutate]
-        roslink.link_pause(self, ms)
+        roslink.link_pause(var ring, self, ms)
 
 // One create request, and whether the agent accepted it.
 fn created(out: rostransport.RosOutcome) -> Bool
@@ -159,8 +162,8 @@ fn main() [hw, io, time, mutate]
         if now - published_at >= 1.0
             let out = rosuart.publish_i32(u, var m, var f, s, DATAWRITER, count)
             s = out.session
-            roslink.link_flush(radio)
+            roslink.link_flush(var ring, radio)
             count = count + 1
             published_at = now
-    let c = roslink.link_counters()
+    let c = roslink.link_counters(ring)
     eprintln("published ${count}, heard ${heard}, silence ${s.silent_ms} ms, link: ${c.tx_octets} octets out, ${c.rx_octets} in, ${c.tx_refused} refused, ${c.rx_dropped} dropped")

@@ -585,7 +585,9 @@ stream that delivers its octets in order while it is up, and the framing's
 begin flag, length and CRC recover a frame cut by a loss.
 
 **On the device**, `roslink` holds two rings of 1,100 octets, one in each
-direction, as module-level variables, so an image has one link. A product's
+direction, in a `LinkRings` that the product makes once (`link_rings`) and keeps
+in a module-level variable of its own, so an image has one link; every function
+of the module takes it as its first argument and declares no effect. A product's
 radio type implements two traits: `LinkRadio`, whose one function
 `link_service(wait_ms)` moves octets between the rings and the air in chunks
 (a notification of ATT_MTU less 3 octets, an SDU of a channel) and waits for
@@ -596,11 +598,12 @@ when the node asks for an octet and the receive ring is empty, and in every
 pause the session takes; `link_flush` services it once for a program that only
 publishes. `link_counters` reports the octets that crossed and the octets a
 full ring refused or dropped, and `link_reset` clears the rings after a
-disconnect. The module allocates nothing; the probe's build grows by 2,828 bytes of
-flash and 2,320 bytes of RAM, the two rings, the lock and the counters, with the
-module and its six checks.
+disconnect. The functions allocate nothing; `link_rings` builds the rings once,
+at start-up. The probe's build grows by 3,008 bytes of flash with the module and
+its six checks, and by 24 bytes of `.data` and `.bss`; the rings, 2,240 bytes,
+are in the heap of the image.
 
-The rings are held under a lock (`core.rt.mutex_lock`), because the node and the
+The rings are held under a lock (`core.rt.mutex_lock`, held in `LinkRings`), because the node and the
 radio may be two tasks that preempt each other: a Bluetooth LE Host allocates, and
 `rosuart`'s functions are `@no_alloc`, which the compiler checks through the
 transport's methods, so a board's node cannot call the Host from its own pause.
@@ -621,10 +624,22 @@ moves 20 octets a call on standard input and output. `tests/link/run.sh`
 runs it against the bridge through a pseudoterminal pair that stands in for the
 air, the Micro XRCE-DDS Agent and ROS 2's `ros2 topic echo` and `ros2 topic
 pub`, and then runs the node again with the same client key. The record of a
-run is in `docs/agent-run.md`, "Over a radio link". The comparison of the ways
-to carry the session over a radio, and the board run that would prove it over
-the air, are in `planning/ROS2-WIRELESS-TRANSPORT.md` of the novo-lang
-repository.
+run is in `docs/agent-run.md`, "Over a radio link".
+
+**Which radio link, and what has not run.** The session needs a byte stream, so
+two Bluetooth LE carriers fit it without a change: a GATT characteristic that the
+client writes without response and that notifies, and an L2CAP credit based
+channel, whose credits give it flow control that a notification lacks. A node
+that publishes the standard `Odometry` and `Imu` messages at 20 and 50 Hz and
+takes a `Twist` at 20 Hz needs about 33,000 octets a second on the link (the
+messages are 720, 320 and 48 octets of CDR, and each crosses in a frame of seven
+octets of framing and twelve of session header); the same at 50, 50 and 100 Hz
+needs about 75,000, which is 78 percent of what a 1M PHY carries at best, so a
+rover of that rate takes the 2M PHY or messages without the 36-element
+covariance matrices. A Wi-Fi part with UDP needs a network stack and a second
+radio that a device of this package does not carry. What has run is the
+software on both sides of the air, against a real agent, with simulated
+Controllers in place of the radio; a run on two boards over the air has not.
 
 ## What is not included
 
