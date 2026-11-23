@@ -124,12 +124,17 @@ fn receive<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[u8; 5
     for round in 0..timeout_ms + 1
         if result == xrceframe.XRCE_PUSH_NONE
             // Everything the receiver holds, up to a bound so that a
-            // line that never stops cannot hold the caller.
+            // line that never stops cannot hold the caller, and no
+            // further than the first call that finds nothing: a link
+            // whose `uart_get` does work when it is empty (a radio's
+            // service) is asked once a round and not 2,048 times.
             for _k in 0..2048
                 if result == xrceframe.XRCE_PUSH_NONE
                     let b = u.uart_get()
                     if b >= 0
                         result = xrceframe.push_byte(var d, b)
+                    else
+                        break
             if result == xrceframe.XRCE_PUSH_NONE and round < timeout_ms
                 u.uart_pause_ms(1)
     if result == xrceframe.XRCE_PUSH_FRAME

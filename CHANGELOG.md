@@ -5,6 +5,12 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased
+
+### Fixed
+
+- **`rosuart.receive` stops reading at the first call that finds nothing.** It asked `uart_get` up to 2,048 times a round whether the receiver held more, so an empty round cost 2,048 calls: on a UART 2,048 register reads, and on a radio link whose `uart_get` services the radio (`roslink`) 2,048 services, which on a board whose Host is a task of its own starved the Host and slowed a node's commands to a few a second. A round now asks once more than the octets it finds.
+
 ## 0.1.8 — 2026-11-23
 
 A patch: a module pair, examples and tests, with nothing that exists changed.
