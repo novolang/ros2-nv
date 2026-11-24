@@ -5,7 +5,9 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.9 — 2026-11-24
+
+A patch: a fix to the receiving round of `rosuart`.
 
 ### Fixed
 
