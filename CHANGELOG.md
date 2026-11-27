@@ -5,6 +5,15 @@ All notable changes to ros2-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.10 — 2026-11-27
+
+A patch: the examples call without a binding where the answer is a status.
+
+### Changed
+
+- `examples/dk_sensor_node.nv`, `examples/uart_stdio_server.nv` and `examples/link_stdio_node.nv` call `xrcewire.put_sample_i64` and `roslink.link_rx_put` without a binding.  The ring counts the octets it drops, so the call needs no check.
+- `examples/dk_long_talker.nv` and `examples/uart_stdio_long.nv` fill the sample and the chunk with `let _ = push(...)` and a comment that says why the bytes fit; the throwaway names are gone.
+
 ## 0.1.9 — 2026-11-24
 
 A patch: a fix to the receiving round of `rosuart`.

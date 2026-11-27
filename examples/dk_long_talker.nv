@@ -79,13 +79,14 @@ fn publish_text<U: XrceUart[e]>(u: U, var d: xrceframe.XrceDeframer, var m: Vec[
                                 rest: Int) -> rostransport.RosLongSent [e, hw]
     sample.clear()
     let counted = n + 1
-    let _l0 = sample.push((counted & 0xFF) as u8)
-    let _l1 = sample.push(((counted >>> 8) & 0xFF) as u8)
-    let _l2 = sample.push(0)
-    let _l3 = sample.push(0)
+    // The longest text is 2040 characters, so its 2045 bytes fit the 2048 the sample holds.
+    let _ = sample.push((counted & 0xFF) as u8)
+    let _ = sample.push(((counted >>> 8) & 0xFF) as u8)
+    let _ = sample.push(0)
+    let _ = sample.push(0)
     for i in 0..n
-        let _c = sample.push((97 + i % 26) as u8)
-    let _z = sample.push(0)
+        let _ = sample.push((97 + i % 26) as u8)
+    let _ = sample.push(0)
     var st = s
     var rel = r
     var at = 0

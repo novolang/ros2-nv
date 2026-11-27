@@ -135,7 +135,7 @@ fn answer<U: XrceUart[e]>(u: U, var m: Vec[u8; 512], var f: Vec[u8; 1037], var h
     let a = xrcewire.i64_at(var m, request.start)
     let b = xrcewire.i64_at(var m, request.start + 8)
     p.clear()
-    let _ = xrcewire.put_sample_i64(var p, a + b, 0)
+    xrcewire.put_sample_i64(var p, a + b, 0)
     rosuart.send_reply(u, var m, var f, var h, s, r, REPLIER, request.identity, var p)
 
 // Open a session and create the eight entities. Answers the session,

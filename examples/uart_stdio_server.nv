@@ -96,7 +96,7 @@ fn main() [hw, io, time]
             let a = xrcewire.i64_at(var m, got.request.start)
             let b = xrcewire.i64_at(var m, got.request.start + 8)
             p.clear()
-            let _ = xrcewire.put_sample_i64(var p, a + b, 0)
+            xrcewire.put_sample_i64(var p, a + b, 0)
             let sent = rosuart.send_reply(u, var m, var f, var h, s, rel, REPLIER,
                                           got.request.identity, var p)
             s = sent.session

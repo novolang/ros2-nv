@@ -68,7 +68,7 @@ impl LinkRadio[hw, mutate] for StdioRadio
             if roslink.link_rx_room(ring) > 0
                 let r = hal.uart.try_read_byte()
                 if r >= 0
-                    let _ = roslink.link_rx_put(var ring, r)
+                    roslink.link_rx_put(var ring, r)
                     moved = moved + 1
         if moved == 0 and wait_ms > 0
             hal.timer.delay_ms(1)
